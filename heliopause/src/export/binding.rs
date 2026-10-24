@@ -871,7 +871,7 @@ mod tests {
     fn native_rank_emission_validates_resolved_rebuild_weights() {
         let request: super::super::CaptureRequest = serde_json::from_value(serde_json::json!({
             "path":"unused", "context":0, "graphs":[], "allocations":[], "execution":null,
-            "server":null, "package_data":null, "shard_size":67108864,
+            "server":null, "package_data":null,
             "rebuild_weights":{"version":1,"tensors":[{"name":"weight","dtype":"float32",
                 "element_bytes":4,"shape":[4],"stride":[1],"address":4096,"extent":16}],"unavailable":[]}
         })).unwrap();

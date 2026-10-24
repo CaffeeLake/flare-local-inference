@@ -90,10 +90,11 @@ def prepare(root, shard_size=64 << 30, table_world=1):
                 prepared.package_data = tables
                 if table_world == 1:
                     export_model(prepared, images, storage, root / 'package', options={}, publisher=publisher(),
-                                 shard_size=shard_size)
+                                 )
                 else:
                     from ignition.preparation import runtime_package_pb2 as proto
-                    from ignition.preparation.package_file import publish, read_index
+                    from ignition.preparation.package_file import read_index
+                    from signing import publish_legacy as publish
                     from ignition.preparation.protection import resource_roles
 
                     staged = root / 'table-source'

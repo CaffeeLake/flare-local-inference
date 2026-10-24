@@ -216,7 +216,7 @@ def _export_hosts(args):
                 result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
                                 staging=configuration.directory("export_staging"),
-                                progress=progress if args.verbose else None)
+                                progress=progress)
                 stage.update(f"{result.entry_path} ({plan.world_size} ranks)")
         for region in storage.host_regions:
             region.close()
@@ -336,7 +336,7 @@ def _prepare(args):
 
                     options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
                     result = export_package(prepared, recorder, storage, None, options=options, publisher=publisher,
-                                 progress=progress if args.verbose else None, console=progress.console,
+                                 progress=progress, console=progress.console,
                                  staging=configuration.directory("export_staging"))
                 except Exception as error:
                     if args.verbose:

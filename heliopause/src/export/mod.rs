@@ -182,7 +182,6 @@ pub(crate) struct CaptureRequest {
     pub options: ExportOptions,
     #[serde(default)]
     pub sources: bool,
-    pub shard_size: u64,
 }
 
 impl CaptureRequest {

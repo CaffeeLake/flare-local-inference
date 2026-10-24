@@ -3063,6 +3063,7 @@ pub(crate) fn capture_rank(
     downloader.drain()?;
     cuda.synchronize()?;
     storage_phase.finish(format!("{scanned} bytes scanned, {} bytes downloaded, {stored_bytes} bytes stored; {} allocations omitted", downloader.downloaded - storage_download_start + committed_downloads, allocations.len() - output.allocations.len()));
+    let weight_phase = progress.phase("Materialize weight payloads", None);
     let device_allocations = output.allocations.clone();
     output.weight_payload = resolve_weight_payload(
         &request,
@@ -3073,6 +3074,7 @@ pub(crate) fn capture_rank(
             None
         },
     )?;
+    weight_phase.finish("");
     output.hardware = current_platform(&cuda)?;
     drop(store);
     drop(downloader);
@@ -3230,7 +3232,6 @@ mod tests {
                 "element_bytes": 1, "shape": [view_bytes], "stride": [1], "address": address
             }]},
             "options": {"cache": cache, "no_weights": no_weights},
-            "shard_size": 67108864
         }))?;
         let output = RankOutput {
             hardware: Some("gb202".to_string()),

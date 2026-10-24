@@ -430,9 +430,10 @@ class HostRankGroup:
         return self.model.manifest()
 
     def export(self, path, *, options, export_id, images, storage, publisher, progress=None,
-               shard_size=64 << 30, form='directory', staging=None):
+               form='directory', staging=None):
         """Combine rank manifests, receiving only content absent from the coordinator cache."""
         import flare_heliopause
+        from ignition.progress import phase
         from .package_snapshot import _OPTIONS, export_options
         from .package_file import combine
         from .runtime_package import export_model
@@ -483,19 +484,20 @@ class HostRankGroup:
                                  f"{report['payload_seconds']:.2f}s, {report['payload_gbps']:.2f} Gbit/s)")
                 # Rank zero's cache objects must outlive the prepared model: retain
                 # them before closing it and before peers close.
-                native_stage.retain_sources([roots[0]])
-                self.close()
-                for region in storage.host_regions:
-                    region.close()
+                with phase(progress, "Release preparation resources"):
+                    native_stage.retain_sources([roots[0]])
+                    self.close()
+                    for region in storage.host_regions:
+                        region.close()
                 # The stage retains the received and local cache-object leases, so
                 # `combine` still sees them after peer processes exit.
                 result = combine(None if cache_only else path, roots, [], publisher=publisher,
-                                 shard_size=shard_size,
                                  cluster=(self.rendezvous.world, export_id), form=form,
                                  cache_only=cache_only)
             print_inventory(inventories, console=getattr(progress, "console", None))
         finally:
-            native_stage.close()
+            with phase(progress, "Clear export staging"):
+                native_stage.close()
         return result
 
     def start_server(self, *, bind="127.0.0.1:8000", template_defaults=None, options=None):

@@ -161,7 +161,7 @@ def prepare(root, shard_size=64 << 30, legacy=False):
             graph_segments = storage.graph_pool.snapshot(include_traces=False)
             assert graph_segments
     package = export_model(prepared, images, storage, root / "rank.json", options={},
-                           sources=True, shard_size=shard_size)
+                           sources=True)
     assert not any(a.address <= unused_address < a.address + a.nbytes for a in package.allocations)
     assert not any(a.address <= freed_address < a.address + a.nbytes for a in package.allocations)
     assert any(a.address == segment["address"] for a in package.allocations for segment in graph_segments)

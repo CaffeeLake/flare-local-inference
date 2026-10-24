@@ -774,15 +774,12 @@ ignition convert /models/existing.safetensors \
   --publisher-keys /keys/publisher.json
 ```
 
-Conversion accepts monolithic, numbered-shard, and snapshot packages, verifies
-signed resources and stored data, and preserves the exact signed envelope. Supply
-the public publisher profile for a production package; the local development
-profile is loaded automatically. `--output` selects a destination and `--form`
-selects the canonical form for payload packages; legacy packages use their
-fixed blob layout and reject `--form packed`. Conversion leaves its source
-intact. Identical conversions reuse payload objects without rewriting them, and a
-resource larger than the legacy limit is rejected because legacy native resources
-must remain contiguous.
+Conversion accepts payload-format packages and preserves their exact signed
+bodies and payload bytes. Supply the public publisher profile for a production
+package; the local development profile is loaded automatically. `--output`
+selects a destination and `--form` selects packed or directory form. Conversion
+leaves its source intact. Legacy packages remain loadable and servable, but
+conversion and signing require a payload-format package exported by Ignition.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's
 repository with the Hugging Face upload client as either canonical form. Export
@@ -809,8 +806,7 @@ accepted. Runtime publisher profiles contain only the verification key.
 identity field requires all three identity fields.
 
 Payload-format packages keep their semantic payload boundaries in either
-canonical form. Legacy blob publication uses a fixed 64 GiB file limit, including
-the header; a larger contiguous legacy resource fails conversion.
+canonical form. Export, conversion, and signing write only this format.
 See [package snapshots](#package-snapshots).
 
 `ignition keygen` creates an encrypted production key and public profile.

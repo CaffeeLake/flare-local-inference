@@ -289,41 +289,36 @@ cache. Unaligned source ranges use aligned scratch reads, and small headers,
 leading bytes, and trailing bytes use positioned I/O where needed. Output files
 retain their exact declared lengths. Direct-I/O errors fail the operation.
 
-A blob's complete safetensors bytes are hashed before opening a temporary output
-for it. An existing cache entry is pinned and verified before reuse. A cache miss
-streams the bytes to a temporary file and hashes them again; changed content
-fails publication. Synchronized immutable blobs are installed without replacing
-existing entries, then hardlinked beside the primary. `--no-weights` requires
-both captured allocation blobs and final stored-data shards to exist with their
-exact contents. It still scans and hashes source bytes, creates no missing
-stored-data blob, and publishes no primary if any required blob is absent.
-Executable resources may produce additional blobs.
+Payload publication verifies source bytes and existing cache objects before reuse.
+A cache miss installs an immutable object without replacing existing entries.
+`--no-weights` requires exact cached weight payloads, including tuned weights;
+missing or corrupt required payloads fail publication. Executable and initial-state
+payloads may be installed during this export.
 
-Native stderr rows omit the Flare banner and report disposable-storage
-clearing, graph inspection and serialization, module and global capture,
-reachable-storage scanning, frontend assets, executable hashing and compression,
-blob publication, and metadata signing. Capture and frontend rows render only on
-rank zero; coordinators report aggregate rank-transfer receive progress. Ignition
-pauses its enclosing export activity while native rows animate and retains the
-elapsed result. Byte counters distinguish source reads, hashes, copies, installed
-bytes, and cache reuse. Rank transfers report send and receive bytes; conversion reports
-source verification, relocation, and publication separately.
+Native stderr rows omit the Flare banner. Rank-zero capture reports storage
+clearing, graph inspection and serialization, module/global capture, storage scans,
+weight materialization, and frontend assets. Coordinators report export peer waits,
+rank transfers, and preparation-resource release before publication.
+Publication reports payload assembly, validation, frontend verification, each rank's
+executable compression and installation, each rank's data verification and
+installation, shared data, metadata signing, and final package commit.
+
+Native phases animate and update elapsed time independently of Python. Byte totals
+count plaintext executable inputs or data source occurrences, including duplicate
+payloads verified before reuse; they do not claim physical disk throughput or
+cache bytes written. Ignition prints one final export success or failure result
+with the total elapsed time.
 
 ### File placement and addressing
 
-This subsection describes the legacy compatibility path only. In a legacy
-package, `ignition export`, `ignition sign`, and `ignition convert` pack published
-payloads to at most 64 GB including the 4096-byte header; the reader keeps that
-limit for existing packages, `shard_size` selects a smaller one, and an
-indivisible resource fails publication. The layout JSON carries `version: 1` and a
-`files` mapping from logical names to ordered `[length, blob]` segments, with at
-most 100 logical files and 65,536 segments; layout supplies physical addressing
-only, while signed bounds, compressed chunk hashes, and stored-data hashes apply to the
-reconstructed logical bytes. The loader pins selected blobs and rejects resources
-spanning blobs or padding. Ignition stores legacy blobs under the package cache
-and hardlinks them into snapshot directories, and key-free conversion validates
-the source signatures and stored data before publishing the original envelope
-with a new layout.
+Legacy package readers retain the 64 GB blob bound, including the 4096-byte
+header. Layout JSON carries `version: 1` and a `files` mapping from logical names
+to ordered `[length, blob]` segments, with at most 100 logical files and 65,536
+segments. Layout supplies physical addressing; signed bounds, compressed chunk
+hashes, and stored-data hashes authenticate reconstructed logical bytes. The
+loader pins selected blobs and rejects resources spanning blobs or padding.
+Legacy packages remain readable and servable. Export, conversion, and signing
+produce only the payload format.
 
 Canonical payload packages do not use logical filenames, layout segments, or
 key-free conversion of signed logical ranges: they use signed content ids,

@@ -190,44 +190,32 @@ with socket.socket(fileno=int(sys.argv[1])) as control:
             child.communicate(timeout=10)
 
 
-def test_cluster_export_combines_native_received_manifests_into_signed_snapshot(tmp_path):
-    import hashlib
+def test_cluster_export_combines_received_sources_into_payload_package(tmp_path):
     from helios.tests.signing import publisher
-    from ignition.preparation.package_file import combine, container_header, write_sources, read_index, PackageFiles
+    from ignition.preparation.package_file import combine
     from ignition.preparation.package_snapshot import export_options
-    from ignition.preparation.runtime_package_pb2 import ModelIndex, BundleIndex, Span
     from tests.preparation.test_export_transfer import transfer
+    from tests.preparation.payload_fixture import rank_source, manifest, schema
+    from safetensors import safe_open
 
-    def sources(rank):
-        contents = f'weights-{rank}'.encode()
-        raw = container_header(len(contents)) + contents
-        blob = tmp_path / (hashlib.sha256(raw).hexdigest() + '.safetensors')
-        blob.write_bytes(raw)
-        code = tmp_path / f'code-{rank}.bin'
-        code.write_bytes(b'kernel')
-        bundle = BundleIndex(resources={'weights': Span(nbytes=len(contents)), 'kernel': Span(offset=4096, nbytes=6)})
-        bundle.allocations.add(name='weights', file='weights')
-        bundle.modules.add(name='kernel', file='kernel')
-        bundle.roce.world, bundle.roce.rank = 2, rank
-        path = tmp_path / f'peer-{rank}.json'
-        write_sources(path, ModelIndex(version=4, ranks=[bundle]),
-                      [(0, blob, 4096, len(contents)), (4096, code, 0, 6)])
-        return path
-
-    local, remote = sources(0), sources(1)
+    local = rank_source(tmp_path / 'local', data=b'weights-0')
+    remote = rank_source(tmp_path / 'remote', data=b'weights-1')
     received = tmp_path / 'received' / 'rank-1.json'
     report = transfer(remote, received, tmp_path / 'cache', streams=2)
-    assert report['files'] == 2
-    output = tmp_path / 'model.safetensors'
+    assert report['files'] == 3
+    output = tmp_path / 'package'
     with export_options(tmp_path / 'cache'):
-        combine(output, [local, received], [], publisher=publisher(), cluster=(2, 'snapshot-cluster'))
-    index, start = read_index(output)
-    assert index.cluster.world == 2 and index.cluster.export_id == 'snapshot-cluster'
-    with output.open('rb') as primary, PackageFiles(output, primary, start, 0) as files:
-        for rank in range(2):
-            span = index.ranks[rank].resources['weights']
-            source, base, _ = files.get(span.filename)
-            assert source.read_at(span.nbytes, base + span.offset) == f'weights-{rank}'.encode()
+        combine(output, [local, received], [], publisher=publisher(), cluster=(2, 'fixture-cluster'))
+    envelope = manifest(output)
+    deployment = schema()('DeploymentBody').FromString(envelope.deployments[0].body)
+    assert deployment.cluster.world == 2 and deployment.cluster.export_id == 'fixture-cluster'
+    assert len(envelope.ranks) == 2
+    contents = set()
+    for path in output.rglob('*.safetensors'):
+        with safe_open(path, framework='numpy') as file:
+            for key in file.keys():
+                contents.add(file.get_tensor(key).tobytes())
+    assert {b'weights-0', b'weights-1'} <= contents
 
 
 def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monkeypatch):

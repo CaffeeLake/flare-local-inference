@@ -329,7 +329,12 @@ pub fn publish(
             "published packages require at least one deployment",
         ));
     }
+    let progress = crate::startup::StartupProgress::stderr_rows();
+    let preflight_phase = progress.phase("Validate package publication", None);
     preflight(request, &destination)?;
+    preflight_phase.finish(format!("{} deployments", request.deployments.len()));
+    let frontend_bytes = request.payloads.iter().map(|payload| payload.nbytes()).sum();
+    let frontend_phase = progress.phase("Verify frontend payloads", Some(frontend_bytes));
     let mut package = request.package.clone();
     package.format_version = schema::FORMAT_VERSION;
     package.package_id = request.package_id.to_vec();
@@ -384,8 +389,10 @@ pub fn publish(
             relative: String::new(),
             tensor: Some(tensor.clone()),
         });
+        frontend_phase.advance_bytes(payload.nbytes());
     }
 
+    frontend_phase.finish(format!("{frontend_bytes} bytes"));
     let mut resource_id = 1u64;
     let mut resource_ids = std::collections::BTreeSet::new();
     let mut deployments = Vec::new();
@@ -404,6 +411,11 @@ pub fn publish(
             }) {
                 return Err(invalid("rank resources must list cubins before graphs"));
             }
+            let executable_bytes = rank.resources.iter().map(|resource| resource.nbytes).sum();
+            let executable_phase = progress.phase(
+                &format!("Compress and publish rank {} executables", rank.body.rank),
+                Some(executable_bytes),
+            );
             let mut groups: Vec<(wire::ExecutableKind, Vec<usize>)> = Vec::new();
             for (position, resource) in rank.resources.iter().enumerate() {
                 match groups.last_mut() {
@@ -427,9 +439,11 @@ pub fn publish(
                     .open(&scratch)
                     .map_err(|e| io("create executable payload", e))?;
                 let mut stored_end = 0u64;
+                let mut plaintext_bytes = 0u64;
                 let mut spans = Vec::with_capacity(indices.len());
                 for position in indices {
                     let resource = &rank.resources[position];
+                    executable_phase.detail(format!("compressing {}", resource.path.display()));
                     let compressed = compress_stream(
                         std::io::BufReader::new(
                             File::open(&resource.path)
@@ -448,6 +462,7 @@ pub fn publish(
                         compressed.chunk_sha256,
                     ));
                     resource_id += 1;
+                    plaintext_bytes += resource.nbytes;
                 }
                 output
                     .sync_all()
@@ -466,6 +481,7 @@ pub fn publish(
                 }
                 // Hash every fresh occurrence before deduplication. Identical rank groups
                 // share one companion; later occurrences still verify their bytes and length.
+                executable_phase.detail(format!("verifying and installing {payload_len} compressed bytes"));
                 let id = hash_file(&scratch, payload_len)?;
                 if !located.contains_key(&id) {
                     install_path_bytes(
@@ -488,6 +504,7 @@ pub fn publish(
                     )));
                 }
                 std::fs::remove_file(&scratch).map_err(|e| io("remove sealed scratch", e))?;
+                executable_phase.advance_bytes(plaintext_bytes);
                 let descriptor = wire::PayloadDescriptor {
                     id: id.as_bytes().to_vec(),
                     nbytes: payload_len,
@@ -524,7 +541,14 @@ pub fn publish(
                     ));
                 }
             }
+            executable_phase.finish(format!("{executable_bytes} plaintext bytes"));
+            let payload_bytes = rank.payloads.iter().map(|payload| payload.nbytes()).sum();
+            let data_phase = progress.phase(
+                &format!("Verify and publish rank {} data", rank.body.rank),
+                Some(payload_bytes),
+            );
             for payload in &rank.payloads {
+                data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
                 let id = payload.id;
                 if located.contains_key(&id) {
                     verify_payload_source(payload)?;
@@ -537,6 +561,7 @@ pub fn publish(
                     )?;
                     located.insert(id, ());
                 }
+                data_phase.advance_bytes(payload.nbytes());
                 let descriptor = wire::PayloadDescriptor {
                     id: id.as_bytes().to_vec(),
                     nbytes: payload.nbytes(),
@@ -552,6 +577,7 @@ pub fn publish(
                     tensor: None,
                 });
             }
+            data_phase.finish(format!("{payload_bytes} source bytes verified"));
             let ranks_count =
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
@@ -563,7 +589,10 @@ pub fn publish(
             });
             ranks.push((index as u32, rank_body.rank, encoded));
         }
+        let payload_bytes = deployment.payloads.iter().map(|payload| payload.nbytes()).sum();
+        let data_phase = progress.phase("Verify and publish shared data", Some(payload_bytes));
         for payload in &deployment.payloads {
+            data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
             let id = payload.id;
             if located.contains_key(&id) {
                 verify_payload_source(payload)?;
@@ -576,6 +605,7 @@ pub fn publish(
                 )?;
                 located.insert(id, ());
             }
+            data_phase.advance_bytes(payload.nbytes());
             let descriptor = wire::PayloadDescriptor {
                 id: id.as_bytes().to_vec(),
                 nbytes: payload.nbytes(),
@@ -590,6 +620,7 @@ pub fn publish(
                 tensor: None,
             });
         }
+        data_phase.finish(format!("{payload_bytes} source bytes verified"));
         let encoded = wire::DeploymentBody::encode_to_vec(&body);
         schema::validate_deployment(&body, &mut catalog)?;
         package.deployments.push(wire::DeploymentCommitment {
@@ -598,6 +629,7 @@ pub fn publish(
         });
         deployments.push((index as u32, encoded));
     }
+    let metadata_phase = progress.phase("Sign and publish package metadata", None);
     schema::validate_package(&package)?;
     let mut builder = EnvelopeBuilder::new(
         wire::PackageBody::encode_to_vec(&package),
@@ -650,6 +682,7 @@ pub fn publish(
         Destination::Directory(root) => write_primary(root, &bytes)?,
         Destination::Cache(_, staging) => staging.write("model.safetensors", &bytes)?,
     }
+    metadata_phase.finish(format!("{} metadata bytes", bytes.len()));
     let mut published: Vec<PublishedPayload> = published.into_values().collect();
     published.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(Published {

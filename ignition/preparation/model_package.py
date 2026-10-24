@@ -2,13 +2,15 @@
 
 from pathlib import Path
 
+from ignition.progress import phase
+
 from .runtime_package import export_model
-from .package_file import DEFAULT_SHARD_SIZE, combine
+from .package_file import combine
 from .memory_inventory import print_inventory
 
 
 def export_package(prepared, images, storage, path, *, options, publisher, progress=None, console=None,
-                   staging=None, shard_size=DEFAULT_SHARD_SIZE, form='directory'):
+                   staging=None, form='directory'):
     """Export every rank, close preparation resources, and assemble the model file.
 
     Ranks reuse immutable allocation blobs and stage execution resources under `staging`
@@ -45,24 +47,28 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
         inventories = [package.memory_inventory]
         memory = [[]] if storage.world == 1 else [list(storage.peer_storage.owned.items())]
         if storage.world > 1:
-            for control in prepared.controls:
-                reply = control.recv()
-                memory.append(reply['peer_memory'])
-                inventories.append(reply['memory_inventory'])
+            with phase(progress, "Wait for rank exports", total=storage.world - 1) as stage:
+                for control in prepared.controls:
+                    reply = control.recv()
+                    memory.append(reply['peer_memory'])
+                    inventories.append(reply['memory_inventory'])
+                    stage.update(advance=1)
         peers = []
         for rank, allocations in enumerate(memory):
             for address, size in allocations:
                 peers.append(dict(owner=rank, address=address, nbytes=size, readers=list(range(storage.world))))
         # The stage leases every cache payload the rank sources name, so peer
         # preparation leases can drop before combine reads them.
-        native_stage.retain_sources(roots)
-        prepared.close()
-        for region in storage.host_regions:
-            region.close()
+        with phase(progress, "Release preparation resources"):
+            native_stage.retain_sources(roots)
+            prepared.close()
+            for region in storage.host_regions:
+                region.close()
         result = combine(None if cache_only else path, roots, peers,
-                         publisher=publisher, shard_size=shard_size, form=form, cache_only=cache_only)
+                         publisher=publisher, form=form, cache_only=cache_only)
         print_inventory(inventories, console=console or getattr(progress, "console", None))
     finally:
         _OPTIONS.reset(token)
-        native_stage.close()
+        with phase(progress, "Clear export staging"):
+            native_stage.close()
     return result

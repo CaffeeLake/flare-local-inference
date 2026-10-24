@@ -3,7 +3,6 @@
 from pathlib import Path
 from ignition.preparation.runtime_package import export_model
 from ignition.preparation.memory_inventory import print_inventory
-from ignition.preparation.package_file import DEFAULT_SHARD_SIZE
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ignition.preparation.protection import Publisher
@@ -12,6 +11,7 @@ if __package__:
 else:
     import legacy_package
 
+DEFAULT_SHARD_SIZE = legacy_package.DEFAULT_SHARD_SIZE
 publish_legacy = legacy_package.publish_legacy
 extend_cluster_legacy = legacy_package.extend_cluster
 zstd_compress = legacy_package.zstd_compress
@@ -29,12 +29,8 @@ def publish_captured_legacy(path, sources, *, shard_size=DEFAULT_SHARD_SIZE):
     payload = [(offset, Path(source), start, size)
                for offset, source, start, size in record['payload']]
     physical = Path(sources).with_suffix('.safetensors')
-    signer = publisher()
-    publish_legacy(physical, index, payload, publisher=signer, shard_size=shard_size)
-    profiles = [{'namespace': signer.namespace, 'development': signer.development,
-                 'public_key': list(signer.public_key)}]
-    return flare_heliopause.export_convert(str(physical), str(path), json.dumps(profiles),
-                                           str(Path(path).parent / 'legacy-cache'), shard_size)
+    publish_legacy(physical, index, payload, publisher=publisher(), shard_size=shard_size)
+    legacy_package.snapshot_fixture(physical, path)
 
 
 def publisher():

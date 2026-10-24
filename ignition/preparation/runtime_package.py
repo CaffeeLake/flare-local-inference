@@ -100,7 +100,7 @@ class RuntimePackage:
             cubin_bytes=sum(len(image) for image in self.modules.values() if isinstance(image, bytes)))
 
     def write(self, path, graphs, *, execution=None, server=None, progress=None, package_data=None,
-              publisher=None, sources=False, shard_size=64 << 30, rebuild_weights=None, zero_ranges=()):
+              publisher=None, sources=False, rebuild_weights=None, zero_ranges=()):
         import flare_heliopause
         from .package_snapshot import _OPTIONS
         from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
@@ -123,7 +123,7 @@ class RuntimePackage:
             server=server, package_data=None if package_data is None else package_data.export_metadata(),
             rebuild_weights=None if rebuild_weights is None else rebuild_weights_metadata(rebuild_weights),
             weight_payload=weight_payload_request(rebuild_weights),
-            zero_ranges=list(zero_ranges), sources=sources, shard_size=shard_size,
+            zero_ranges=list(zero_ranges), sources=sources,
             options=_cache_options(cache))
         self.source_path = Path(path)
         self._capture(request, (self, self.owners, graphs), self.recorder)
@@ -158,7 +158,7 @@ def _publisher_metadata(publisher):
 
 
 def export_model(prepared, images, storage, path, *, options, progress=None, publisher=None, bundle_only=False,
-                 sources=False, shard_size=64 << 30):
+                 sources=False):
     """Hand captured handles and preparation metadata to the native exporter."""
     import flare_heliopause
     from .tensor_metadata import live_metadata
@@ -223,7 +223,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
         weight_payload=weight_payload_request(getattr(prepared, "rebuild_weights", None)),
-        options=_cache_options(cache), sources=sources, shard_size=shard_size)
+        options=_cache_options(cache), sources=sources)
     package = RuntimePackage(allocations=allocations, modules={}, kernels=(), owners=(prepared, storage, images))
     package.source_path = Path(path)
     package._capture(request, package.owners, images.native)

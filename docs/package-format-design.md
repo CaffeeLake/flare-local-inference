@@ -739,8 +739,7 @@ transaction and holds leases through rank transfer and entry publication.
 Ignition passes prepared resources, semantic declarations, destinations, and
 export options to Heliopause. Heliopause chooses temporary paths, manages rank
 files, checks destination conflicts, and cleans up failed exports. These rules
-apply to explicit destinations, cache-only exports, and compatible legacy
-package operations.
+apply to explicit destinations and cache-only exports.
 Configured export staging remains temporary workspace; it is not an independent
 persistent model store.
 
@@ -755,8 +754,9 @@ reads may improve throughput without changing initializer semantics or handle
 lifetimes. GPU storage and resource owners outlive all queued work.
 
 Format version dispatch is explicit. Payload format version 2 identifies the
-current executable representation. Old-layout internal tooling uses
-`ProtectedIndex` envelope 6. Absent Protobuf fields use their declared defaults.
+executable representation written by export, conversion, and signing.
+Legacy readers accept `ProtectedIndex` envelope 6. Absent Protobuf fields use
+their declared defaults.
 
 Legacy cache entries also use a primary-plus-companions directory, retaining the
 legacy primary's authenticated semantics and accepted companion encoding. Their
@@ -764,8 +764,8 @@ compatibility reader does not pretend those signatures authenticate payload-base
 metadata. Legacy immutable companions use container-digest keys under
 `blobs/legacy/`; payload-format companions use payload-digest keys under `blobs/`.
 Both use the same Rust publication, hardlink, lease, and reclamation facilities.
-Normalizing a legacy container with its existing keyless converter does not
-require signing; replacing its signed semantic format does.
+Legacy packages remain readable and servable; conversion and signing accept
+only payload-format packages.
 Legacy companions remain direct siblings of the primary under the exact
 container-digest basenames expected by the legacy layout. They are not moved into
 the payload format's `weights/` or `deployments/` subdirectories.

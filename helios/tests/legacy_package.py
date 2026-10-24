@@ -637,3 +637,50 @@ def read_index(path):
             result.ranks.add().CopyFrom(proto.RankProtection.FromString(rank.body).bundle)
     _validate_spans(result, length)
     return result, size + 8
+
+
+def snapshot_fixture(source, destination):
+    """Wrap physical envelope-6 fixture bytes in a hash-named snapshot layout."""
+    from ignition.preparation.package_snapshot import read_container
+
+    source, destination = Path(source), Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    index, _ = read_index(source)
+    names = {span.filename for _, _, span in resource_roles(index)} | {''}
+    layout = {'version': 1, 'files': {}}
+    for name in sorted(names):
+        physical = source.parent / name if name else source
+        header, base, envelope, _ = read_container(physical)
+        length = header['flare.payload']['shape'][0]
+        if not name:
+            metadata = envelope
+        if not length:
+            layout['files'][name] = []
+            continue
+        framing = container_header(length)
+        digest = hashlib.sha256(framing)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(framing)
+            with physical.open('rb') as file:
+                file.seek(base)
+                remaining = length
+                while remaining:
+                    block = file.read(min(remaining, COPY_BLOCK))
+                    if not block:
+                        raise ValueError('truncated legacy fixture payload')
+                    output.write(block)
+                    digest.update(block)
+                    remaining -= len(block)
+        blob = digest.hexdigest() + '.safetensors'
+        temporary.replace(destination.parent / blob)
+        layout['files'][name] = [[length, blob]]
+    encoded = json.dumps(layout, separators=(',', ':')).encode()
+    header = {'__metadata__': {'format': 'flare-snapshot'},
+              'flare.payload': {'dtype': 'U8', 'shape': [0], 'data_offsets': [0, 0]},
+              'flare.metadata': {'dtype': 'U8', 'shape': [len(metadata)], 'data_offsets': [0, len(metadata)]},
+              'flare.layout': {'dtype': 'U8', 'shape': [len(encoded)],
+                               'data_offsets': [len(metadata), len(metadata) + len(encoded)]}}
+    raw = json.dumps(header, separators=(',', ':')).encode()
+    raw = raw.ljust(align(8 + len(raw)) - 8, b' ')
+    destination.write_bytes(struct.pack('<Q', len(raw)) + raw + metadata + encoded)

@@ -144,7 +144,7 @@ def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
                 if layer_groups else declare_weights({"weight": tensors["weight"]},
                                                      components=("weight",)))
     package.write(root / ("rank.json" if legacy else "package"), graphs,
-                  publisher=None if legacy else publisher(), sources=legacy, shard_size=shard_size,
+                  publisher=None if legacy else publisher(), sources=legacy,
                   server=server_config(root),
                   rebuild_weights={"weight": tensors["weight"]} if legacy else declared)
     if legacy:

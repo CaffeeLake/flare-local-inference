@@ -1,13 +1,10 @@
 //! Rank assembly and immutable package publication.
 use super::archive::{self, Container, Layout};
-use super::blob::BlobStore;
-use super::io::{IoBudget, Source};
-use super::protection::{self, Publisher};
+use super::protection;
 use super::{
-    ExportOptions, ExportResult as Result, FilePart, FileSource, RankOutput, invalid, wire,
+    ExportResult as Result, FilePart, FileSource, RankOutput, invalid, wire,
 };
 use prost::Message;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,9 +15,6 @@ use std::{
     time::SystemTime,
 };
 
-pub(crate) const ALIGNMENT: u64 = 4096;
-pub(crate) const DEFAULT_SHARD_SIZE: u64 = 64 << 30;
-pub(crate) const MAX_PUBLISHED_BLOB_BYTES: u64 = 64_000_000_000;
 pub(crate) fn align(value: u64) -> Result<u64> {
     value
         .checked_add(4095)
@@ -38,7 +32,6 @@ pub(crate) enum SpanKey {
 pub(crate) struct Role {
     pub kind: u32,
     pub owner: Option<usize>,
-    pub key: SpanKey,
     pub span: wire::Span,
 }
 pub(crate) fn span_mut<'a>(index: &'a mut wire::ModelIndex, key: &SpanKey) -> &'a mut wire::Span {
@@ -101,7 +94,6 @@ pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
             result.push(Role {
                 kind,
                 owner: Some(owner),
-                key: SpanKey::Resource(owner, name.into()),
                 span: rank.resources[name].clone(),
             });
         }
@@ -114,11 +106,10 @@ pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
             return Err(invalid("allocation destination spans cannot name a file"));
         }
     }
-    for (i, asset) in index.assets.iter().enumerate() {
+    for asset in &index.assets {
         result.push(Role {
             kind: 3,
             owner: None,
-            key: SpanKey::Asset(i),
             span: asset
                 .payload
                 .clone()
@@ -126,13 +117,12 @@ pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
         });
     }
     if let Some(engram) = &index.engram {
-        for (i, table) in engram.tables.iter().enumerate() {
+        for table in &engram.tables {
             if table.shards.is_empty() {
                 for scales in [false, true] {
                     result.push(Role {
                         kind: 4,
                         owner: None,
-                        key: SpanKey::Table(i, None, scales),
                         span: if scales {
                             table.scales.clone()
                         } else {
@@ -147,7 +137,7 @@ pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
                         "partitioned embedding tables cannot also hold shared planes",
                     ));
                 }
-                for (j, shard) in table.shards.iter().enumerate() {
+                for shard in &table.shards {
                     if shard.rank as usize >= index.ranks.len() {
                         return Err(invalid("embedding partition owner outside package ranks"));
                     }
@@ -155,7 +145,6 @@ pub(crate) fn roles(index: &wire::ModelIndex) -> Result<Vec<Role>> {
                         result.push(Role {
                             kind: 4,
                             owner: Some(shard.rank as usize),
-                            key: SpanKey::Table(i, Some(j), scales),
                             span: if scales {
                                 shard.scales.clone()
                             } else {
@@ -501,514 +490,6 @@ pub(crate) fn combine(
     Ok((index, payload))
 }
 
-#[derive(Clone)]
-pub(crate) struct ResourceGroup {
-    pub roles: Vec<Role>,
-    pub filename: String,
-    pub offset: u64,
-    pub nbytes: u64,
-}
-pub(crate) fn groups(index: &wire::ModelIndex, shard_size: u64) -> Result<Vec<ResourceGroup>> {
-    if !(ALIGNMENT < shard_size && shard_size <= DEFAULT_SHARD_SIZE) {
-        return Err(invalid(
-            "payload shard limit must exceed 4096 bytes and be at most 64G",
-        ));
-    }
-    let limit = shard_size.min(MAX_PUBLISHED_BLOB_BYTES) - ALIGNMENT;
-    let mut roles = roles(index)?;
-    roles.sort_by_key(|r| (r.span.filename.clone(), r.span.offset));
-    let mut result: Vec<ResourceGroup> = Vec::new();
-    for role in roles {
-        if role.span.nbytes > limit {
-            return Err(invalid("package resource exceeds the payload shard limit"));
-        }
-        let append = result.last().is_some_and(|g| {
-            g.filename == role.span.filename
-                && g.roles[0].owner == role.owner
-                && (g.roles[0].kind == 4) == (role.kind == 4)
-                && role.span.offset + role.span.nbytes - g.offset <= limit
-        });
-        if append {
-            let group = result.last_mut().unwrap();
-            group.nbytes = role.span.offset + role.span.nbytes - group.offset;
-            group.roles.push(role);
-        } else {
-            result.push(ResourceGroup {
-                filename: role.span.filename.clone(),
-                offset: role.span.offset,
-                nbytes: role.span.nbytes,
-                roles: vec![role],
-            });
-        }
-    }
-    let mut segments = result.len();
-    let mut ends = BTreeMap::new();
-    for group in &result {
-        if group.offset > *ends.get(&group.filename).unwrap_or(&0) {
-            segments += 1;
-        }
-        ends.insert(group.filename.clone(), group.offset + group.nbytes);
-    }
-    if segments > 65536 {
-        return Err(invalid("snapshot has too many payload segments"));
-    }
-    Ok(result)
-}
-#[derive(Debug, Serialize)]
-pub(crate) struct PublishStats {
-    pub written: u64,
-    pub reused: u64,
-}
-
-pub(crate) fn publish(
-    path: &Path,
-    index: wire::ModelIndex,
-    payload: Vec<FilePart>,
-    publisher: Option<&Publisher>,
-    options: &ExportOptions,
-    shard_size: u64,
-) -> Result<PublishStats> {
-    publish_checked(
-        path,
-        index,
-        payload,
-        publisher,
-        options,
-        shard_size,
-        |_, _| Ok(()),
-    )
-}
-pub(crate) fn publish_checked(
-    path: &Path,
-    index: wire::ModelIndex,
-    payload: Vec<FilePart>,
-    publisher: Option<&Publisher>,
-    options: &ExportOptions,
-    shard_size: u64,
-    verify: impl Fn(&protection::Protected, &Layout) -> Result<()>,
-) -> Result<PublishStats> {
-    if path.try_exists()? {
-        return Err(invalid(format!("destination exists: {}", path.display())));
-    }
-    let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let Some(publisher) = publisher else {
-        write_staging(path, &index, &payload)?;
-        return Ok(PublishStats {
-            written: 0,
-            reused: 0,
-        });
-    };
-    let budget = IoBudget::for_ranks(1)?;
-    let stage = tempfile::Builder::new()
-        .prefix(".flare-protection-")
-        .tempdir_in(parent)?;
-    let progress = helios_core::startup::StartupProgress::stderr_rows();
-    let protected_bytes = roles(&index)?
-        .iter()
-        .filter(|r| r.kind != 4)
-        .map(|r| r.span.nbytes)
-        .sum::<u64>();
-    let protect_phase = progress.phase(
-        "Compress executable resources",
-        Some(protected_bytes),
-    );
-    let protected = protection::prepare(
-        index,
-        payload,
-        publisher,
-        stage.path(),
-        shard_size,
-        path.file_stem().and_then(|s| s.to_str()).unwrap_or("model"),
-        budget.clone(),
-        &protect_phase,
-    )?;
-    protect_phase.finish(format!(
-        "{} plaintext bytes read; {} compressed resources",
-        protected_bytes,
-        protected
-            .code
-            .values()
-            .map(|c| c.resources.len())
-            .sum::<usize>()
-    ));
-    let blob_bytes = groups(&protected.index, shard_size)?
-        .iter()
-        .map(|g| g.nbytes)
-        .sum();
-    let blob_phase = progress.phase("Hash and publish payload blobs", Some(blob_bytes));
-    let cache = options
-        .cache
-        .clone()
-        .unwrap_or_else(|| parent.join(".flare-cache"));
-    let store = BlobStore::new(&cache, budget.clone())?;
-    let (layout, hashes, detail) = publish_groups(
-        &store,
-        &protected,
-        options.no_weights,
-        shard_size,
-        &blob_phase,
-    )?;
-    for source in &protected.source_snapshots {
-        source.check_unchanged()?;
-    }
-    for parts in layout.files.values() {
-        for (_, name) in parts {
-            if !name.is_empty() {
-                store.link(name, parent)?;
-            }
-        }
-    }
-    verify(&protected, &layout)?;
-    blob_phase.finish(detail);
-    let sign_phase = progress.phase("Sign and publish package metadata", None);
-    let envelope = protected.envelope(publisher, &hashes)?;
-    store.sync()?;
-    archive::install_snapshot(path, &envelope, &layout)?;
-    sign_phase.finish(format!("{} metadata bytes", envelope.len()));
-    Ok(PublishStats {
-        written: store.written.load(std::sync::atomic::Ordering::Relaxed),
-        reused: store.reused.load(std::sync::atomic::Ordering::Relaxed),
-    })
-}
-
-pub(crate) fn publish_groups(
-    store: &BlobStore,
-    protected: &protection::Protected,
-    no_weights: bool,
-    shard_size: u64,
-    phase: &helios_core::startup::Phase,
-) -> Result<(Layout, BTreeMap<Option<usize>, Vec<u8>>, String)> {
-    use ring::digest;
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    };
-    let read = AtomicU64::new(0);
-    let hashed = AtomicU64::new(0);
-    let copied = AtomicU64::new(0);
-    let describe = || {
-        format!(
-            "{} source bytes read; {} bytes hashed; {} bytes copied; {} bytes installed; {} bytes reused",
-            read.load(Ordering::Relaxed),
-            hashed.load(Ordering::Relaxed),
-            copied.load(Ordering::Relaxed),
-            store.written.load(Ordering::Relaxed),
-            store.reused.load(Ordering::Relaxed)
-        )
-    };
-    let planned = groups(&protected.index, shard_size)?;
-    let mut source_files = BTreeMap::new();
-    for source in &protected.source_snapshots {
-        source_files.insert(source.path.clone(), source.clone());
-    }
-    let mut logical_sources = BTreeMap::new();
-    for (name, parts) in &protected.payloads {
-        let mut resources = Vec::with_capacity(parts.len());
-        for part in parts {
-            if !source_files.contains_key(&part.source.path) {
-                source_files.insert(
-                    part.source.path.clone(),
-                    protection::SourceSnapshot::open(&part.source.path)?,
-                );
-            }
-            let snapshot = &source_files[&part.source.path];
-            if part
-                .source
-                .offset
-                .checked_add(part.source.nbytes)
-                .is_none_or(|end| end > snapshot.identity.size)
-            {
-                return Err(invalid("export source range exceeds file"));
-            }
-            resources.push((part.offset, part.source.clone()));
-        }
-        logical_sources.insert(name.clone(), resources);
-    }
-    let active = Mutex::new(BTreeMap::<std::path::PathBuf, Source>::new());
-    let open_source = |source: &FileSource| -> Result<Source> {
-        let mut active = active
-            .lock()
-            .map_err(|_| invalid("publication source lock poisoned"))?;
-        if !active.contains_key(&source.path) {
-            let snapshot = &source_files[&source.path];
-            let pin = snapshot.source(0, snapshot.identity.size)?;
-            if active.len() == 8 {
-                active.pop_first();
-            }
-            active.insert(source.path.clone(), pin);
-        }
-        active[&source.path].slice(source.offset, source.nbytes)
-    };
-    let selections: Result<Vec<_>> = planned
-        .iter()
-        .map(|group| {
-            let parts = logical_sources
-                .get(&group.filename)
-                .ok_or_else(|| invalid("missing publication logical file"))?;
-            let first =
-                parts.partition_point(|(offset, source)| offset + source.nbytes <= group.offset);
-            let last = parts.partition_point(|(offset, _)| *offset < group.offset + group.nbytes);
-            Ok(&parts[first..last])
-        })
-        .collect();
-    let selections = selections?;
-    let fill = |i: usize, offset: u64, buffer: &mut [u8]| -> Result<()> {
-        let start = planned[i].offset + offset;
-        let end = start + buffer.len() as u64;
-        let mut cursor = start;
-        let selected = selections[i];
-        let first =
-            selected.partition_point(|(position, source)| position + source.nbytes <= start);
-        for (position, source) in &selected[first..] {
-            if *position >= end {
-                break;
-            }
-            let first = start.max(*position);
-            let stop = end.min(*position + source.nbytes);
-            if cursor < first {
-                buffer[(cursor - start) as usize..(first - start) as usize].fill(0);
-            }
-            if first < stop {
-                let source = open_source(source)?;
-                source.check_unchanged()?;
-                store.budget.read_at(
-                    &source,
-                    first - *position,
-                    &mut buffer[(first - start) as usize..(stop - start) as usize],
-                )?;
-                source.check_unchanged()?;
-                read.fetch_add(stop - first, Ordering::Relaxed);
-                cursor = stop;
-            }
-        }
-        if cursor < end {
-            buffer[(cursor - start) as usize..].fill(0);
-        }
-        Ok(())
-    };
-    let prepare = |i: usize, mut digest: Option<&mut digest::Context>| {
-        let group = &planned[i];
-        let selected = selections[i];
-        for (_, source) in selected {
-            source_files[&source.path].check_unchanged()?;
-        }
-        let source_blob = if selected.len() == 1
-            && selected[0].0 == group.offset
-            && selected[0].1.nbytes == group.nbytes
-        {
-            Some(open_source(&selected[0].1)?)
-        } else {
-            None
-        };
-        let prepared = store.prepare(
-            group.nbytes,
-            no_weights && group.roles[0].kind == 4,
-            source_blob.as_ref(),
-            |offset, buffer| {
-                fill(i, offset, buffer)?;
-                if let Some(hash) = digest.as_deref_mut() {
-                    hash.update(buffer);
-                }
-                hashed.fetch_add(buffer.len() as u64, Ordering::Relaxed);
-                phase.advance(buffer.len() as u64);
-                phase.detail(describe());
-                Ok(())
-            },
-        )?;
-        for (_, source) in selected {
-            source_files[&source.path].check_unchanged()?;
-        }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(prepared)
-    };
-    let owners: Vec<_> = protected.ranges.keys().copied().collect();
-    let writers = owners.len().min(4).min(store.budget.depth).max(1);
-    let (jobs, receiver) = mpsc::sync_channel::<(usize, super::blob::PreparedBlob)>(writers);
-    let receiver = Mutex::new(receiver);
-    let (hashes, mut names) = std::thread::scope(|scope| -> Result<_> {
-        let (outgoing, results) = mpsc::channel();
-        let mut workers = Vec::with_capacity(writers);
-        for _ in 0..writers {
-            let receiver = &receiver;
-            let outgoing = outgoing.clone();
-            let fill = &fill;
-            let selections = &selections;
-            let source_files = &source_files;
-            let copied = &copied;
-            let describe = &describe;
-            workers.push(scope.spawn(move || {
-                loop {
-                    let job = match receiver.lock() {
-                        Ok(receiver) => receiver.recv(),
-                        Err(_) => break,
-                    };
-                    let Ok((i, prepared)) = job else { break };
-                    let result = (|| {
-                        let name = store.commit(prepared, |offset, buffer| {
-                            fill(i, offset, buffer)?;
-                            copied.fetch_add(buffer.len() as u64, Ordering::Relaxed);
-                            phase.detail(describe());
-                            Ok(())
-                        })?;
-                        for (_, source) in selections[i] {
-                            source_files[&source.path].check_unchanged()?;
-                        }
-                        phase.detail(describe());
-                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((i, name))
-                    })();
-                    let _ = outgoing.send(result);
-                }
-            }));
-        }
-        drop(outgoing);
-        let submit = |i, prepared| -> Result<()> {
-            jobs.send((i, prepared))
-                .map_err(|_| invalid("payload writer queue closed"))
-        };
-        let stored: Result<Vec<_>> = owners
-            .par_iter()
-            .map(|owner| {
-                let mut digest = digest::Context::new(&digest::SHA256);
-                let zeros = [0u8; 4096];
-                for part in &protected.ranges[owner] {
-                    let mut cursor = part.offset;
-                    for (i, group) in planned.iter().enumerate().filter(|(_, g)| {
-                        g.roles[0].kind == 4
-                            && g.roles[0].owner == *owner
-                            && g.filename == part.filename
-                            && g.offset >= part.offset
-                            && g.offset + g.nbytes <= part.offset + part.nbytes
-                    }) {
-                        let mut gap = group.offset - cursor;
-                        while gap > 0 {
-                            let count = gap.min(zeros.len() as u64) as usize;
-                            digest.update(&zeros[..count]);
-                            gap -= count as u64;
-                        }
-                        let prepared = prepare(i, Some(&mut digest))?;
-                        submit(i, prepared)?;
-                        cursor = group.offset + group.nbytes;
-                    }
-                    let mut gap = part.offset + part.nbytes - cursor;
-                    while gap > 0 {
-                        let count = gap.min(zeros.len() as u64) as usize;
-                        digest.update(&zeros[..count]);
-                        gap -= count as u64;
-                    }
-                }
-                Ok((*owner, digest.finish().as_ref().to_vec()))
-            })
-            .collect();
-        let execution: Result<()> = if stored.is_ok() {
-            planned
-                .par_iter()
-                .enumerate()
-                .filter(|(_, g)| g.roles[0].kind != 4)
-                .try_for_each(|(i, _)| submit(i, prepare(i, None)?))
-        } else {
-            Ok(())
-        };
-        drop(jobs);
-        for worker in workers {
-            worker
-                .join()
-                .map_err(|_| invalid("payload writer panicked"))?;
-        }
-        let mut names = BTreeMap::new();
-        let mut write_error = None;
-        for result in results {
-            match result {
-                Ok((i, name)) => {
-                    names.insert(i, name);
-                }
-                Err(error) => {
-                    if write_error.is_none() {
-                        write_error = Some(error);
-                    }
-                }
-            }
-        }
-        let hashes = stored?.into_iter().collect::<BTreeMap<_, _>>();
-        execution?;
-        if let Some(error) = write_error {
-            return Err(error);
-        }
-        Ok((hashes, names))
-    })?;
-    let mut files = BTreeMap::from([(String::new(), Vec::new())]);
-    for (i, group) in planned.iter().enumerate() {
-        let entries = files.entry(group.filename.clone()).or_insert_with(Vec::new);
-        let cursor: u64 = entries.iter().map(|(n, _)| *n).sum();
-        if cursor < group.offset {
-            entries.push((group.offset - cursor, String::new()));
-        }
-        entries.push((
-            group.nbytes,
-            names
-                .remove(&i)
-                .ok_or_else(|| invalid("unpublished resource group"))?,
-        ));
-    }
-    Ok((Layout { version: 1, files }, hashes, describe()))
-}
-
-pub(crate) fn write_staging(
-    path: &Path,
-    index: &wire::ModelIndex,
-    payload: &[FilePart],
-) -> Result<()> {
-    let length = validate_payload(payload)?;
-    validate_index(index, length)?;
-    let metadata = index.encode_to_vec();
-    if metadata.is_empty() || metadata.len() > 128 << 20 {
-        return Err(invalid("model index exceeds its metadata limit"));
-    }
-    let header = archive::container_header(length, metadata.len() as u64, "flare-staging")?;
-    let directory = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(directory)?;
-    let (mut output, temporary) = archive::temporary(directory, "staging")?;
-    let mut installed = false;
-    let result = (|| {
-        output.write_all(&header)?;
-        let budget = IoBudget::for_ranks(1)?;
-        for part in payload {
-            let source = Source::open(&part.source.path, part.source.offset, part.source.nbytes)?;
-            let destination = header.len() as u64 + part.offset;
-            if destination % 4096 == 0 {
-                budget.copy(&source, &output, destination)?;
-            } else {
-                let mut cursor = destination;
-                budget.scan(&source, |block| {
-                    super::io::write_all_at(&output, block, cursor)?;
-                    cursor += block.len() as u64;
-                    Ok(())
-                })?;
-                source.check_unchanged()?;
-            }
-        }
-        use std::io::{Seek, SeekFrom};
-        output.seek(SeekFrom::Start(header.len() as u64 + length))?;
-        output.write_all(&metadata)?;
-        output.sync_all()?;
-        archive::install_file(&temporary, path)?;
-        installed = true;
-        archive::sync_directory(directory)
-    })();
-    let result = result.and(archive::remove_temporary(&temporary));
-    if result.is_err() && installed {
-        if let Ok(linked) = super::io::open_read(path) {
-            if super::io::Identity::of(&output)?.same_file(&super::io::Identity::of(&linked)?) {
-                fs::remove_file(path)?;
-            }
-        }
-    }
-    result
-}
-
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 fn py_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
@@ -1026,40 +507,6 @@ fn decode_payload(value: &str) -> Result<Vec<FilePart>> {
             },
         })
         .collect())
-}
-#[pyfunction]
-#[pyo3(signature=(path,index,payload,publisher,options,shard_size,form="directory"))]
-fn export_publish(
-    py: Python<'_>,
-    path: String,
-    index: Vec<u8>,
-    payload: String,
-    publisher: Option<String>,
-    options: String,
-    shard_size: u64,
-    form: &str,
-) -> PyResult<String> {
-    py.detach(|| {
-        let index = wire::ModelIndex::decode(index.as_slice())?;
-        let payload = decode_payload(&payload)?;
-        let publisher = publisher
-            .as_deref()
-            .map(serde_json::from_str::<protection::PublisherRequest>)
-            .transpose()?
-            .map(|p| p.publisher())
-            .transpose()?;
-        let options = serde_json::from_str(&options)?;
-        let result = publish(
-            Path::new(&path),
-            index,
-            payload,
-            publisher.as_ref(),
-            &options,
-            shard_size,
-        )?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(serde_json::to_string(&result)?)
-    })
-    .map_err(py_error)
 }
 #[pyfunction]
 #[pyo3(signature=(path,ranks,peer_memory,publisher,cluster,cache=None))]
@@ -1099,14 +546,13 @@ fn export_payload(
     .map_err(py_error)
 }
 #[pyfunction]
-#[pyo3(signature=(path,ranks,peer_memory,publisher,shard_size,cluster,cache,no_weights=false,form="directory"))]
+#[pyo3(signature=(path,ranks,peer_memory,publisher,cluster,cache,no_weights=false,form="directory"))]
 fn export_combine(
     py: Python<'_>,
     path: String,
     ranks: Vec<String>,
     peer_memory: String,
     publisher: Option<String>,
-    shard_size: u64,
     cluster: Option<String>,
     cache: Option<String>,
     no_weights: bool,
@@ -1125,35 +571,16 @@ fn export_combine(
             .map(|p| p.publisher())
             .transpose()?;
         let publisher = publisher.ok_or_else(|| invalid("export requires a publisher identity"))?;
-        let (index, payload) = combine(&sources, peers.clone(), cluster.clone())?;
-        let result = if metadata_only(&index) {
-            if form != "directory" {
-                return Err(invalid("packed form requires payload-format preparation"));
-            }
-            let options = ExportOptions {
-                cache: cache.map(PathBuf::from),
-                no_weights,
-            };
-            serde_json::to_value(publish(
-                Path::new(&path),
-                index,
-                payload,
-                Some(&publisher),
-                &options,
-                shard_size,
-            )?)?
-        } else {
-            publish_payload(
-                Path::new(&path),
-                &sources,
-                peers,
-                cluster,
-                &publisher,
-                cache.map(PathBuf::from),
-                no_weights,
-                form,
-            )?
-        };
+        let result = publish_payload(
+            Path::new(&path),
+            &sources,
+            peers,
+            cluster,
+            &publisher,
+            cache.map(PathBuf::from),
+            no_weights,
+            form,
+        )?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(serde_json::to_string(&result)?)
     })
     .map_err(py_error)
@@ -1272,7 +699,9 @@ pub(crate) fn publish_payload(
         .prefix(".flare-payload-")
         .tempdir_in(parent)?;
     let staging = staging_directory.path().to_path_buf();
+    let progress = helios_core::startup::StartupProgress::stderr_rows();
     let result = (|| -> Result<serde_json::Value> {
+        let assembly = progress.phase("Assemble package payloads", Some(ranks.len() as u64));
         let (index, payload) = combine(ranks, peer_memory, cluster.clone())?;
         let rank_count = u32::try_from(index.ranks.len()).map_err(|_| invalid("too many ranks"))?;
         let architecture = index.ranks[0].architecture.clone();
@@ -1401,6 +830,7 @@ pub(crate) fn publish_payload(
         let mut leases = Vec::new();
         let mut rank_plans = Vec::with_capacity(ranks.len());
         for (position, rank) in ranks.iter().enumerate() {
+            assembly.detail(format!("rank {position}"));
             rank_plans.push(rank_plan(
                 rank,
                 position as u32,
@@ -1411,6 +841,7 @@ pub(crate) fn publish_payload(
                 cache_root.as_ref(),
                 &mut leases,
             )?);
+            assembly.advance(1);
         }
         let deployment = pwire::DeploymentBody {
             deployment_id: deployment_id.clone(),
@@ -1438,6 +869,7 @@ pub(crate) fn publish_payload(
             accepted: publisher.namespace.clone(),
             no_weights,
         };
+        assembly.finish(format!("{rank_count} ranks"));
         if let Some(cache) = &cache {
             let root = helios_core::package::cache::Root::open(cache)?;
             // The cache owns model-key encoding: an unusable identity is an
@@ -1455,6 +887,7 @@ pub(crate) fn publish_payload(
                 publisher.signing_key(),
                 payload_export::Destination::Cache(&root, &mut staging_entry),
             )?;
+            let commit = progress.phase("Commit package", None);
             let payload_ids: Vec<String> = published
                 .payloads
                 .iter()
@@ -1529,6 +962,7 @@ pub(crate) fn publish_payload(
                     "publishing the default for completed cache entry {model_key}@{entry_id} failed: {error}; the entry is retained and the ref update may already be visible; verify with `flare models list`"
                 )));
             }
+            commit.finish(committed.directory().display().to_string());
             return Ok(serde_json::json!({
                 "format": format!("payload-{form}"),
                 "destination": if cache_only {
@@ -1557,6 +991,7 @@ pub(crate) fn publish_payload(
             publisher.signing_key(),
             payload_export::Destination::Directory(&package_directory),
         )?;
+        let commit = progress.phase("Commit package", None);
         let payload_ids: Vec<String> = published
             .payloads
             .iter()
@@ -1586,6 +1021,7 @@ pub(crate) fn publish_payload(
         } else {
             helios_core::package::export::publish_staged_directory(&package_directory, path)?;
         }
+        commit.finish(path.display().to_string());
         Ok(serde_json::json!({
             "format": format!("payload-{form}"),
             "path": path.display().to_string(),
@@ -1660,14 +1096,6 @@ fn materialize(
         span.nbytes,
         path,
     ))
-}
-
-/// Metadata-only packages (inspection, conversion, rebuild metadata) carry no
-/// serving rank geometry; the legacy publisher still emits them unchanged.
-fn metadata_only(index: &wire::ModelIndex) -> bool {
-    index.ranks.iter().any(|bundle| {
-        bundle.context.is_none() || bundle.graphs.is_empty() || bundle.allocations.is_empty()
-    })
 }
 
 /// Translate declared provenance exactly: source tensors, their ordered
@@ -2726,12 +2154,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_locate_sources, module)?)?;
     module.add_function(wrap_pyfunction!(export_roles, module)?)?;
     module.add_function(wrap_pyfunction!(export_validate_layout, module)?)?;
-    module.add_function(wrap_pyfunction!(export_write_primary, module)?)?;
     module.add_function(wrap_pyfunction!(export_signature_message, module)?)?;
     module.add_function(wrap_pyfunction!(export_validate_publisher, module)?)?;
     module.add_function(wrap_pyfunction!(export_validate_license, module)?)?;
     super::protection::register(module)?;
-    module.add_function(wrap_pyfunction!(export_publish, module)?)?;
     module.add_function(wrap_pyfunction!(export_payload, module)?)?;
     module.add_function(wrap_pyfunction!(export_combine, module)?)?;
     module.add_function(wrap_pyfunction!(export_write_sources, module)?)?;
@@ -2753,17 +2179,6 @@ fn export_roles(py: Python<'_>, index: Vec<u8>) -> PyResult<String> {
 fn export_validate_layout(layout: String) -> PyResult<()> {
     let layout: Layout = serde_json::from_str(&layout).map_err(py_error)?;
     layout.validate().map_err(py_error)
-}
-#[pyfunction]
-fn export_write_primary(
-    py: Python<'_>,
-    path: String,
-    envelope: Vec<u8>,
-    layout: String,
-) -> PyResult<()> {
-    let layout: Layout = serde_json::from_str(&layout).map_err(py_error)?;
-    py.detach(|| archive::install_snapshot(Path::new(&path), &envelope, &layout))
-        .map_err(py_error)
 }
 #[pyfunction]
 fn export_signature_message<'py>(
@@ -2894,91 +2309,6 @@ fn export_read_index_fd<'py>(
         })
         .map_err(py_error)?;
     Ok((PyBytes::new(py, &bytes), base))
-}
-
-#[cfg(test)]
-mod staging_tests {
-    use super::*;
-
-    fn index() -> wire::ModelIndex {
-        wire::ModelIndex {
-            version: 4,
-            ranks: vec![wire::BundleIndex::default()],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn staging_publishes_complete_metadata_without_replacing_existing_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested/model.safetensors");
-        write_staging(&path, &index(), &[]).unwrap();
-        let container = Container::open(&path).unwrap();
-        assert_eq!(container.format, "flare-staging");
-        assert_eq!(
-            wire::ModelIndex::decode(container.envelope.as_slice()).unwrap(),
-            index()
-        );
-        let original = fs::read(&path).unwrap();
-        assert!(write_staging(&path, &index(), &[]).is_err());
-        assert_eq!(fs::read(&path).unwrap(), original);
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn staging_source_failure_leaves_no_primary_or_temporary() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("model.safetensors");
-        let payload = [FilePart {
-            offset: 0,
-            source: FileSource {
-                path: directory.path().join("missing"),
-                offset: 0,
-                nbytes: 3,
-            },
-        }];
-        assert!(write_staging(&path, &index(), &payload).is_err());
-        assert!(!path.exists());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn staging_header_failure_leaves_no_primary_or_temporary() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "export::package::staging_tests::staging_header_failure_child",
-                "--ignored",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore]
-    fn staging_header_failure_child() {
-        unsafe {
-            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-        }
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) },
-            0
-        );
-        limit.rlim_cur = limit.rlim_cur.min(128);
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) }, 0);
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("model.safetensors");
-        assert!(write_staging(&path, &index(), &[]).is_err());
-        assert!(!path.exists());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
-    }
 }
 
 #[cfg(test)]

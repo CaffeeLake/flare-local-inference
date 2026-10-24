@@ -8,7 +8,6 @@ from . import runtime_package_pb2 as proto
 ALIGNMENT = 4096
 MAX_HEADER_BYTES = 64 << 10
 MAX_INDEX_BYTES = 128 << 20
-DEFAULT_SHARD_SIZE = 64 << 30
 
 
 def align(value):
@@ -77,23 +76,6 @@ def _export_native(path, form, publish, cache_only=False):
     return publish(destination, form)
 
 
-def publish(path, index, payload, *, publisher=None, shard_size=DEFAULT_SHARD_SIZE, form=None):
-    import flare_heliopause
-    from types import SimpleNamespace
-    form = package_form(path, form)
-    options = _options(path)
-    encoded = index.SerializeToString(deterministic=True)
-    packed = _payload(payload)
-    value = _export_native(path, form,
-        lambda destination, selected: flare_heliopause.export_publish(
-            destination, encoded, packed,
-            None if publisher is None else json.dumps(publisher.native_request),
-            json.dumps(options), shard_size, selected))
-    result = json.loads(value)
-    result.setdefault('form', form)
-    return SimpleNamespace(**result)
-
-
 def write_sources(path, index, payload, *, hardware=None, weight_payload=None):
     """Write one staged rank source, carrying captured side metadata forward."""
     import json
@@ -122,7 +104,7 @@ def read_sources(path):
     return index, locate
 
 
-def combine(path, ranks, peer_memory, *, publisher=None, shard_size=DEFAULT_SHARD_SIZE,
+def combine(path, ranks, peer_memory, *, publisher=None,
             cluster=None, form=None, cache_only=False):
     import flare_heliopause
     from types import SimpleNamespace
@@ -136,7 +118,7 @@ def combine(path, ranks, peer_memory, *, publisher=None, shard_size=DEFAULT_SHAR
     form = package_form(path if path is not None else 'cache', form)
     value = _export_native(path, form,
         lambda destination, selected: flare_heliopause.export_combine(
-            destination, sources, peers, publisher_request, shard_size, cluster_request,
+            destination, sources, peers, publisher_request, cluster_request,
             options['cache'], options['no_weights'], selected),
         cache_only=cache_only)
     result = json.loads(value)
