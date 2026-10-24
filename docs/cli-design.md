@@ -101,7 +101,7 @@ flare/target/release/flare run PACKAGE --gpus 0 --host 127.0.0.1 --port 8000
 ```
 flare run [PACKAGE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared package
-flare inspect PACKAGE [--tensor-parallel N] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
+flare inspect PACKAGE|MODEL[@VERSION] [--tensor-parallel N] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -446,9 +446,13 @@ zero disables that term. Terminal age starts when termination is observed and
 includes queued-work drainage. These are scheduling preferences, not deadlines.
 The controls use existing snapshot graphs and require no package re-export.
 
-`flare run PACKAGE` loads an exported file without the Ignition configuration
-reader. `PACKAGE` can also be a Hugging Face repository ID with an optional
-`@revision`; Flare downloads its prepared package before loading it. A
+`flare run PACKAGE` loads an exported file and reads host defaults from
+`~/.config/flare/config.toml` using its Rust configuration reader. `--config PATH`
+selects another file. Explicit flags override configuration values. `PACKAGE` accepts a
+local path or `MODEL[@VERSION]`. A model name resolves its selected version in
+the Flare cache before any repository lookup. An unknown name can be a Hugging
+Face repository ID with an optional `@revision`; Flare downloads its prepared
+package before loading it. A
 [serving container](container.md) packages Flare and Helios without
 Python or the CUDA toolkit. `flare --help` lists commands; `flare run --help`,
 `flare run -h`, and `flare help run` describe every serving option, its defaults,
@@ -466,13 +470,13 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--trust-store PATH` | Persistent key/namespace acceptance file | `~/.config/flare/trust.toml` |
 | `--verify-weights` | Verify the stored allocation and table ranges of the ranks served before loading model GPU resources | off |
 | `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | First N visible GPUs for the package's N local ranks; one GPU per host for multi-host packages |
-| `--host ADDR` | Listener IP address, IPv4 or IPv6 | `127.0.0.1` |
-| `--port N` | Listener port | `8000` |
+| `--host ADDR` | Listener IP address, IPv4 or IPv6 | `[server] host`, otherwise `127.0.0.1` |
+| `--port N` | Listener port | `[server] port`, otherwise `8000` |
 | `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
-| `--api-key-file PATH` | File containing the serving API key | No authentication |
-| `--max-concurrency N` | Reduce concurrency within captured batch capacities | Package default |
+| `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
+| `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise package default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
-| `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`), or fraction of total memory (`0.8`) | Package serving reserve |
+| `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; existing packages retain recorded defaults unless overridden |
@@ -574,7 +578,8 @@ fractions, nonfinite values, and overflowing sizes are rejected. Both
 `--memory-limit -30g` and `--memory-limit=-30g` work.
 
 An explicit memory flag replaces the package's serving reserve; the two are
-never subtracted together. Omission preserves the exported `[memory] reserve`.
+never subtracted together. Without a flag, an explicitly configured `[memory] reserve`
+replaces the exported reserve; an absent setting preserves the package value.
 Integrated GPUs also count resident host tables, embedding row caches, and
 future prefix-cache host pools in the same physical budget. Shared host memory
 is charged once per host. The existing driver margin, host allowance, and
@@ -638,9 +643,9 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Detected `gb10` or `gb202` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
-| `--cache-dir PATH` | Hugging Face hub cache directory | `~/.cache/huggingface/hub` from the OS user account |
+| `--cache-dir PATH` | Parent for temporary prepared-package transport staging | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
 | `--offline` | Resolve prepared packages only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local package path | Off |
 | `--model-cache PATH` | Flare prepared-model cache directory | `paths.package_cache`, otherwise `~/.cache/flare/packages` |
@@ -659,6 +664,20 @@ lookup and transfer to preserve that sharing. Reuse operates on complete files;
 downloads use resumable HTTP transfers through `hf-hub`, without Xet chunk
 reconstruction. A cached blob with an unexpected size or file type reports an
 error. Package signature verification still occurs when serving.
+
+`flare run MODEL` leases the selected local default first. Locally exported
+versions have no download origin and do not trigger repository lookup. A
+version downloaded from Hugging Face retains its acquisition repository,
+revision, filename, and TP selection independently of moving source references.
+For an unqualified model name, Flare checks that recorded repository and revision
+for updates, even when the repository differs from the signed model identity.
+An unchanged commit requires no package transfer. A changed commit is acquired
+and verified before the model default switches. An update naming a different
+model is rejected. Failed checks or acquisitions leave the default unchanged;
+`--offline` skips the check. Explicit `MODEL@VERSION` and package paths stay
+pinned. `--revision` and `--filename` can override an unqualified HF-origin
+model's source, but cannot override an explicit local version. A missing version
+or default of a known local model is an error, not a repository lookup.
 
 Successful downloads record repository, requested revision, resolved commit,
 filename, TP selection, and the SHA-256 of the exact signed envelope authenticated
@@ -769,7 +788,7 @@ The printed cache entry is self-contained and can be uploaded to the recipe's
 repository with the Hugging Face upload client as either canonical form. Export
 and conversion do not upload or change publisher trust. Removing an entry removes
 its hard links; shared payload objects remain available for other entries, and
-`flare cache gc` reclaims objects nothing references.
+`flare models gc` reclaims objects nothing references.
 
 ### Signing and local development
 
@@ -863,7 +882,32 @@ the `publisher.json` beside the signing key to `flare run --publisher-keys PATH`
 
 `~/.config/flare/config.toml`. All keys optional. Written on first export with
 the resolved values present as comments.
-`[server]` configures `ignition serve`; pass native serving options to `flare run`.
+Ignition and native Flare read this file; `--config PATH` selects another file.
+An absent default file supplies no overrides; an explicitly selected missing
+file or an invalid runtime setting is an error. Help does not read the file.
+
+Native `flare run` applies `[server] host`, `port`, and `api_key`, `[memory] reserve`,
+`[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
+settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
+use `[paths] package_cache`. Flags override these defaults, including explicit
+zero limits and values equal to the built-in defaults. An empty `--api-key-file`
+disables configured authentication; API keys are never forwarded as arguments.
+
+Model overrides match the signed canonical model ID and serving aliases, independently
+of the package filename and `--served-model-name`. Conflicting concurrency values
+for matching names are rejected unless `--max-concurrency` supplies the value.
+Configured concurrency must fit the package's prepared capacities.
+
+`[publishing]`, `[preparation]`, `defaults.model`, image concurrency, speculative
+graph preparation settings, and the checkpoint, kernel, staging, and toolkit paths
+remain preparation settings. `flare run` requires a package; it does not interpret
+an Ignition recipe alias as a prepared package. `paths.hub_cache` does not select
+prepared-package transport staging or the model cache.
+
+Each Orbit node reads its own host configuration when its rank starts; saved group
+options and explicit flags take precedence. `--config` on the controller selects
+its local file, not a file on remote nodes. Every rank must use compatible serving
+settings. `flare run --hosts` forwards resolved runtime options to its peer ranks.
 
 ```toml
 [server]
@@ -882,6 +926,11 @@ max_concurrency = 4
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
 
+[prefix_cache]
+memory = ""                      # Host retention budget; empty: disabled.
+disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
+disk_transport = ""              # Empty: staged; also accepts direct.
+
 [models."qwen3.8-flash"]          # Per-model overrides of [defaults].
 max_concurrency = 2
 
@@ -889,6 +938,7 @@ max_concurrency = 2
 hub_cache = "~/.cache/huggingface/hub"
 kernel_cache = "~/.cache/flare/kernels"
 package_cache = "~/.cache/flare/packages"
+prefix_cache = ""                # Host checkpoint directory; empty: disk retention disabled.
 export_staging = ""               # Rank files an export assembles from; empty: beside the package.
 cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
@@ -917,8 +967,9 @@ Seed remains request-controlled.
 
 `memory.reserve` exists for one case: a process that starts after Flare and
 needs GPU memory. Processes already running when Flare starts need no
-setting, because supply is free memory rather than card size. It lives in the configuration file and is exported as the package's serving
-reserve.
+setting, because supply is free memory rather than card size. Preparation records
+it as the package's serving reserve. Native serving uses an explicit host configuration
+value in preference to that recorded reserve.
 
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
@@ -944,7 +995,7 @@ Configuration assigns each decision to one owner:
 | Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
-| Serving memory budget | Runtime `--memory-limit`, otherwise exported `[memory] reserve` |
+| Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the package reserve |
 | Preparation headroom | 1 GiB for compiled warmup and capture |
 | Serving driver margin | 64 MiB after graph upload |
 | Prefill chunk | Recipe default, overridden by `--prefill-chunk-size` |
@@ -957,7 +1008,7 @@ Configuration assigns each decision to one owner:
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
 | Served names | Recipe alias and repository ID, exposed through `/v1/models` |
-| API key | Ignition configuration or native `--api-key-file`; excluded from packages |
+| API key | `[server] api_key`, overridden by native `--api-key-file`; excluded from packages |
 | Sampling distribution controls | Recipe defaults and optional model-author ranges; request values clamp to ranges, or to defaults when no range exists |
 | Seed, output limit, and stops | Request fields, with declared defaults for missing values |
 
@@ -1039,6 +1090,13 @@ After startup, a usable terminal switches to the live metrics dashboard.
 Shutdown restores the terminal after draining active execution.
 
 ### 5.3 `flare inspect`
+
+`flare inspect` and `flare models inspect` share the same arguments and inspection
+implementation. The target accepts a local package path, `MODEL@VERSION`, or a
+model identity selecting its default version. Model selection uses `--model-cache`
+or configured model storage and holds a lease until inspection finishes. Existing
+paths take precedence over model selectors, including paths containing `@`;
+absolute paths and paths prefixed with `./` or `../` are always treated as paths.
 
 Print a compact model summary: identity and publisher verification, architecture,
 served names, context and execution capacities, cache history kinds, speculation,
@@ -1267,20 +1325,24 @@ Cross-node tensor parallelism across supported hosts is in scope. The
 distribution, and rank process management. `flare run` executes its assigned
 rank. See [Orbit](orbit.md) and [multi-host serving](multi-host.md).
 
-## Prepared-model cache commands
+## Local model management
 
-`flare cache` manages the prepared-model cache selected by the global
+`flare models` manages the prepared-model cache selected by the global
 `--model-cache PATH` flag, which resolves exactly as `HubOptions.model_cache`
 does: an explicit path wins, then `paths.package_cache` from
 `~/.config/flare/config.toml`, then `~/.cache/flare/packages`.
 
 ```sh
-flare cache list [MODEL] [--json]
-flare cache inspect MODEL@VERSION [inspection flags]
-flare cache select MODEL@VERSION
-flare cache remove MODEL@VERSION [--clear-default]
-flare cache gc [--json]
+flare models list [MODEL] [--json]
+flare models inspect PACKAGE|MODEL[@VERSION] [inspection flags]
+flare models download REPOSITORY [download flags]
+flare models select MODEL@VERSION
+flare models remove MODEL@VERSION [--clear-default]
+flare models gc [--json]
 ```
+
+`flare models download` is an alias for `flare download`, with identical flags,
+configuration precedence, acquisition behavior, and package-path output.
 
 Entries are immutable directory-form packages. `select` writes the model's
 default ref atomically and refuses an entry that is not published. `remove`
@@ -1290,11 +1352,17 @@ silently. `gc` runs the cache's collection pass: it removes abandoned staging
 trees, unreferenced payload objects, and unreferenced legacy containers. It does
 not evict published entries, selected refs, or leased objects. A failed export
 leaves only an abandoned staging tree, which `gc` reclaims; an entry that was
-already published under `models/` is removed only by `cache remove`. There is no
+already published under `models/` is removed only by `models remove`. There is no
 automatic reclamation of published entries.
 
+Human-readable output groups versions by model, marks the selected default and
+entries in use, and formats storage sizes in binary units and capacities with
+digit separators. `--plain` disables terminal styling for every `models`
+subcommand; redirected output is unstyled. `--json` retains exact byte counts
+and structured fields. `inspect` uses the package inspection presentation.
+
 `list` reports each model, its versions, the selected default, per-deployment
-tensor-parallel size and serving capacities, and three distinct byte figures:
+tensor-parallel size and serving capacities, and distinct storage figures:
 
 - `logical_bytes` is the sum of unique payload lengths named by the signed
   manifests. It is not disk usage and is never reclaimable by deleting the cache.
@@ -1312,7 +1380,7 @@ tensor-parallel size and serving capacities, and three distinct byte figures:
 
 `list` metadata is explicitly unverified: it decodes the manifest to report
 identity, deployments, and capacities without claiming authentication.
-`inspect` resolves `MODEL@VERSION` to the entry directory while holding its
+`inspect` resolves `MODEL[@VERSION]` to the selected version while holding its
 lease and then runs the normal package inspection path, so
 `--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
 `--tensor-parallel`, and the section flags keep their established semantics. It does not gain a separate

@@ -581,6 +581,7 @@ executable caches with distinct purposes remain separate.
     ...
   refs/...
   sources/...                             # Acquisition selectors to cache entries.
+  origins/...                             # Per-version acquisition origins.
   staging/...
   locks/...
 ```
@@ -601,6 +602,15 @@ Concurrent operations serialize their ref
 updates; the last successful ref update selects the default. Switching the default
 retains preceding entries and does not change versions held by running processes.
 An explicit version selection overrides the default during resolution.
+
+Unqualified model names resolve the local default before repository lookup.
+HF-acquired versions retain their repository, requested revision, resolved commit,
+filename, TP selection, and signed-envelope binding in a per-version origin record.
+A moving acquisition selector cannot erase an earlier version's origin. Online
+runs check that recorded source and automatically acquire and select an available
+update; an unchanged commit transfers no package bytes. Locally exported versions
+have no download origin. Explicit versions and offline runs do not check for
+updates. Origin records are removed with their versions.
 
 Offline repository resolution uses only acquisition references and entries in
 the Flare model cache. Successful downloads record the repository, requested

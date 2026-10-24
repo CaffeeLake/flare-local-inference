@@ -308,22 +308,31 @@ fn offline_download_uses_the_selected_flare_cache_entry_and_rejects_hf_only_cach
         )
         .unwrap();
 
-    let output = flare(&[
-        "download",
-        &format!("owner/model@{commit}"),
-        "--offline",
-        "--model-cache",
-        model_cache.to_str().unwrap(),
-        "--publisher-keys",
-        profile.to_str().unwrap(),
-        "--trust-store",
-        trust_store.to_str().unwrap(),
-    ]);
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        entry.directory().display().to_string()
-    );
+    store.publish_entry_source(
+        &serde_json::json!(["huggingface", "owner/model", commit, "model.safetensors", [1]]).to_string(),
+        commit, &entry, *PayloadId::of(&metadata.envelope).as_bytes(),
+    ).unwrap();
+
+    for command in [vec!["download"], vec!["models", "download"]] {
+        let repository = format!("owner/model@{commit}");
+        let mut arguments = command;
+        arguments.extend([
+            &repository,
+            "--offline",
+            "--model-cache",
+            model_cache.to_str().unwrap(),
+            "--publisher-keys",
+            profile.to_str().unwrap(),
+            "--trust-store",
+            trust_store.to_str().unwrap(),
+        ]);
+        let output = flare(&arguments);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            entry.directory().display().to_string()
+        );
+    }
 
     let hf_cache = temp.path().join("hf-only");
     let snapshot = hf_cache
@@ -405,7 +414,7 @@ fn usage_errors_identify_the_problem_before_accessing_files() {
     for (arguments, expected) in [
         (vec![], "Usage: flare"),
         (vec!["run"], "<PACKAGE>"),
-        (vec!["inspect"], "<PACKAGE>"),
+        (vec!["inspect"], "<PACKAGE|MODEL[@VERSION]>"),
         (vec!["rnu"], "unrecognized subcommand"),
         (
             vec!["run", "/nonexistent/model", "--bogus"],
@@ -460,4 +469,47 @@ fn usage_errors_identify_the_problem_before_accessing_files() {
         assert!(error.contains(expected), "{arguments:?}: {error}");
         assert!(error.contains("--help"), "{arguments:?}: {error}");
     }
+}
+
+#[test]
+fn configuration_is_loaded_by_the_native_entrypoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    let missing = temp.path().join("missing.safetensors");
+    let config_arg = config.to_str().unwrap();
+    let package_arg = missing.to_str().unwrap();
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read"));
+
+    std::fs::write(&config, "[memory]\nreserve = 'invalid'\n").unwrap();
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("memory.reserve"), "{error}");
+    assert!(!error.contains("cannot access package"), "{error}");
+    assert!(
+        flare(&["run", "--config", config_arg, "--help"])
+            .status
+            .success()
+    );
+
+    let cache = temp.path().join("models");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nhost = '::1'\n[paths]\npackage_cache = {:?}\n",
+            cache.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = flare(&["models", "list", "--json", "--config", config_arg]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cache.is_dir(), "configured cache must be opened");
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot access package"));
 }

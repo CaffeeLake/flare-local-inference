@@ -1,4 +1,4 @@
-//! Integration tests for `flare cache` against a real, CPU-prepared package fixture.
+//! Integration tests for `flare models` against a real, CPU-prepared package fixture.
 //!
 //! Every test builds a signed payload-format package with the native export API,
 //! installs it into a temporary model cache, and drives the actual `flare` binary.
@@ -191,7 +191,7 @@ fn install_pair() -> (tempfile::TempDir, Fixture, String) {
 fn list_reports_default_deployment_and_unverified_metadata() {
     let (scratch, fixture, _) = install_pair();
     let output = flare(&[
-        "cache",
+        "models",
         "list",
         "--json",
         "--model-cache",
@@ -244,19 +244,19 @@ fn select_changes_default_and_remove_requires_clear_default() {
     let (scratch, fixture, second) = install_pair();
     let cache = fixture.cache.to_str().unwrap();
     let spec = "namespaced/model@version-one".to_string();
-    let output = flare(&["cache", "select", &spec, "--model-cache", cache]);
+    let output = flare(&["models", "select", &spec, "--model-cache", cache]);
     assert!(
         output.status.success(),
         "{:?}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let listing = flare(&["cache", "list", "--json", "--model-cache", cache]);
+    let listing = flare(&["models", "list", "--json", "--model-cache", cache]);
     let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert_eq!(listing["models"][0]["default"], "version-one");
 
     let output = flare(&[
-        "cache",
+        "models",
         "remove",
         &format!("namespaced/model@{second}"),
         "--model-cache",
@@ -269,7 +269,7 @@ fn select_changes_default_and_remove_requires_clear_default() {
     );
 
     let selected = "namespaced/model@version-one".to_string();
-    let output = flare(&["cache", "remove", &selected, "--model-cache", cache]);
+    let output = flare(&["models", "remove", &selected, "--model-cache", cache]);
     assert!(!output.status.success(), "selected default was removed");
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -278,7 +278,7 @@ fn select_changes_default_and_remove_requires_clear_default() {
     );
 
     let output = flare(&[
-        "cache",
+        "models",
         "remove",
         &selected,
         "--clear-default",
@@ -290,7 +290,7 @@ fn select_changes_default_and_remove_requires_clear_default() {
         "{:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let listing = flare(&["cache", "list", "--json", "--model-cache", cache]);
+    let listing = flare(&["models", "list", "--json", "--model-cache", cache]);
     let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert!(
         listing["models"]
@@ -311,12 +311,12 @@ fn remove_refuses_a_leased_entry_until_the_lease_ends() {
     // the refusal under test is the lease, not the default.
     let lease = store.entry(&fixture.model, "version-one").unwrap();
     let spec = "namespaced/model@version-one".to_string();
-    let output = flare(&["cache", "remove", &spec, "--model-cache", cache_path]);
+    let output = flare(&["models", "remove", &spec, "--model-cache", cache_path]);
     assert!(!output.status.success(), "leased entry was removed");
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("leased"), "{error}");
     drop(lease);
-    let output = flare(&["cache", "remove", &spec, "--model-cache", cache_path]);
+    let output = flare(&["models", "remove", &spec, "--model-cache", cache_path]);
     assert!(
         output.status.success(),
         "{:?}",
@@ -342,7 +342,7 @@ fn shared_objects_survive_gc_and_external_links_are_not_reclaimed() {
     let external = scratch.path().join("external-link.safetensors");
     std::fs::hard_link(&blob, &external).unwrap();
 
-    let output = flare(&["cache", "gc", "--json", "--model-cache", cache_path]);
+    let output = flare(&["models", "gc", "--json", "--model-cache", cache_path]);
     assert!(
         output.status.success(),
         "{:?}",
@@ -356,7 +356,7 @@ fn shared_objects_survive_gc_and_external_links_are_not_reclaimed() {
     assert!(external.exists(), "externally linked object was reclaimed");
 
     std::fs::remove_file(&external).unwrap();
-    let listing = flare(&["cache", "list", "--json", "--model-cache", cache_path]);
+    let listing = flare(&["models", "list", "--json", "--model-cache", cache_path]);
     let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     let versions = listing["models"][0]["versions"].as_array().unwrap();
     assert!(
@@ -371,13 +371,13 @@ fn shared_objects_survive_gc_and_external_links_are_not_reclaimed() {
 fn missing_version_removal_fails_without_moving_the_default() {
     let (scratch, fixture, _) = install_pair();
     let cache = fixture.cache.to_str().unwrap();
-    let listing = flare(&["cache", "list", "--json", "--model-cache", cache]);
+    let listing = flare(&["models", "list", "--json", "--model-cache", cache]);
     let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert_eq!(listing["models"][0]["default"], "version-two");
 
     let before = listing["models"][0]["versions"].as_array().unwrap().len();
     let output = flare(&[
-        "cache",
+        "models",
         "remove",
         "namespaced/model@version-missing",
         "--model-cache",
@@ -389,7 +389,7 @@ fn missing_version_removal_fails_without_moving_the_default() {
         error.contains("missing") || error.contains("not published") || error.contains("version"),
         "{error}"
     );
-    let after = flare(&["cache", "list", "--json", "--model-cache", cache]);
+    let after = flare(&["models", "list", "--json", "--model-cache", cache]);
     let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
     assert_eq!(after["models"][0]["default"], "version-two");
     assert_eq!(
@@ -404,7 +404,7 @@ fn removing_a_non_default_version_leaves_the_selected_default_in_place() {
     let (scratch, fixture, _) = install_pair();
     let cache = fixture.cache.to_str().unwrap();
     let output = flare(&[
-        "cache",
+        "models",
         "select",
         "namespaced/model@version-two",
         "--model-cache",
@@ -417,7 +417,7 @@ fn removing_a_non_default_version_leaves_the_selected_default_in_place() {
     );
 
     let output = flare(&[
-        "cache",
+        "models",
         "remove",
         "namespaced/model@version-one",
         "--model-cache",
@@ -428,7 +428,7 @@ fn removing_a_non_default_version_leaves_the_selected_default_in_place() {
         "{:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let listing = flare(&["cache", "list", "--json", "--model-cache", cache]);
+    let listing = flare(&["models", "list", "--json", "--model-cache", cache]);
     let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert_eq!(listing["models"][0]["default"], "version-two");
     let versions = listing["models"][0]["versions"].as_array().unwrap();
@@ -439,29 +439,37 @@ fn removing_a_non_default_version_leaves_the_selected_default_in_place() {
 }
 
 #[test]
-fn inspect_reports_the_cached_entry_metadata() {
+fn inspect_aliases_accept_versions_and_package_paths() {
     let (scratch, fixture, _) = install_pair();
     let cache = fixture.cache.to_str().unwrap();
-    let output = flare(&[
-        "cache",
-        "inspect",
-        "namespaced/model@version-two",
-        "--json",
-        "--unverified",
-        "--model-cache",
-        cache,
-    ]);
-    assert!(
-        output.status.success(),
-        "{:?}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    // `--unverified` prints metadata without claiming signature verification.
-    let text = document.to_string();
-    assert!(
-        text.contains("sm120-tp1") || text.contains("deployment"),
-        "{text}"
-    );
-    let _ = scratch;
+    let store = cache::Root::open(&fixture.cache).unwrap();
+    let entry = store.entry(&fixture.model, "version-two").unwrap();
+    let primary = store.primary(&entry).unwrap();
+    let literal = "literal@version.safetensors";
+    std::fs::copy(&primary, scratch.path().join(literal)).unwrap();
+    let mut documents = Vec::new();
+    for nested in [false, true] {
+        for target in ["namespaced/model", "namespaced/model@version-two", primary.to_str().unwrap(), literal] {
+            let mut arguments = if nested {
+                vec!["models", "--model-cache", cache, "inspect"]
+            } else {
+                vec!["inspect", "--model-cache", cache]
+            };
+            arguments.extend([target, "--json", "--unverified"]);
+            let output = Command::new(env!("CARGO_BIN_EXE_flare"))
+                .args(&arguments).current_dir(scratch.path()).output().unwrap();
+            assert!(output.status.success(), "{arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let mut document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(document["package"]["signatures_verified"], false);
+            assert!(document.to_string().contains("sm120-tp1"));
+            if target == literal {
+                assert_eq!(document["package"]["path"], literal);
+            }
+            document["package"].as_object_mut().unwrap().remove("path");
+            documents.push(document);
+        }
+    }
+    for document in &documents[1..] {
+        assert_eq!(document, &documents[0]);
+    }
 }

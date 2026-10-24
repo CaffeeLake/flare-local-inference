@@ -2,8 +2,8 @@
 //!
 //! Unix-specific rank transport and locking remain in `package_cache`.
 
+use crate::config::{Configuration, expand};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -27,44 +27,75 @@ pub(crate) fn model_root_from(
         return Ok(expand(home, path));
     }
     if let Some(config) = config
-        && let Some(configured) = configured_package_cache(config)?
+        && let Some(configured) = Configuration::load(config, false)?.package_cache(home)
     {
-        return Ok(expand(home, &configured));
+        return Ok(configured);
     }
     Ok(home.join(".cache/flare/packages"))
 }
 
-#[derive(serde::Deserialize, Default)]
-struct ConfigFile {
-    #[serde(default)]
-    paths: Paths,
+fn cache_key(input: &str) -> Result<String, Failure> {
+    flare_helios::package::cache::model_key(input).map_err(|error| error.to_string().into())
 }
 
-#[derive(serde::Deserialize, Default)]
-struct Paths {
-    package_cache: Option<String>,
-}
-
-fn configured_package_cache(path: &Path) -> Result<Option<PathBuf>, Failure> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display()).into()),
-    };
-    let config: ConfigFile = toml::from_str(&text)
-        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-    Ok(config
-        .paths
-        .package_cache
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from))
-}
-
-fn expand(home: &Path, path: &Path) -> PathBuf {
-    match path.strip_prefix("~") {
-        Ok(rest) => home.join(rest),
-        Err(_) => path.to_owned(),
+/// Accepted user syntax is the model identity (for example `owner/name`); a cache key is
+/// accepted only when the identity it decodes to names the same entry, so both spellings resolve
+/// deterministically.
+pub(crate) fn resolve_model(
+    root: &flare_helios::package::cache::Root,
+    input: &str,
+) -> Result<(String, String), Failure> {
+    let key = cache_key(input)?;
+    if root.ref_entry(&key)?.is_some() || !root.versions(&key)?.is_empty() {
+        return Ok((key, input.to_owned()));
     }
+    if let Ok(identity) = flare_helios::package::cache::model_identity(input) {
+        let decoded = cache_key(&identity)?;
+        if decoded != key
+            && (root.ref_entry(&decoded)?.is_some() || !root.versions(&decoded)?.is_empty())
+        {
+            return Ok((decoded, identity));
+        }
+    }
+    Ok((key, input.to_owned()))
+}
+
+pub(crate) fn explicit_package_path(input: &Path) -> Result<bool, Failure> {
+    Ok(input.is_absolute()
+        || input.starts_with(".")
+        || input.starts_with("..")
+        || input.try_exists()?)
+}
+
+/// Resolve an immutable local version, holding its lease before releasing the default ref.
+pub(crate) fn local_model(
+    root: &flare_helios::package::cache::Root,
+    input: &Path,
+) -> Result<Option<(flare_helios::package::cache::Entry, bool)>, Failure> {
+    if explicit_package_path(input)? {
+        return Ok(None);
+    }
+    let Some(input) = input.to_str() else {
+        return Ok(None);
+    };
+    let (identity, version) = match input.rsplit_once('@') {
+        Some((model, version)) if !model.is_empty() && !version.is_empty() => {
+            (model, Some(version))
+        }
+        Some(_) => return Err("expected a package path or MODEL[@VERSION]".into()),
+        None => (input, None),
+    };
+    let (model, identity) = resolve_model(root, identity)?;
+    if root.ref_entry(&model)?.is_none() && root.versions(&model)?.is_empty() {
+        return Ok(None);
+    }
+    let entry = match version {
+        Some(version) => root.entry(&model, version)?,
+        None => root.resolve(&model)?.ok_or_else(|| format!(
+            "model {identity} has no selected default version; use flare models list to see local versions"
+        ))?,
+    };
+    Ok(Some((entry, version.is_some())))
 }
 
 /// Normalize requested tensor-parallel sizes: deduplicated, ascending, non-zero.

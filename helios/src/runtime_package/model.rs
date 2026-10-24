@@ -1252,6 +1252,7 @@ mod identity_tests {
         };
         let contract = crate::runtime_package::wire::ServingContract {
             model_id: model.into(),
+            served_names: vec!["recipe-alias".into()],
             identity: format!("{model}-{hardware}"),
             max_sequence_tokens: 8,
             prefill_chunk_size: 1,
@@ -1420,6 +1421,7 @@ mod identity_tests {
         )
         .unwrap();
         let authorized = verified.authorize("identity", false).unwrap();
+        assert_eq!(authorized.model_names().unwrap(), vec!["deepseek-v4.1-flash", "recipe-alias"]);
         let identity = authorized.identity().unwrap();
         assert_eq!(identity.model, "deepseek-v4.1-flash");
         assert_eq!(identity.hardware, "gb202");

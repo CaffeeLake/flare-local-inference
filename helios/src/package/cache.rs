@@ -1291,6 +1291,7 @@ impl Root {
             "models",
             "refs",
             "sources",
+            "origins",
             "staging/incoming",
             "staging/wrapped",
             "staging/trees",
@@ -1878,12 +1879,49 @@ impl Root {
         entry: &Entry,
         expected_envelope: [u8; 32],
     ) -> Result<()> {
+        let directory = self.root.join("sources");
+        let destination = directory.join(PayloadId::of(selector.as_bytes()).to_string());
+        self.write_source_ref(&destination, selector, revision, entry, expected_envelope)
+    }
+
+    /// Retain the acquisition origin of an immutable version independently of moving selectors.
+    pub fn publish_entry_source(
+        &self,
+        selector: &str,
+        revision: &str,
+        entry: &Entry,
+        expected_envelope: [u8; 32],
+    ) -> Result<()> {
+        self.write_source_ref(
+            &self.origin_path(entry.model(), entry.id()),
+            selector,
+            revision,
+            entry,
+            expected_envelope,
+        )
+    }
+
+    fn origin_path(&self, model: &str, entry: &str) -> PathBuf {
+        self.root
+            .join("origins")
+            .join(PayloadId::of(format!("{model}/{entry}").as_bytes()).to_string())
+    }
+
+    fn write_source_ref(
+        &self,
+        destination: &Path,
+        selector: &str,
+        revision: &str,
+        entry: &Entry,
+        expected_envelope: [u8; 32],
+    ) -> Result<()> {
         let local = self.entry(entry.model(), entry.id())?;
         if local.directory() != entry.directory() {
             return Err("source reference entry belongs to another cache".into());
         }
-        let directory = self.root.join("sources");
-        let destination = directory.join(PayloadId::of(selector.as_bytes()).to_string());
+        let directory = destination
+            .parent()
+            .ok_or("source reference has no parent")?;
         let temporary = directory.join(format!(".ref-{}", token()));
         let result = (|| {
             let bytes = serde_json::to_vec(&SourceRefRecord::Versioned {
@@ -1919,6 +1957,49 @@ impl Root {
             .root
             .join("sources")
             .join(PayloadId::of(selector.as_bytes()).to_string());
+        let reference = Self::read_source_file(&path)?;
+        if reference
+            .as_ref()
+            .is_some_and(|reference| reference.selector() != selector)
+        {
+            return Err("cache source reference selector does not match".into());
+        }
+        Ok(reference)
+    }
+
+    pub fn entry_source(&self, entry: &Entry) -> Result<Option<SourceRef>> {
+        let reference = Self::read_source_file(&self.origin_path(entry.model(), entry.id()))?;
+        if reference.as_ref().is_some_and(|reference| {
+            reference.model() != entry.model() || reference.entry() != entry.id()
+        }) {
+            return Err("cache origin names a different model version".into());
+        }
+        Ok(reference)
+    }
+
+    /// Acquisition references retained by caches without a per-version origin record.
+    pub fn entry_source_refs(&self, entry: &Entry) -> Result<Vec<SourceRef>> {
+        let mut references = Vec::new();
+        for path in read_dir(&self.root.join("sources"))? {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if PayloadId::parse(name).is_err() {
+                continue;
+            }
+            if let Some(reference) = Self::read_source_file(&path)? {
+                if PayloadId::of(reference.selector().as_bytes()).to_string() != name {
+                    return Err("cache source reference selector does not match".into());
+                }
+                if reference.model() == entry.model() && reference.entry() == entry.id() {
+                    references.push(reference);
+                }
+            }
+        }
+        Ok(references)
+    }
+
+    fn read_source_file(path: &Path) -> Result<Option<SourceRef>> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1939,15 +2020,14 @@ impl Root {
                 envelope_sha256,
             } => {
                 if version != 2 {
-                    return Err(format!("unsupported cache source reference version {version}").into());
+                    return Err(
+                        format!("unsupported cache source reference version {version}").into(),
+                    );
                 }
                 let digest = PayloadId::parse(&envelope_sha256)?;
                 (stored, revision, model, id, Some(*digest.as_bytes()))
             }
         };
-        if stored != selector {
-            return Err("cache source reference selector does not match".into());
-        }
         validate_name(&model, "model key")?;
         validate_name(&id, "entry id")?;
         Ok(Some(SourceRef {
@@ -2195,8 +2275,15 @@ impl Root {
     /// Entry ids published for one model, in sorted order.
     pub fn versions(&self, model: &str) -> Result<Vec<String>> {
         validate_name(model, "model key")?;
+        let directory = self.root.join("models").join(model);
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(failure(error)),
+        };
         let mut versions = Vec::new();
-        for path in read_dir(&self.root.join("models").join(model))? {
+        for entry in entries {
+            let path = entry.map_err(failure)?.path();
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 validate_name(name, "entry id")?;
                 versions.push(name.to_owned());
@@ -2248,8 +2335,17 @@ impl Root {
             }
         }
         remove_tree(&directory)?;
+        self.remove_origin(model, entry)?;
         syncdir(&self.root.join("models").join(model))?;
         Ok(())
+    }
+
+    fn remove_origin(&self, model: &str, entry: &str) -> Result<()> {
+        match fs::remove_file(self.origin_path(model, entry)) {
+            Ok(()) => syncdir(&self.root.join("origins")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(failure(error)),
+        }
     }
 
     /// Export a committed entry to a standalone directory, hardlinking objects
@@ -2300,6 +2396,7 @@ impl Root {
             remove_tree(&directory)?;
             syncdir(&self.root.join("models").join(model))?;
         }
+        self.remove_origin(model, entry)?;
         if self.ref_entry(model)?.as_deref() == Some(entry) {
             match fs::remove_file(self.root.join("refs").join(model)) {
                 Ok(()) => syncdir(&self.root.join("refs"))?,
@@ -3761,6 +3858,54 @@ mod tests {
             .is_err()
         );
         assert_eq!(staged(&root), 0);
+    }
+
+    #[test]
+    fn unknown_model_has_no_versions() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        assert!(root.versions("missing").unwrap().is_empty());
+        assert!(root.versions("../invalid").is_err());
+        fs::write(root.path().join("models").join("broken"), b"not a directory").unwrap();
+        assert!(root.versions("broken").is_err());
+    }
+
+    #[test]
+    fn entry_origins_survive_selector_updates_and_are_removed_with_versions() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let first = root.stage("model", "first").unwrap().commit().unwrap();
+        let second = root.stage("model", "second").unwrap().commit().unwrap();
+        for (entry, revision, digest) in [
+            (&first, "commit-1", [1; 32]),
+            (&second, "commit-2", [2; 32]),
+        ] {
+            root.publish_source_ref("repository/branch", revision, entry, digest)
+                .unwrap();
+            root.publish_entry_source("repository/branch", revision, entry, digest)
+                .unwrap();
+        }
+        assert_eq!(
+            root.read_source_ref("repository/branch")
+                .unwrap()
+                .unwrap()
+                .entry(),
+            "second"
+        );
+        let origin = root.entry_source(&first).unwrap().unwrap();
+        assert_eq!(origin.revision(), "commit-1");
+        assert_eq!(origin.expected_envelope(), Some([1; 32]));
+        assert!(root.entry_source_refs(&first).unwrap().is_empty());
+        assert_eq!(root.entry_source_refs(&second).unwrap().len(), 1);
+        fs::copy(
+            root.origin_path("model", "first"),
+            root.origin_path("model", "second"),
+        )
+        .unwrap();
+        assert!(root.entry_source(&second).is_err());
+        drop(first);
+        root.evict("model", "first").unwrap();
+        assert!(!root.origin_path("model", "first").exists());
     }
 
     #[test]

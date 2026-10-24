@@ -108,6 +108,20 @@ fn choose_file(files: impl IntoIterator<Item = String>, requested: Option<&str>)
     }
 }
 
+pub fn run_download(args: crate::cli::Download) -> Result<()> {
+    crate::environment::configure(&args.gpus)?;
+    let entry = download(
+        &args.repository,
+        &args.hub,
+        args.gpus.len(),
+        &args.publisher_keys,
+        args.trust_store.as_deref(),
+        &[],
+    )?;
+    println!("{}", entry.directory().display());
+    Ok(())
+}
+
 pub fn download(
     source: &str,
     options: &HubOptions,
@@ -163,6 +177,31 @@ fn download_with_token_at(
     publisher_keys: &[std::path::PathBuf],
     trust_store: Option<&std::path::Path>,
     supplied_profiles: &[flare_helios::runtime_package::Publisher],
+) -> Result<flare_helios::package::cache::Entry> {
+    download_for_model_at(
+        endpoint,
+        source,
+        options,
+        gpu_count,
+        access_token,
+        publisher_keys,
+        trust_store,
+        supplied_profiles,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_for_model_at(
+    endpoint: &str,
+    source: &str,
+    options: &HubOptions,
+    gpu_count: usize,
+    access_token: Option<String>,
+    publisher_keys: &[std::path::PathBuf],
+    trust_store: Option<&std::path::Path>,
+    supplied_profiles: &[flare_helios::runtime_package::Publisher],
+    expected_model: Option<&str>,
 ) -> Result<flare_helios::package::cache::Entry> {
     let (id, given_revision) = repository(source)?;
     let revision = match options.revision.as_deref().or(given_revision) {
@@ -239,6 +278,17 @@ fn download_with_token_at(
         let legacy = flare_helios::package::conversion::form(&primary)
             .map_err(|error| error.to_string())?
             .is_none();
+        if let Some(expected) = expected_model.filter(|_| !legacy) {
+            use flare_helios::package::{cache, protection, reader};
+            let metadata = reader::Metadata::open(&primary)?;
+            let catalog = protection::verify(&metadata.envelope, &publishers, protection::Selection::Catalog)?;
+            let identity = catalog.package().model_identity.as_str();
+            let model = cache::model_key(if identity.is_empty() { id } else { identity })
+                .map_err(|error| error.to_string())?;
+            if model != expected {
+                return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+            }
+        }
         let entry = if legacy {
             match legacy_warm_entry(
                 &primary,
@@ -296,6 +346,9 @@ fn download_with_token_at(
                 }
             }
         };
+        if expected_model.is_some_and(|model| model != entry.model()) {
+            return Err("the Hugging Face update names a different model; the selected version is unchanged".into());
+        }
         let expected_envelope =
             authenticated_source_envelope(&primary, options, gpu_count, &publishers)?;
         remember_download(
@@ -393,6 +446,231 @@ fn source_selector(
     serde_json::json!(["huggingface", repository, revision, filename, sizes]).to_string()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct HubOrigin {
+    repository: String,
+    revision: String,
+    commit: String,
+    filename: Option<String>,
+    sizes: Vec<u32>,
+    expected_envelope: [u8; 32],
+}
+
+impl HubOrigin {
+    fn from_reference(reference: &flare_helios::package::cache::SourceRef) -> Result<Self> {
+        let (provider, repository_id, revision, filename, sizes): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Vec<u32>,
+        ) = serde_json::from_str(reference.selector())?;
+        if provider != "huggingface" || repository(&repository_id)?.1.is_some() {
+            return Err("model origin is not a Hugging Face repository".into());
+        }
+        validate_relative(&revision)?;
+        if let Some(filename) = &filename {
+            choose_file([], Some(filename))?;
+        }
+        let expected_envelope = reference
+            .expected_envelope()
+            .ok_or_else(|| unbound_source(&repository_id, &revision))?;
+        if sizes.is_empty() || sizes.contains(&0) {
+            return Err("model origin has no concrete tensor-parallel selection".into());
+        }
+        Ok(Self {
+            repository: repository_id,
+            revision,
+            commit: reference.revision().into(),
+            filename,
+            sizes,
+            expected_envelope,
+        })
+    }
+}
+
+fn entry_origin(
+    store: &flare_helios::package::cache::Root,
+    entry: &flare_helios::package::cache::Entry,
+) -> Result<Option<HubOrigin>> {
+    if let Some(reference) = store.entry_source(entry)? {
+        return HubOrigin::from_reference(&reference).map(Some);
+    }
+    // Source selectors can recover an origin only when they identify one acquisition unambiguously.
+    let mut origins = std::collections::BTreeSet::new();
+    for reference in store.entry_source_refs(entry)? {
+        let value: serde_json::Value = match serde_json::from_str(reference.selector()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get(0).and_then(serde_json::Value::as_str) != Some("huggingface") {
+            continue;
+        }
+        let fields: (String, String, String, Option<String>, Vec<u32>) =
+            serde_json::from_value(value)?;
+        if fields.4.is_empty() || fields.3.is_none() {
+            continue;
+        }
+        origins.insert(HubOrigin::from_reference(&reference)?);
+    }
+    if origins
+        .iter()
+        .any(|origin| origin.revision != origin.commit)
+    {
+        origins.retain(|origin| origin.revision != origin.commit);
+    }
+    if origins.len() > 1 {
+        return Err("model version has multiple recorded Hugging Face origins; download the intended source explicitly to record its origin".into());
+    }
+    let origin = origins.into_iter().next();
+    if let Some(origin) = &origin {
+        store.publish_entry_source(
+            &source_selector(
+                &origin.repository,
+                &origin.revision,
+                origin.filename.as_deref(),
+                &origin.sizes,
+            ),
+            &origin.commit,
+            entry,
+            origin.expected_envelope,
+        )?;
+    }
+    Ok(origin)
+}
+
+pub(crate) fn refresh_model(
+    store: &flare_helios::package::cache::Root,
+    entry: flare_helios::package::cache::Entry,
+    pinned: bool,
+    args: &crate::cli::Run,
+) -> Result<(flare_helios::package::cache::Entry, Option<String>)> {
+    let entry = refresh_model_at(
+        "https://huggingface.co",
+        store,
+        entry,
+        pinned,
+        &args.hub,
+        args.gpus.len().max(1),
+        &args.publisher_keys,
+        args.trust_store.as_deref(),
+        &[],
+    )?;
+    let repository = if pinned || args.hub.offline {
+        None
+    } else {
+        store.entry_source(&entry)?.map(|reference| {
+            HubOrigin::from_reference(&reference).map(|origin| origin.repository)
+        }).transpose()?
+    };
+    Ok((entry, repository))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_model_at(
+    endpoint: &str,
+    store: &flare_helios::package::cache::Root,
+    entry: flare_helios::package::cache::Entry,
+    pinned: bool,
+    options: &HubOptions,
+    gpu_count: usize,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+    supplied_profiles: &[flare_helios::runtime_package::Publisher],
+) -> Result<flare_helios::package::cache::Entry> {
+    if pinned {
+        if options.revision.is_some() || options.filename.is_some() {
+            return Err("a local model version is pinned; use models download to select a Hugging Face revision".into());
+        }
+        return Ok(entry);
+    }
+    if options.offline && options.revision.is_none() && options.filename.is_none() {
+        return Ok(entry);
+    }
+    let Some(origin) = entry_origin(store, &entry)? else {
+        if options.revision.is_some() || options.filename.is_some() {
+            return Err("this local model has no Hugging Face origin; download the intended repository explicitly".into());
+        }
+        return Ok(entry);
+    };
+    if options.offline {
+        if options
+            .revision
+            .as_ref()
+            .is_some_and(|revision| revision != &origin.revision && revision != &origin.commit)
+            || options
+                .filename
+                .as_ref()
+                .is_some_and(|filename| Some(filename) != origin.filename.as_ref())
+        {
+            return Err(
+                "the selected local model does not match the requested offline source".into(),
+            );
+        }
+    }
+    let mut requested = options.clone();
+    requested.model_cache = Some(store.path().to_owned());
+    requested.revision.get_or_insert(origin.revision.clone());
+    if requested.filename.is_none() {
+        requested.filename = origin.filename.clone();
+    }
+    if requested.tensor_parallel.is_empty() {
+        requested.tensor_parallel = origin.sizes.clone();
+    }
+    let primary = store.primary(&entry)?;
+    let resolved = crate::trust::resolve_identity_with(
+        &primary,
+        publisher_keys,
+        supplied_profiles,
+        &requested,
+        trust_store,
+    )?;
+    verify_offline_binding(
+        &entry,
+        origin.expected_envelope,
+        &origin.repository,
+        &origin.revision,
+        &resolved.profiles,
+    )?;
+    if options.offline {
+        return Ok(entry);
+    }
+    let access_token = token(options)?;
+    let staging = TransportStaging::new(store.path(), options.cache_dir.as_deref())?;
+    let api = ApiBuilder::from_cache(Cache::new(staging.path().to_owned()))
+        .with_endpoint(endpoint.into())
+        .with_token(access_token.clone())
+        .with_progress(false)
+        .with_retries(3)
+        .build()?;
+    let revision = requested.revision.as_deref().unwrap();
+    eprintln!("Checking model origin: {}@{revision}", origin.repository);
+    let info = api.repo(Repo::with_revision(origin.repository.clone(), RepoType::Model, revision.into()))
+        .info().map_err(|error| format!("cannot check {}@{revision} for updates: {error}; the local version is unchanged (use --offline to skip the check)", origin.repository))?;
+    if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Hugging Face returned an invalid commit ID".into());
+    }
+    if info.sha == origin.commit
+        && revision == origin.revision
+        && requested.filename == origin.filename
+        && requested.tensor_parallel == origin.sizes
+    {
+        return Ok(entry);
+    }
+    eprintln!("Updating model from {}@{revision}", origin.repository);
+    download_for_model_at(
+        endpoint,
+        &origin.repository,
+        &requested,
+        gpu_count,
+        access_token,
+        publisher_keys,
+        trust_store,
+        supplied_profiles,
+        Some(entry.model()),
+    )
+}
+
 fn authenticated_source_envelope(
     primary: &Path,
     options: &HubOptions,
@@ -460,6 +738,12 @@ pub(crate) fn remember_download(
             }
         }
     }
+    store.publish_entry_source(
+        &source_selector(repository, revision, Some(filename), &sizes),
+        commit,
+        entry,
+        expected_envelope,
+    )?;
     Ok(())
 }
 
@@ -1398,6 +1682,12 @@ pub(crate) mod tests {
         flare_helios::runtime_package::Publisher,
         String,
     ) {
+        signed_payload_fixture_identity(parent, deployment_id, hardware_identity, "owner/offline")
+    }
+
+    fn signed_payload_fixture_identity(
+        parent: &Path, deployment_id: &str, hardware_identity: &str, model: &str,
+    ) -> (PathBuf, PathBuf, flare_helios::runtime_package::Publisher, String) {
         use flare_helios::package::{PayloadId, container, export, schema::wire};
         use flare_helios::runtime_package::Publisher;
         use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1469,7 +1759,7 @@ pub(crate) mod tests {
         };
         let request = export::PublishRequest {
             package: wire::PackageBody {
-                model_identity: "owner/offline".into(),
+                model_identity: model.into(),
                 hardware_identity: hardware_identity.into(),
                 frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
                 sampling_defaults: Some(
@@ -1564,6 +1854,292 @@ pub(crate) mod tests {
         result.resize(4096, b' ');
         result.extend(envelope);
         result
+    }
+
+    fn origin_fixture(
+        parent: &Path,
+    ) -> (
+        flare_helios::package::cache::Root,
+        flare_helios::package::cache::Entry,
+        flare_helios::runtime_package::Publisher,
+        HubOptions,
+    ) {
+        let (package, _, publisher, _) = signed_payload_fixture(parent);
+        let options = HubOptions {
+            model_cache: Some(parent.join("models")),
+            ..Default::default()
+        };
+        let store = flare_helios::package::cache::Root::open(options.model_cache.as_ref().unwrap())
+            .unwrap();
+        let entry = install_ready(
+            "publisher/prepared",
+            &package,
+            &options,
+            store.path(),
+            1,
+            std::slice::from_ref(&publisher),
+        )
+        .unwrap();
+        let digest =
+            authenticated_source_envelope(&package, &options, 1, std::slice::from_ref(&publisher))
+                .unwrap();
+        remember_download(
+            store.path(),
+            "publisher/prepared",
+            "gb10",
+            COMMIT,
+            "model.safetensors",
+            &options,
+            1,
+            &entry,
+            digest,
+        )
+        .unwrap();
+        store.publish_entry(&entry).unwrap();
+        (store, entry, publisher, options)
+    }
+
+    #[test]
+    fn model_refresh_checks_recorded_repository_without_downloading_unchanged_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, entry, publisher, options) = origin_fixture(temp.path());
+        assert_ne!(
+            entry.model(),
+            flare_helios::package::cache::model_key("publisher/prepared").unwrap()
+        );
+        let original = entry.id().to_owned();
+        let (endpoint, worker) = mock_hub(vec![(
+            "/api/models/publisher/prepared/revision/gb10".into(),
+            metadata_response_with(&["model.safetensors"]),
+        )]);
+        let selected = refresh_model_at(
+            &endpoint,
+            &store,
+            entry,
+            false,
+            &options,
+            1,
+            &[],
+            None,
+            &[publisher],
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(selected.id(), original);
+        assert!(store.evict(selected.model(), selected.id()).is_err());
+    }
+
+    #[test]
+    fn model_refresh_pinned_and_offline_never_contact_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, entry, publisher, mut options) = origin_fixture(temp.path());
+        let model = entry.model().to_owned();
+        let version = entry.id().to_owned();
+        options.token_file = Some(temp.path().join("missing-token"));
+        for (pinned, offline) in [(true, false), (false, true)] {
+            options.offline = offline;
+            let selected = refresh_model_at(
+                "http://127.0.0.1:0",
+                &store,
+                store.entry(&model, &version).unwrap(),
+                pinned,
+                &options,
+                1,
+                &[],
+                None,
+                std::slice::from_ref(&publisher),
+            )
+            .unwrap();
+            assert_eq!(selected.id(), version);
+        }
+        options.offline = false;
+        options.revision = Some("different".into());
+        assert!(
+            refresh_model_at(
+                "http://127.0.0.1:0",
+                &store,
+                entry,
+                true,
+                &options,
+                1,
+                &[],
+                None,
+                &[publisher]
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pinned")
+        );
+    }
+
+    #[test]
+    fn model_refresh_installs_update_and_preserves_previous_version_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, old, publisher, options) = origin_fixture(&temp.path().join("original"));
+        let old_id = old.id().to_owned();
+        // The selected entry was acquired before the commit now served by the branch.
+        let old_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let origin = entry_origin(&store, &old).unwrap().unwrap();
+        store
+            .publish_entry_source(
+                &source_selector(
+                    "publisher/prepared",
+                    "gb10",
+                    Some("model.safetensors"),
+                    &[1],
+                ),
+                old_commit,
+                &old,
+                origin.expected_envelope,
+            )
+            .unwrap();
+        let (package, _, updated_publisher, _) =
+            signed_payload_fixture(&temp.path().join("updated"));
+        let mut routes = package_routes(&package, "publisher/prepared", "gb10");
+        let response = routes
+            .get_mut("/api/models/publisher/prepared/revision/gb10")
+            .unwrap();
+        response.1 = response.0.clone();
+        let (endpoint, worker, _) = mock_hub_counted(routes);
+        let selected = refresh_model_at(
+            &endpoint,
+            &store,
+            old,
+            false,
+            &options,
+            1,
+            &[],
+            None,
+            &[publisher, updated_publisher],
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_ne!(selected.id(), old_id);
+        assert_eq!(
+            store.resolve(selected.model()).unwrap().unwrap().id(),
+            selected.id()
+        );
+        assert_eq!(
+            entry_origin(&store, &selected).unwrap().unwrap().commit,
+            COMMIT
+        );
+        let previous = store.entry(selected.model(), &old_id).unwrap();
+        assert_eq!(
+            entry_origin(&store, &previous).unwrap().unwrap().commit,
+            old_commit
+        );
+    }
+
+    #[test]
+    fn model_refresh_rejects_changed_identity_and_untrusted_update_without_selecting_it() {
+        for (model, trusted, expected_error) in [
+            ("owner/other", true, "different model"),
+            ("owner/offline", false, "publisher"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (store, old, publisher, options) = origin_fixture(&temp.path().join("original"));
+            let key = old.model().to_owned();
+            let id = old.id().to_owned();
+            let origin = entry_origin(&store, &old).unwrap().unwrap();
+            store
+                .publish_entry_source(
+                    &source_selector(
+                        "publisher/prepared",
+                        "gb10",
+                        Some("model.safetensors"),
+                        &[1],
+                    ),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    &old,
+                    origin.expected_envelope,
+                )
+                .unwrap();
+            let (package, _, other, _) = signed_payload_fixture_identity(
+                &temp.path().join("updated"),
+                "gb10-tp1",
+                "sm120",
+                model,
+            );
+            let mut routes = package_routes(&package, "publisher/prepared", "gb10");
+            let response = routes
+                .get_mut("/api/models/publisher/prepared/revision/gb10")
+                .unwrap();
+            response.1 = response.0.clone();
+            let (endpoint, worker, _) = mock_hub_counted(routes);
+            let mut profiles = vec![publisher];
+            if trusted {
+                profiles.push(other);
+            }
+            let error = refresh_model_at(
+                &endpoint,
+                &store,
+                old,
+                false,
+                &options,
+                1,
+                &[],
+                None,
+                &profiles,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            worker.join().unwrap();
+            assert!(error.contains(expected_error), "{error}");
+            assert_eq!(store.resolve(&key).unwrap().unwrap().id(), id);
+        }
+    }
+
+    #[test]
+    fn model_origin_recovers_hub_refs_and_ignores_rank_transfer_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, entry, _, _) = origin_fixture(temp.path());
+        for record in std::fs::read_dir(store.path().join("origins")).unwrap() {
+            std::fs::remove_file(record.unwrap().path()).unwrap();
+        }
+        store
+            .publish_source_ref("distributed-export-rank0", "export", &entry, [1; 32])
+            .unwrap();
+        let origin = entry_origin(&store, &entry).unwrap().unwrap();
+        assert_eq!(origin.repository, "publisher/prepared");
+        assert_eq!(origin.revision, "gb10");
+        assert_eq!(origin.sizes, vec![1]);
+        for record in std::fs::read_dir(store.path().join("sources")).unwrap() {
+            std::fs::remove_file(record.unwrap().path()).unwrap();
+        }
+        assert_eq!(entry_origin(&store, &entry).unwrap(), Some(origin));
+    }
+
+    #[test]
+    fn model_refresh_failed_update_keeps_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, entry, publisher, options) = origin_fixture(temp.path());
+        let model = entry.model().to_owned();
+        let version = entry.id().to_owned();
+        let response =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (endpoint, worker) = mock_hub(vec![(
+            "/api/models/publisher/prepared/revision/gb10".into(),
+            response,
+        )]);
+        let error = refresh_model_at(
+            &endpoint,
+            &store,
+            entry,
+            false,
+            &options,
+            1,
+            &[],
+            None,
+            &[publisher],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        worker.join().unwrap();
+        assert!(error.contains("--offline"), "{error}");
+        assert_eq!(store.resolve(&model).unwrap().unwrap().id(), version);
     }
 
     #[test]

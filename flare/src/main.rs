@@ -6,6 +6,7 @@ mod cache_commands;
 mod cache_support;
 mod cli;
 mod cluster;
+mod config;
 #[cfg(unix)]
 mod distribution;
 mod environment;
@@ -47,24 +48,23 @@ extern "C" fn stop(_: libc::c_int) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = cli::Cli::command().get_matches();
-    let parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let mut parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let home = environment::home_directory()?;
+    let config_path = parsed
+        .config
+        .as_deref()
+        .map(|path| config::expand(&home, path))
+        .unwrap_or_else(|| home.join(".config/flare/config.toml"));
+    let configuration = config::Configuration::load(&config_path, parsed.config.is_some())
+        .map_err(|error| error.to_string())?;
+    configuration
+        .apply(&mut parsed, &matches, &home)
+        .map_err(|error| error.to_string())?;
     let mut args = match parsed.command {
         cli::Command::Run(args) => *args,
-        cli::Command::Download(args) => {
-            environment::configure(&args.gpus)?;
-            let entry = hub::download(
-                &args.repository,
-                &args.hub,
-                args.gpus.len(),
-                &args.publisher_keys,
-                args.trust_store.as_deref(),
-                &[],
-            )?;
-            println!("{}", entry.directory().display());
-            return Ok(());
-        }
+        cli::Command::Download(args) => return hub::run_download(args),
         cli::Command::Inspect(args) => return inspect::run(args),
-        cli::Command::Cache(args) => return cache_commands::run(args),
+        cli::Command::Models(args) => return cache_commands::run(args),
         cli::Command::HardwareRevision { gpu_count } => {
             let devices: Vec<_> = (0..gpu_count).collect();
             environment::configure(&devices)?;
@@ -144,15 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.gpus.is_empty() {
         environment::configure(&args.gpus)?;
     }
-    let key = args
-        .api_key_file
-        .as_ref()
-        .map(|path| {
-            std::fs::read_to_string(path)
-                .map(|value| value.trim().to_owned())
-                .map_err(|error| format!("cannot read API key file {}: {error}", path.display()))
-        })
-        .transpose()?;
+    let key = configuration
+        .api_key(args.api_key_file.as_deref())
+        .map_err(|error| error.to_string())?;
     let mut progress = StartupProgress::stderr();
     #[cfg(unix)]
     let mut launched = None;
@@ -164,10 +158,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--hosts applies only to rank zero".into());
         }
         let received = distribution::peer(&mut args, &mut progress).map_err(|e| e.to_string())?;
+        configuration
+            .apply_model(&mut args.serving, &received.authorized.model_names()?)
+            .map_err(|error| error.to_string())?;
         _lease = received.lease;
         (received.authorized, Some(received.membership))
     } else {
         let (root, authorized, publisher, lease) = load_package(&args, &mut progress)?;
+        configuration
+            .apply_model(&mut args.serving, &authorized.model_names()?)
+            .map_err(|error| error.to_string())?;
         configure_package_devices(&mut args, &authorized, &mut progress)?;
         _lease = lease;
         if !args.hosts.is_empty() {
@@ -210,6 +210,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Option<flare_helios::package::cache::Entry>,
     ) = {
         let (_, authorized, _, lease) = load_package(&args, &mut progress)?;
+        configuration
+            .apply_model(&mut args.serving, &authorized.model_names()?)
+            .map_err(|error| error.to_string())?;
         configure_package_devices(&mut args, &authorized, &mut progress)?;
         (authorized, lease)
     };
@@ -267,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }
-    config["api_key"] = key.unwrap_or_default().into();
+    config["api_key"] = key.into();
     phase.finish(config["model_id"].as_str().unwrap_or_default());
     serve(owner, config, progress, cluster, shape)?;
     #[cfg(unix)]
@@ -336,7 +339,30 @@ fn load_package(
         .ok_or("rank zero requires a package")?;
     let mut origin = None;
     let mut lease = None;
-    let path = if hub::is_repository(package) {
+    let local = if crate::cache_support::explicit_package_path(package)
+        .map_err(|error| error.to_string())?
+    {
+        None
+    } else {
+        let cache_root = crate::cache_support::model_root(
+            args.hub
+                .model_cache
+                .as_deref()
+                .or(args.package_cache.as_deref()),
+        )
+        .map_err(|error| error.to_string())?;
+        let store = flare_helios::package::cache::Root::open(cache_root)?;
+        crate::cache_support::local_model(&store, package)
+            .map_err(|error| error.to_string())?
+            .map(|(entry, pinned)| hub::refresh_model(&store, entry, pinned, args))
+            .transpose()?
+    };
+    let path = if let Some((entry, repository)) = local {
+        origin = repository;
+        let directory = entry.directory().to_owned();
+        lease = Some(entry);
+        directory
+    } else if hub::is_repository(package) {
         let text = package.to_str().ok_or("repository must be UTF-8")?;
         origin = Some(hub::repository(text)?.0.to_owned());
         let mut hub_options = args.hub.clone();
@@ -360,8 +386,7 @@ fn load_package(
             || args.hub.cache_dir.is_some()
         {
             return Err(
-                "download options apply to Hugging Face repositories, not local package paths"
-                    .into(),
+                "download options apply to Hugging Face origins, not local package paths".into(),
             );
         }
         package.clone()
@@ -369,7 +394,7 @@ fn load_package(
     let root = path
         .canonicalize()
         .map_err(|e| format!("cannot access package {}: {e}", path.display()))?;
-    if !hub::is_repository(package) {
+    if lease.is_none() {
         lease = local_package_lease(
             &root,
             args.hub.model_cache.as_deref(),
@@ -673,6 +698,70 @@ mod tests {
         let entry_id = installed.id().to_owned();
         drop(installed);
         (store, entry_id)
+    }
+
+    #[test]
+    fn actual_load_package_resolves_local_defaults_and_pinned_versions_before_hub() {
+        let temp = tempfile::tempdir().unwrap();
+        let (package, profile, publisher, _) =
+            crate::hub::tests::signed_payload_fixture(temp.path());
+        let model_root = temp.path().join("models");
+        let (store, first) = install_fixture(&package, &publisher, &model_root, "first");
+        let (_, second) = install_fixture(&package, &publisher, &model_root, "second");
+        let model = model_key("owner/offline").unwrap();
+        store
+            .publish_entry(&store.entry(&model, &second).unwrap())
+            .unwrap();
+        for (input, expected) in [
+            ("owner/offline".to_owned(), second.clone()),
+            (format!("owner/offline@{first}"), first),
+        ] {
+            let mut args = run_args(
+                Path::new(&input),
+                &profile,
+                &model_root,
+                &temp.path().join("trust.toml"),
+                Some(&publisher),
+            );
+            args.serving.hub.offline = false;
+            args.serving.hub.token_file = Some(temp.path().join("missing-token"));
+            let mut progress = flare_helios::startup::StartupProgress::silent();
+            let (path, _, _, lease) = super::load_package(&args, &mut progress).unwrap();
+            assert_eq!(lease.as_ref().unwrap().id(), expected);
+            assert_eq!(path, lease.as_ref().unwrap().directory());
+            assert!(store.evict(&model, &expected).is_err());
+            assert_eq!(store.resolve(&model).unwrap().unwrap().id(), second);
+        }
+        let args = run_args(
+            Path::new("owner/offline@absent"),
+            &profile,
+            &model_root,
+            &temp.path().join("trust.toml"),
+            Some(&publisher),
+        );
+        let mut progress = flare_helios::startup::StartupProgress::silent();
+        assert!(
+            super::load_package(&args, &mut progress)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("absent")
+        );
+        store.clear_default(&model).unwrap();
+        let args = run_args(
+            Path::new("owner/offline"),
+            &profile,
+            &model_root,
+            &temp.path().join("trust.toml"),
+            Some(&publisher),
+        );
+        assert!(
+            super::load_package(&args, &mut progress)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("no selected default")
+        );
     }
 
     #[test]

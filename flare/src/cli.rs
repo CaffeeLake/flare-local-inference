@@ -19,6 +19,10 @@ use flare_helios::{
     about = "Serve prepared models on NVIDIA GPUs"
 )]
 pub struct Cli {
+    /// Configuration file [default: ~/.config/flare/config.toml].
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -51,8 +55,8 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
-    /// List, inspect, select, and remove prepared-model cache entries.
-    Cache(CacheArgs),
+    /// List, inspect, and manage locally prepared models.
+    Models(CacheArgs),
 }
 
 #[derive(Debug, Args)]
@@ -60,33 +64,39 @@ pub struct CacheArgs {
     #[command(subcommand)]
     pub command: CacheCommand,
 
-    /// Prepared-model cache root [default: paths.package_cache, else ~/.cache/flare/packages].
+    /// Model storage directory [default: paths.package_cache, else ~/.cache/flare/packages].
     #[arg(
         long,
         value_name = "PATH",
         global = true,
-        help_heading = "Cache options"
+        help_heading = "Model storage"
     )]
     pub model_cache: Option<PathBuf>,
+
+    /// Disable terminal styling.
+    #[arg(long, global = true)]
+    pub plain: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum CacheCommand {
-    /// List cached models, their versions, default selection, deployments, and usage.
+    /// List local models, versions, and storage usage.
     List(CacheList),
-    /// Inspect one cached entry with the normal package inspection flags.
-    Inspect(CacheInspect),
-    /// Select one cached entry as a model's default.
+    /// Show details for a local model, version, or package.
+    Inspect(Inspect),
+    /// Download a prepared model from Hugging Face.
+    Download(Download),
+    /// Choose the default version of a model.
     Select(CacheSpec),
-    /// Remove one cached entry.
+    /// Remove a local model version.
     Remove(CacheRemove),
-    /// Reclaim abandoned staging trees and unreferenced payload blobs.
+    /// Free unused model storage.
     Gc(CacheGc),
 }
 
 #[derive(Debug, Args)]
 pub struct CacheList {
-    /// Model key to list; every model when omitted.
+    /// Model to list; all local models when omitted.
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
@@ -97,83 +107,32 @@ pub struct CacheList {
 
 #[derive(Debug, Args)]
 pub struct CacheSpec {
-    /// MODEL@VERSION entry in the prepared-model cache.
+    /// Model and version, as MODEL@VERSION.
     #[arg(value_name = "MODEL@VERSION")]
     pub spec: String,
 }
 
 #[derive(Debug, Args)]
 pub struct CacheRemove {
-    /// MODEL@VERSION entry in the prepared-model cache.
+    /// Model and version, as MODEL@VERSION.
     #[arg(value_name = "MODEL@VERSION")]
     pub spec: String,
 
-    /// Remove the entry even though it is the model's selected default.
+    /// Allow removing the model's default version.
     #[arg(long)]
     pub clear_default: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct CacheGc {
-    /// Print the reclaimed counts as JSON.
+    /// Print the cleanup results as JSON.
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct CacheInspect {
-    /// MODEL@VERSION entry in the prepared-model cache.
-    #[arg(value_name = "MODEL@VERSION")]
-    pub spec: String,
-
-    /// Print the selected sections as JSON.
-    #[arg(long)]
-    pub json: bool,
-
-    /// Disable terminal styling.
-    #[arg(long, conflicts_with = "json")]
-    pub plain: bool,
-
-    /// Include allocation addresses, reservations, and execution buffer views.
-    #[arg(long)]
-    pub memory_map: bool,
-
-    /// Include graph capacities, timings, and node counts for every selected rank.
-    #[arg(long)]
-    pub graphs: bool,
-
-    /// Include tokenizer, parser, vision, asset, and auxiliary table details.
-    #[arg(long)]
-    pub frontend: bool,
-
-    /// Include every detail section and the complete serving contract.
-    #[arg(long)]
-    pub all: bool,
-
-    /// Read only primary-file metadata without checking signatures or opening companions.
-    #[arg(long, conflicts_with_all = ["publisher_keys", "trust_store"])]
-    pub unverified: bool,
-
-    /// Verify only this rank of a multi-host package whose copy holds that rank's bytes alone.
-    #[arg(long, value_name = "N")]
-    pub rank: Option<usize>,
-
-    /// Select a deployment by tensor-parallel size for a multi-deployment payload package.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    pub tensor_parallel: Option<u32>,
-
-    /// Additional publisher verification profiles (JSON).
-    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
-    pub publisher_keys: Vec<PathBuf>,
-
-    /// Persistent trust file whose remembered keys also verify [default: ~/.config/flare/trust.toml].
-    #[arg(long, value_name = "PATH")]
-    pub trust_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HubOptions {
-    /// Hub revision; defaults to gb10 or gb202 detected from the selected GPUs.
+    /// Hub revision; uses the model origin when cached, otherwise detects gb10 or gb202.
     #[arg(long, value_name = "REVISION", help_heading = "Download options")]
     pub revision: Option<String>,
 
@@ -211,9 +170,13 @@ pub struct HubOptions {
 
 #[derive(Debug, Args)]
 pub struct Inspect {
-    /// Local prepared .safetensors package.
-    #[arg(value_name = "PACKAGE")]
+    /// Local package path or MODEL[@VERSION]; omitting the version selects the model's default.
+    #[arg(value_name = "PACKAGE|MODEL[@VERSION]")]
     pub package: PathBuf,
+
+    /// Model storage directory [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(long, value_name = "PATH", help_heading = "Model storage")]
+    pub model_cache: Option<PathBuf>,
 
     /// Print the selected sections as JSON.
     #[arg(long)]
@@ -559,7 +522,7 @@ pub struct OrbitRun {
     #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
     pub scheduler_terminal_age_price: Option<f64>,
 
-    /// File on rank zero's node containing the serving API key; omit to disable authentication.
+    /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
@@ -652,14 +615,14 @@ pub enum TrustCommand {
 #[derive(Debug, Args)]
 #[command(
     args_override_self = true,
-    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the package's prepared capacities.\nOmitted concurrency and speculation options use package defaults."
+    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the package's prepared capacities.\nOmitted options use host configuration, then package defaults."
 )]
 pub struct Run {
-    /// Local prepared .safetensors package or Hugging Face ORG/NAME[@REVISION].
+    /// Local package, MODEL[@VERSION], or Hugging Face repository; local models resolve first.
     #[arg(value_name = "PACKAGE", required_unless_present = "rank")]
     pub package: Option<PathBuf>,
 
-    /// IP address for the HTTP server.
+    /// IP address for the HTTP server [default: server.host, else 127.0.0.1].
     #[arg(
         long,
         value_name = "ADDR",
@@ -668,7 +631,7 @@ pub struct Run {
     )]
     pub host: IpAddr,
 
-    /// Port for the HTTP server.
+    /// Port for the HTTP server [default: server.port, else 8000].
     #[arg(
         long,
         value_name = "N",
@@ -743,7 +706,7 @@ pub struct Run {
     #[arg(long, help_heading = "Multi-host options")]
     pub stage_only: bool,
 
-    /// File containing the serving API key; omit to disable authentication.
+    /// File containing the serving API key; overrides [server].api_key, including with an empty file.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
@@ -815,7 +778,7 @@ pub struct ServingOptions {
     pub kv_cache_limit: KvCacheLimit,
 
     /// Per-GPU serving memory: occupied size (30G), free reserve (-30G), or total fraction (0.8).
-    /// Omitted: package serving reserve.
+    /// Omitted: memory.reserve from configuration, then the package serving reserve.
     #[arg(
         long,
         allow_hyphen_values = true,
@@ -824,7 +787,7 @@ pub struct ServingOptions {
     )]
     pub memory_limit: Option<MemoryLimit>,
 
-    /// Maximum simultaneous requests [default: package setting].
+    /// Maximum simultaneous requests [default: model/default configuration, then package setting].
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
@@ -906,19 +869,19 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
-    /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: disabled].
+    /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
 
-    /// Directory for prefix checkpoints and prepared inputs on disk [default: disabled].
+    /// Directory for prefix checkpoints and prepared inputs on disk [default: paths.prefix_cache, else disabled].
     #[arg(long, value_name = "DIR", help_heading = "Prefix cache options")]
     pub prefix_cache_disk: Option<PathBuf>,
 
-    /// Disk retention limit, e.g. 100G; 0 disables [default: 10% of free space].
+    /// Disk retention limit, e.g. 100G; 0 disables [default: prefix_cache.disk_limit, else 10% of free space].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: staged].
+    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: prefix_cache.disk_transport, else staged].
     #[arg(long, value_name = "MODE", help_heading = "Prefix cache options",
         value_parser = PossibleValuesParser::new(["staged", "direct"])
             .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
@@ -1870,7 +1833,7 @@ mod tests {
 
     #[test]
     fn memory_limits_accept_signed_values_and_reach_every_rank() {
-        for value in ["30g", "-30g", "0.8"] {
+        for value in ["30g", "-30g", "0.8", "-0G"] {
             for flags in [
                 vec!["--memory-limit".to_owned(), value.to_owned()],
                 vec![format!("--memory-limit={value}")],
@@ -1897,7 +1860,7 @@ mod tests {
                 assert_eq!(peer.kv_cache_limit, KvCacheLimit::Context);
             }
         }
-        for value in ["0", "-0.8", "2", "NaN", "1e-1", "-0G"] {
+        for value in ["0", "-0.8", "2", "NaN", "1e-1"] {
             assert!(
                 Cli::try_parse_from(["flare", "run", "model.safetensors", "--memory-limit", value])
                     .is_err()
@@ -1923,7 +1886,7 @@ mod cache_cli_tests {
     fn parse(arguments: &[&str]) -> CacheArgs {
         let parsed = Cli::try_parse_from(arguments).unwrap();
         match parsed.command {
-            Command::Cache(args) => args,
+            Command::Models(args) => args,
             other => panic!("expected cache command, got {other:?}"),
         }
     }
@@ -1932,7 +1895,7 @@ mod cache_cli_tests {
     fn cache_commands_parse_with_the_shared_model_cache_flag() {
         let list = parse(&[
             "flare",
-            "cache",
+            "models",
             "--model-cache",
             "/cache",
             "list",
@@ -1951,24 +1914,24 @@ mod cache_cli_tests {
         }
         let inspect = parse(&[
             "flare",
-            "cache",
+            "models",
             "inspect",
             "model@v1",
             "--json",
             "--unverified",
         ]);
         match inspect.command {
-            CacheCommand::Inspect(CacheInspect {
-                spec,
+            CacheCommand::Inspect(Inspect {
+                package,
                 json: true,
                 unverified: true,
                 ..
             }) => {
-                assert_eq!(spec, "model@v1");
+                assert_eq!(package, PathBuf::from("model@v1"));
             }
             other => panic!("unexpected inspect command: {other:?}"),
         }
-        let remove = parse(&["flare", "cache", "remove", "model@v1", "--clear-default"]);
+        let remove = parse(&["flare", "models", "remove", "model@v1", "--clear-default"]);
         match remove.command {
             CacheCommand::Remove(CacheRemove {
                 spec,
@@ -1979,11 +1942,11 @@ mod cache_cli_tests {
             other => panic!("unexpected remove command: {other:?}"),
         }
         assert!(matches!(
-            parse(&["flare", "cache", "select", "model@v1"]).command,
+            parse(&["flare", "models", "select", "model@v1"]).command,
             CacheCommand::Select(CacheSpec { spec }) if spec == "model@v1"
         ));
         assert!(matches!(
-            parse(&["flare", "cache", "gc", "--json"]).command,
+            parse(&["flare", "models", "gc", "--json"]).command,
             CacheCommand::Gc(CacheGc { json: true })
         ));
     }

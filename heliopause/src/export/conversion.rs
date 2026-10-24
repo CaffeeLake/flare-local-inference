@@ -973,7 +973,7 @@ fn convert_cache_at(
             return match root.remove(&model_key, &entry_id, false) {
                 Ok(()) => Err(error.into()),
                 Err(cleanup) => Err(invalid(format!(
-                    "{error}; the failed conversion left cache entry {model_key}@{entry_id}, which could not be removed: {cleanup}; remove it with `flare cache remove`"
+                    "{error}; the failed conversion left cache entry {model_key}@{entry_id}, which could not be removed: {cleanup}; remove it with `flare models remove`"
                 ))),
             };
         }
@@ -985,7 +985,7 @@ fn convert_cache_at(
         let model_key = committed.model().to_string();
         drop(committed);
         return Err(invalid(format!(
-            "publishing the default for completed cache entry {model_key}@{entry_id} failed: {error}; the entry is retained and the ref update may already be visible; verify with `flare cache list`"
+            "publishing the default for completed cache entry {model_key}@{entry_id} failed: {error}; the entry is retained and the ref update may already be visible; verify with `flare models list`"
         )));
     }
     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(

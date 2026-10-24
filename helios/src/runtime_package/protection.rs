@@ -196,6 +196,17 @@ pub struct AuthorizedPackage {
 }
 
 impl AuthorizedPackage {
+    /// Canonical model ID followed by serving aliases from the signed serving contract.
+    pub fn model_names(&self) -> Result<Vec<&str>> {
+        let contract = match &self.kind {
+            AuthorizedKind::Legacy { index, .. } => index.contract.as_ref(),
+            AuthorizedKind::Payload(package) => package.source.authorized.verified()
+                .deployment().and_then(|deployment| deployment.contract.as_ref()),
+        }.ok_or_else(|| invalid("package has no serving contract"))?;
+        Ok(std::iter::once(contract.model_id.as_str())
+            .chain(contract.served_names.iter().map(String::as_str)).collect())
+    }
+
     /// SHA-256 of the exact signed envelope bytes this copy verified.
     pub fn envelope_digest(&self) -> [u8; 32] {
         match &self.kind {
