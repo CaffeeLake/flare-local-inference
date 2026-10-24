@@ -97,6 +97,12 @@
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
 
+[ ] Immediately after completing payload-package implementation and validation,
+    use one shared DeepSeek Engram table and host reader/cache for single-node
+    TP, retaining per-GPU head ownership and partial projections. Keep partitioned
+    table storage for multi-node TP; package metadata and prepared row mappings
+    must match each layout. See package-format-design.md.
+
 [ ] Measure cross-host rank handoff polling and completion yielding: CPU time,
     request p99, and complete-round latency under active and idle workloads.
     See helios/src/execution/parallel.rs and performance-work.md.
@@ -112,13 +118,20 @@
     exported V4/V4.1 packages with packed context projections. Compare GLM's
     shared-expert launch order when the configured checkpoint shards are available.
 
-[ ] Pack weight payloads by recipe-declared owner and group so rebuilt packages
-    rename only executable and state blobs. See weight-payload-stability.md.
-
-[ ] Combine per-size exports into one fat package whose derived tensor-parallel
-    sizes are affine derivations of the canonical blobs, with materialization in
-    `flare download --tp` and `flare run`. See package-resharding.md.
+[ ] TP resharding is not qualified for full-model use. Export compressed Qwen
+    TP1 and native TP2 packages, complete combine and clean-cache acquisition,
+    compare materialized weights byte-for-byte against native TP2, and validate
+    native replay. Resolve the observed combine derivation-cycle failure.
+    Measure complete combine and acquisition costs against a successful baseline;
+    the required 10x speed improvement has not been demonstrated. Fixture tests
+    cover derivation replay and signed multi-host distribution, but do not
+    establish full-model TP2 correctness or performance. See package-format-design.md.
 
 [ ] Invalidate b12x preparation discovery's cached compiler context when
     Inductor selects a different libdevice in the same process. Repeated GPU
     test preparation can restore program keys for the preceding library.
+
+[ ] Investigate Nemotron repeated-image prefix reuse in
+    tests/server/test_nemotron.py::test_image_cache_identity: native serving of
+    NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
+    287-token prompt; image answers and token identity assertions pass.
