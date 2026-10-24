@@ -46,7 +46,13 @@ impl ModelCatalog {
             .contract
             .vision
             .enabled()
-            .then(|| super::config::image_limits(&model.contract.vision, model.limits.max_sequence_tokens).ok())
+            .then(|| {
+                super::config::image_limits(
+                    &model.contract.vision,
+                    model.limits.max_sequence_tokens,
+                )
+                .ok()
+            })
             .flatten();
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
@@ -286,7 +292,10 @@ mod tests {
             text["flare"]["sampling_defaults"],
             json!(model.sampling_defaults)
         );
-        assert_eq!(text["flare"]["sampling_ranges"], json!(model.sampling_ranges));
+        assert_eq!(
+            text["flare"]["sampling_ranges"],
+            json!(model.sampling_ranges)
+        );
         assert_eq!(text["flare"]["input_modalities"], json!(["text"]));
         assert_eq!(text["flare"]["output_modalities"], json!(["text"]));
         assert_eq!(text["flare"]["max_images_per_prompt"], 0);
@@ -303,7 +312,10 @@ mod tests {
         model.max_top_logprobs = crate::execution::MAX_TOP_LOGPROBS;
         let logprobs = ModelCatalog::new(&model, &[]).card;
         assert_eq!(logprobs["permission"][0]["allow_logprobs"], true);
-        assert_eq!(logprobs["flare"]["max_top_logprobs"], crate::execution::MAX_TOP_LOGPROBS);
+        assert_eq!(
+            logprobs["flare"]["max_top_logprobs"],
+            crate::execution::MAX_TOP_LOGPROBS
+        );
         model.limits.max_sequence_tokens = 4096;
         model.contract.vision = VisionCapabilities {
             feature_slots: 4,

@@ -726,18 +726,25 @@ def test_generation_logprobs_single_token_continuation(clients, streaming):
             'stream': streaming}
     if streaming:
         entries = []
+        stream_events = []
         with http.stream('POST', '/v1/chat/completions', json=body) as response:
             assert response.status_code == 200, response.read()
             for line in response.iter_lines():
                 if line.startswith('data: ') and line != 'data: [DONE]':
                     data = json.loads(line[6:])
+                    stream_events.append(data)
                     for choice in data.get('choices', []):
                         entries.extend((choice.get('logprobs') or {}).get('content', []))
+        observed = json.dumps(stream_events, indent=2)
     else:
         response = http.post('/v1/chat/completions', json=body)
         assert response.status_code == 200, response.text
         entries = response.json()['choices'][0]['logprobs']['content']
-    assert len(entries) == 1
+        observed = response.text
+    assert len(entries) == 1, (
+        f'expected one continuation logprob entry, got {len(entries)}; '
+        f'streaming={streaming}; response={observed}'
+    )
     _check_logprob_entry(entries[0], 20)
 
 
