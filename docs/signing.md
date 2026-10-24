@@ -112,10 +112,9 @@ frame bytes may change.
 
 The output uses the directory canonical form with readable companion names.
 Use `ignition convert --form packed` to produce a single-file package afterward.
-The payload format has no canonical size-sharded form, and `--shard-size` does
-not control payload-format signing. The internal logical-resource package
-layout uses a separate signing path that honors `--shard-size` and writes
-content-addressed snapshot companions.
+The payload format has no canonical size-sharded form or shard-size setting.
+The internal logical-resource package layout uses a separate signing path
+that writes content-addressed snapshot companions with a fixed 64 GiB file limit.
 
 Invalid packages fail before publication, and existing destinations are never
 overwritten. Weight identities remain independent of executable resources.

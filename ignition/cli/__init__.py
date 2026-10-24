@@ -29,11 +29,7 @@ def _parser() -> argparse.ArgumentParser:
                                help="configuration file (default: ~/.config/flare/config.toml)")
         return subparser
 
-    exporting = command("export", serve.export, "prepare a native model package")
-    exporting.add_argument("--output", type=Path, metavar="PATH",
-                           help="exact destination path: a package directory (default form) or one .safetensors file with --form packed; omit to publish a shared cache entry")
-    exporting.add_argument("--form", choices=("directory", "packed"), default="directory",
-                           help="payload package form at --output (default: directory)")
+    exporting = command("export", serve.export, "prepare a native model package in the shared cache")
     exporting.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
@@ -54,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
                            help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)")
         hosts.add_argument("--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
                            help="tensor-parallel ranks, one per host; this process is rank zero (default: 1);"
-                                " an export assembles all ranks at --output on rank zero")
+                                " an export publishes all ranks to the shared model cache on rank zero")
         hosts.add_argument("--rendezvous", metavar="ADDR:PORT",
                            help="IPv4 address and port on which rank zero admits its peers")
     serving.add_argument("--prefix-cache-states", type=int, metavar="N",
@@ -101,23 +97,12 @@ def _parser() -> argparse.ArgumentParser:
     combining.add_argument("--publisher-keys", type=Path, action="append", default=[],
                            help="trusted public publisher profiles of the sources; repeatable")
     converting = command("convert", publishing.convert, "convert a package to the selected canonical container form")
-    converting.add_argument("package", type=Path, help="existing signed .safetensors package")
-    converting.add_argument("--output", type=Path, help="destination primary (default: package cache snapshot)")
+    converting.add_argument("package", type=Path, help="existing signed package file or directory, including a cache entry")
+    converting.add_argument("--output", type=Path, help="standalone destination (default: shared model cache entry)")
     converting.add_argument("--publisher-keys", type=Path, action="append", default=[],
                             help="trusted public publisher profiles; repeatable")
     converting.add_argument("--form", choices=("directory", "packed"), default="directory",
                             help="payload container form: a directory of companions or one packed .safetensors file (default: directory)")
-    def shard_size(value):
-        from .config import parse_size
-        try:
-            parse_size(value, "shard size")
-        except FlareError as error:
-            raise argparse.ArgumentTypeError(str(error)) from error
-        return value
-
-    for publishing in (signing, converting):
-        publishing.add_argument("--shard-size", type=shard_size, metavar="SIZE",
-                                help="legacy blob conversion: maximum payload file size including its header; at most 64G (default: 64G)")
     return parser
 
 

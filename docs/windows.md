@@ -173,12 +173,15 @@ The toolkit's PTX assembler must support SM121; Ignition selects it from the
 configured toolkit. Use an explicit memory reserve for the OS and compiler
 workers, such as `[memory] reserve = "8G"`.
 
-From the repository root in that x64 preparation environment:
+From the repository root in that x64 preparation environment, export to the
+model cache. Replace `CACHE_ENTRY` with the printed entry path when converting
+to a standalone package:
 
 ```powershell
 python -m ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 `
-  --prefill-chunk-size 4096 --no-compile --config C:\models\ignition.toml `
-  --output C:\models\qwen38-27b.safetensors
+  --prefill-chunk-size 4096 --no-compile --config C:\models\ignition.toml
+python -m ignition convert CACHE_ENTRY --config C:\models\ignition.toml `
+  --form packed --output C:\models\qwen38-27b.safetensors
 ```
 
 `--no-compile` disables forward compilation. Kernel compilation, autotuning,

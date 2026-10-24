@@ -24,8 +24,6 @@ def convert(args):
         kind = payload_form(args.package)
         if kind == 'legacy' and form == 'packed':
             raise UsageError('--form packed requires a payload-format package')
-        if kind != 'legacy' and args.shard_size is not None:
-            raise UsageError('--shard-size applies to legacy blob conversion; payload containers are not sharded')
         embedded = Path(__file__).parents[2] / 'helios/src/runtime_package/publishers.json'
         profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
         paths = list(args.publisher_keys)
@@ -41,7 +39,7 @@ def convert(args):
                 from ignition.preparation.package_snapshot import export_convert_cache
                 store = export_convert_cache(
                     args.package, configuration.directory('package_cache'),
-                    profiles=profiles, shard_size=configuration.shard_size(args.shard_size))
+                    profiles=profiles)
                 print(f'Converted cache entry: {store.entry_path} ({store.model}/{store.entry})')
                 return
             output = args.output
@@ -61,7 +59,7 @@ def convert(args):
         else:
             store = convert_package(args.package, output, profiles=profiles,
                                     cache=configuration.directory('package_cache'),
-                                    shard_size=configuration.shard_size(args.shard_size), form=form)
+                                    form=form)
     except (ValueError, OSError, KeyError, TypeError, DecodeError) as error:
         raise UsageError(str(error)) from error
     if hasattr(store, 'entry'):
@@ -217,7 +215,7 @@ def sign(args):
         from ignition.preparation.package_snapshot import export_options
         with export_options(configuration.directory('package_cache')):
             promote(args.package, args.output, publisher=publisher, development_profile=profiles[0],
-                    progress=StartupProgress(), shard_size=configuration.shard_size(getattr(args, "shard_size", None)))
+                    progress=StartupProgress())
     except (ValueError, OSError, EOFError, DecodeError) as error:
         raise UsageError(str(error)) from error
     print(f'Signed package: {args.output}')

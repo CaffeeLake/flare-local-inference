@@ -261,12 +261,14 @@ authentication without encryption. Payloads travel through rank-owned helpers on
 using direct peer connections or ring relays selected by `--roce-ring`.
 
 The example prepares GLM-5.3 Flash on two Sparks. Run from each checkout root.
-On `maxwell`, whose preparation address is `10.200.0.12`, select an unused output:
+On `maxwell`, whose preparation address is `10.200.0.12`, publish to its model
+cache. Replace `CACHE_ENTRY` in the conversion command with the printed entry
+path after preparation completes:
 
 ```sh
 .venv/bin/ignition export glm-5.3-flash --ranks 2 \
-  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8 \
-  --output /data/flare-runtime/glm53-spark-tp2.safetensors --verbose
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-spark-tp2.safetensors
 ```
 
 On `hertz`:

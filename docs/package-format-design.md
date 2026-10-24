@@ -577,10 +577,10 @@ Frontend payloads can remain embedded in the small primary.
 Each model's mutable ref selects its default version. A successful export or
 download automatically switches that ref to the resulting entry, including when
 a download reuses an existing cache entry. The switch occurs only after the
-complete selected deployment closure is ready and any requested standalone output
-has been published. Preparation, acquisition, verification, or output-publication
-failure leaves the default unchanged; a failure while writing the ref itself is
-reported as indeterminate under entry publication below. Concurrent operations serialize their ref
+complete selected deployment closure is ready. Preparation, acquisition, or
+verification failure leaves the default unchanged; a failure while writing the
+ref itself is reported as indeterminate under entry publication below.
+Concurrent operations serialize their ref
 updates; the last successful ref update selects the default. Switching the default
 retains preceding entries and does not change versions held by running processes.
 An explicit version selection overrides the default during resolution.
@@ -669,13 +669,12 @@ the initial-state role and each initializer names the payload that supplies it.
 Entry names are display metadata. Payload identity, package identity,
 signatures, and selected tensor-parallel unions are unchanged by renaming, and a
 rebuilt package does not invalidate an entry whose bytes are unchanged.
-Successful export updates the model's default only after the complete cache entry
-and any requested standalone output have been published. A failure in the
-standalone output, before this export writes a default ref, leaves every ref
-unchanged and removes only the entry this export created; if a lease prevents
-that removal the error names the retained entry, which is then removed with an
-explicit cache removal. A failure while writing the default ref may occur after
-the ref rename, so the export reports publication as indeterminate, retains the
+Successful export updates the model's default after the complete cache entry
+has been published. `ignition export` accepts no standalone destination or form
+selection. `ignition convert` creates standalone packed or directory packages
+from the printed cache entry path; a failed standalone conversion leaves that
+entry and its default reference unchanged. A failure while writing the default
+ref may occur after the ref rename, so the export reports publication as indeterminate, retains the
 complete entry, and does not rewrite or clear any default: another exporter's or
 user's concurrent selection is never rolled back to a snapshot. Automatic
 cleanup therefore never removes a selected entry; otherwise a published entry is

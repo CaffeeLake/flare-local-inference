@@ -55,8 +55,8 @@ preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
 
 ```
-ignition export  [MODEL] [--output FILE] [flags]  prepare a native model package
-ignition convert FILE [--output FILE] [flags]   convert a package to shared blobs
+ignition export  [MODEL] [flags]                prepare a model in the shared cache
+ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
@@ -82,9 +82,10 @@ then hands graph handles, metadata, and retained resource owners to Heliopause.
 The native exporter writes compiled CUDA modules, allocation contents, graph
 descriptions, and frontend assets to content-addressed payload blobs with a
 metadata-only `.safetensors` primary. Native stderr phases report scanning,
-hashing, copying, cache reuse, compression, and publication progress. Every
-destination must be unused. Ignition exits without opening a listener after
-publication. Launch the exported package
+hashing, copying, cache reuse, compression, and publication progress. Export
+publishes a directory entry in the shared model cache and selects it as the
+model's default. Ignition exits without opening a listener after publication.
+Launch the exported package
 with `flare run PACKAGE`. Qwen, GLM, and DeepSeek provide native package storage support.
 Tensor-parallel packages contain one resource bundle per selected GPU and load
 in one process with one execution thread per rank. API keys are excluded from
@@ -187,8 +188,8 @@ storage according to those selections and available GPU memory.
 
 ### 3.1 Ignition command-line flags
 
-`export` and `serve` accept the preparation flags below. `export` also accepts
-`--output FILE` and defaults to a local snapshot. Listener flags apply only to
+`export` and `serve` accept the preparation flags below. `export` publishes a
+directory entry in the shared model cache. Listener flags apply only to
 `serve`; native package serving uses `flare run` flags. Development `serve` also
 accepts the runtime `--history-drafts` / `--no-history-drafts` options for native
 serving. `export` accepts neither option, and `--direct` rejects history drafting.
@@ -204,8 +205,6 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
 | `--no-weights` | Export only when exact stored-data blobs are cached | Off |
 | `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
-| `--output PATH` | Additional export destination: `FILE` with `--form packed`, otherwise a directory copy; must not exist | Cache entry only |
-| `--form packed\|directory` | Canonical form of an `--output` export | `directory` |
 | `--staging PATH` | Export workspace | `paths.export_staging` |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
@@ -260,14 +259,15 @@ graph budget controls catalog density between each batch's smallest wider round
 and its maximum physical extent. Width-one and ordinary graphs do not consume
 that budget. Budgets below the required endpoint count fail during planning;
 budgets above the number of distinct valid capacities capture every capacity.
-For eight requests with five drafts each, this example instead limits physical
-target capacity to 24 rows while retaining six-token per-request prefixes:
+In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
+`ignition export`. For eight requests with five drafts each, this example limits
+physical target capacity to 24 rows while retaining six-token per-request prefixes:
 
 ```sh
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 8 --mtp-draft-tokens 5 \
-  --speculative-token-capacity 24 --prefill-chunk-size 4096 \
-  --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors --verbose
+  --speculative-token-capacity 24 --prefill-chunk-size 4096 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
 Packed packages require adaptive execution at their captured draft depth, or
@@ -310,8 +310,8 @@ FlashInfer dependency supplies the required preparation API. For example:
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 8 --mtp-draft-tokens 5 \
   --speculative-token-capacity 24 --prefill-chunk-size 4096 \
-  --mla-compute-mode bf16 \
-  --output /data/flare-runtime/deepseek41-tp4-c8-packed24-bf16.safetensors --verbose
+  --mla-compute-mode bf16 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24-bf16.safetensors
 ```
 
 The arithmetic choice applies to target, prefill, and draft attention and is
@@ -420,8 +420,8 @@ default. This command uses the recipe's concurrency 32, seven draft tokens,
 4096-token prefill chunk, and 128 physical target rows:
 
 ```sh
-.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
-  --output /data/flare-runtime/ds41-tp4-c32-d7-p128.safetensors
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/ds41-tp4-c32-d7-p128.safetensors
 ```
 
 The default catalog contains 64 packed rounds with logical width eight and six
@@ -672,8 +672,8 @@ authentication are configured explicitly; native commands do not interpret
 
 ### Package snapshots
 
-`ignition export MODEL` publishes a prepared entry in the shared model cache
-without requiring `--output`. A recipe's `export_repository` supplies its Hugging
+`ignition export MODEL` publishes a prepared directory entry in the shared model
+cache and prints its path. A recipe's `export_repository` supplies its Hugging
 Face target; `--repo-id NAMESPACE/REPOSITORY` overrides it. For Qwen Flash:
 
 ```sh
@@ -703,16 +703,17 @@ never copies. The primary carries the signed manifest, the unsigned physical
 locations, and any embedded frontend assets (such as the tokenizer and chat
 template). Weight, executable, and state payloads live in companions.
 
-Export writes the directory canonical form by default. `--form packed` with
-`--output FILE` writes the single-file canonical form instead; `--output DIR`
-writes a copy of the directory form at that path. Both forms use the same
-metadata, payloads, signatures, and location records, and converting between them
+Export always writes the directory canonical form in the cache.
+`ignition convert CACHE_ENTRY --form packed --output FILE` writes a standalone
+single-file package; `ignition convert CACHE_ENTRY --output DIR` writes a
+standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
+the same metadata, payloads, signatures, and location records. Converting between them
 needs no signing key or GPU. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
-inodes where it can. The 64 GB publication limit applies to legacy blob
-publication and `--shard-size`. Payload-format packages keep the payload
-boundaries their export declared, and `--shard-size` does not regroup them.
+inodes where it can. Legacy blob publication retains its fixed 64 GiB file limit.
+Payload-format packages keep the semantic payload boundaries their export declared. No
+command or configuration setting selects a size-sharding threshold.
 
 Weight payloads are declared per semantic layer and stored as their own payload
 objects; tuning-dependent layouts and residual initialization bytes form separate
@@ -751,8 +752,8 @@ Conversion accepts monolithic, numbered-shard, and snapshot packages, verifies
 signed resources and stored data, and preserves the exact signed envelope. Supply
 the public publisher profile for a production package; the local development
 profile is loaded automatically. `--output` selects a destination and `--form`
-selects the canonical form for payload packages; legacy packages keep
-shard-size conversion and reject `--form packed`. Conversion leaves its source
+selects the canonical form for payload packages; legacy packages use their
+fixed blob layout and reject `--form packed`. Conversion leaves its source
 intact. Identical conversions reuse payload objects without rewriting them, and a
 resource larger than the legacy limit is rejected because legacy native resources
 must remain contiguous.
@@ -779,15 +780,11 @@ The key must be an owner-only Ed25519 PKCS#8 PEM file. Encrypted keys prompt
 for their passphrase in an interactive terminal; unencrypted keys are also
 accepted. Runtime publisher profiles contain only the verification key.
 `--official-source` overrides the configured repository URL. Setting any signing
-identity field requires all three identity fields. `[publishing] shard_size` may
-be configured independently and does not select a production identity.
+identity field requires all three identity fields.
 
-`shard_size = "64G"` is the hard payload-file limit for legacy blob packages;
-`ignition sign` and `ignition convert` accept `--shard-size SIZE` up to 64 GiB, including each
-file's header. Zero and limits at or below 4096 bytes are invalid. A legacy
-resource larger than the limit fails conversion. Payload-format packages keep
-their own payload boundaries in either canonical form. The primary contains
-metadata only; resources reside in immutable content-addressed payload objects.
+Payload-format packages keep their semantic payload boundaries in either
+canonical form. Legacy blob publication uses a fixed 64 GiB file limit, including
+the header; a larger contiguous legacy resource fails conversion.
 See [package snapshots](#package-snapshots).
 
 `ignition keygen` creates an encrypted production key and public profile.
@@ -995,10 +992,10 @@ decoded-source windows are accounted for separately at startup.
 Resolve `MODEL`, discover GPUs through NVML, and derive the preparation plan.
 Download missing checkpoint weights, then prepare and publish an entry in the
 shared model cache under `paths.package_cache`.
-`--output PATH` writes an additional copy: with `--form packed` the single-file
-canonical form (`FILE`, no `.safetensors` suffix is appended), otherwise a
-directory copy; the destination must not exist. Multi-host export requires
-`--output DIR`, and the coordinator publishes the shared cache entry.
+Export accepts no output path or form selection. Use `ignition convert` on the
+printed cache entry path to create a standalone packed file or directory.
+For multi-host export, the coordinator stages rank resources through Heliopause
+and publishes the complete entry in its shared model cache.
 `--staging PATH` selects the export workspace. `--no-weights` requires exact
 cached weight payloads; initial state and executable resources may be produced
 fresh. Export closes the prepared model and exits without starting a listener.
