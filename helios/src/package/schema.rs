@@ -44,6 +44,14 @@ fn bounded_name(value: &str, limit: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
+// Mangled CUDA symbols use the enclosing signed metadata body's size bound.
+fn symbol_name(value: &str, what: &str) -> Result<()> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(invalid(format!("invalid {what}")));
+    }
+    Ok(())
+}
+
 fn digest(id: &[u8], what: &str) -> Result<()> {
     if id.len() != 32 {
         return Err(invalid(format!("{what} must be a 32-byte SHA-256 digest")));
@@ -517,7 +525,7 @@ pub fn validate_rank(
         }
         let mut symbols = BTreeSet::new();
         for global in &module.globals {
-            bounded_name(&global.symbol, 256, "module symbol")?;
+            symbol_name(&global.symbol, "module symbol")?;
             if !symbols.insert(global.symbol.as_str()) {
                 return Err(invalid("duplicate module global symbol"));
             }
@@ -540,7 +548,7 @@ pub fn validate_rank(
         if !module_names.contains(function.module.as_str()) {
             return Err(invalid("function names an absent module"));
         }
-        bounded_name(&function.symbol, 256, "function symbol")?;
+        symbol_name(&function.symbol, "function symbol")?;
         if function.parameter_sizes.len() > 128 {
             return Err(invalid("function declares too many parameters"));
         }
@@ -1145,6 +1153,36 @@ mod tests {
             ..Default::default()
         };
         (rank, catalog)
+    }
+
+    #[test]
+    fn cuda_symbols_preserve_long_names_and_reject_invalid_strings() {
+        for symbol in ["_f0".to_owned(), format!("_Z{}", "template_parameter_".repeat(4096))] {
+            let (mut rank, mut catalog) = module_rank();
+            rank.functions.push(wire::Function {
+                module: "model".into(),
+                symbol: symbol.clone(),
+                ..Default::default()
+            });
+            rank.modules[0].globals[0].symbol = symbol;
+            validate_rank(&rank, 1, &mut catalog, &mut BTreeSet::new()).unwrap();
+        }
+        for invalid_symbol in ["", "kernel\0suffix", "kernel\nsuffix"] {
+            for global in [false, true] {
+                let (mut rank, mut catalog) = module_rank();
+                if global {
+                    rank.modules[0].globals[0].symbol = invalid_symbol.into();
+                } else {
+                    rank.functions.push(wire::Function {
+                        module: "model".into(),
+                        symbol: invalid_symbol.into(),
+                        ..Default::default()
+                    });
+                }
+                let error = validate_rank(&rank, 1, &mut catalog, &mut BTreeSet::new()).unwrap_err();
+                assert!(error.to_string().contains(if global { "module symbol" } else { "function symbol" }));
+            }
+        }
     }
 
     #[test]

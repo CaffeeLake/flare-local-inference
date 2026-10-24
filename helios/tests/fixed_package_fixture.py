@@ -48,6 +48,10 @@ def allocation_reference(allocations, tensor):
     return {"allocation": allocation.name, "offset": address - allocation.address}
 
 
+TRANSFORM_SYMBOL = "transform_" + "template_parameter_" * 32
+BIAS_SYMBOL = "bias_" + "template_parameter_" * 32
+
+
 def global_kernel(root, storage, source):
     code = root / "globals.cu"
     code.write_text('''
@@ -63,19 +67,19 @@ __global__ void transform(float *output, Shape shape) {
 }
 __global__ void no_arguments() {}
 }
-''')
+'''.replace('transform', TRANSFORM_SYMBOL).replace('bias', BIAS_SYMBOL))
     cubin = root / "globals.cubin"
     architecture = "sm_" + "".join(map(str, torch.cuda.get_device_capability()))
     subprocess.run(["nvcc", "--cubin", f"-arch={architecture}", str(code), "-o", str(cubin)], check=True)
     cuda = storage.cuda
     module, function, empty = C.c_void_p(), C.c_void_p(), C.c_void_p()
     cuda.call("cuModuleLoad", C.byref(module), C.c_char_p(str(cubin).encode()))
-    for name, value in (("bias", C.c_float(2)), ("scale", C.c_float(3)), ("base", C.c_uint64(source.data_ptr()))):
+    for name, value in ((BIAS_SYMBOL, C.c_float(2)), ("scale", C.c_float(3)), ("base", C.c_uint64(source.data_ptr()))):
         address, size = C.c_uint64(), C.c_size_t()
         cuda.call("cuModuleGetGlobal_v2", C.byref(address), C.byref(size), module, C.c_char_p(name.encode()))
         assert size.value == C.sizeof(value)
         cuda.call("cuMemcpyHtoD_v2", address, C.byref(value), size)
-    cuda.call("cuModuleGetFunction", C.byref(function), module, C.c_char_p(b"transform"))
+    cuda.call("cuModuleGetFunction", C.byref(function), module, C.c_char_p(TRANSFORM_SYMBOL.encode()))
     cuda.call("cuModuleGetFunction", C.byref(empty), module, C.c_char_p(b"no_arguments"))
     return module, function, empty
 

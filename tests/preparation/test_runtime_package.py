@@ -153,7 +153,8 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
         rank_type = message_factory.GetMessageClass(pool.FindMessageTypeByName('flare.package.RankBody'))
         envelope = envelope_type.FromString(manifests[0])
         rank = rank_type.FromString(envelope.ranks[0].body)
-        assert 'transform' in {function.symbol for function in rank.functions}
+        assert 'transform_' + 'template_parameter_' * 32 in {function.symbol for function in rank.functions}
+        assert 'bias_' + 'template_parameter_' * 32 in {symbol.symbol for module in rank.modules for symbol in module.globals}
         assert 'assertFile_0' in {symbol.symbol for module in rank.modules for symbol in module.globals}
     companions = sorted(path for path in (original / "package").rglob("*.safetensors")
                         if path.name != "model.safetensors")
@@ -295,7 +296,7 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
         assert any(contents(symbol.file).rstrip(b"\0") == b"kernel"
                    for module in document.modules for symbol in module.globals)
         for name in (b"numeric_argument", b"integer_pointer_argument", b"pointer_table_argument",
-                     b"transform", b"no_arguments", b"assertFile_0"):
+                     b"transform_" + b"template_parameter_" * 32, b"no_arguments", b"assertFile_0"):
             assert name in document.SerializeToString()
             assert any(name + b"\0" in contents(module.file) for module in document.modules)
     if not exec_handover:
