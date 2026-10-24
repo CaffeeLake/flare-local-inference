@@ -297,8 +297,10 @@ the pending input. Selection uses these fields before reading graph bodies or
 loading kernels. MTP alternatives for one batch and verification width are
 selected exclusively. Weights, including MTP weights, remain loaded.
 
-Graph bodies, module images, globals, tensor payloads, and frontend assets are
-separate indexed spans in the file. Each graph body contains its declared
+Executable resource spans are one zstd level-3 frame per cubin or graph; the
+manifest does not select a codec or carry executable keys. Graph bodies, module
+images, globals, tensor payloads, and frontend assets are separate indexed spans
+in the file. Each graph body contains its declared
 number of nodes followed by its edges, encoded as u32 little-endian lengths
 and Protobuf records. Records are limited to 1 MiB. Helios decodes one record
 at a time and drops CUDA graph templates after instantiation. Tensor loading

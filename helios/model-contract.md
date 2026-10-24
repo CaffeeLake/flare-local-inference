@@ -33,9 +33,21 @@ no Python calls, CUDA allocation, compilation, or graph capture. Missing graph
 variants and inconsistent contracts fail startup; requests outside prepared
 capacities fail admission.
 
-Model index version 4 is required. Execution ABI 2/3 and protected envelope
-version 4 have separate meanings. Packages with a different model-index version
-require re-export; Helios has no schema-name fallback or migration loader.
+Payload packages use `PackageBody.format_version` 2 with a signed payload
+envelope and unsigned `LocationSet`. Each executable resource is one zstd
+level-3 frame with a signed decoded length and compressed-chunk commitments.
+Execution ABI 2/3, the old-layout internal `ProtectedIndex` envelope 6 when
+those tools are retained, model contract version 1, and payload-format version
+2 are independent version domains. Unsupported versions fail startup.
+
+Executable resources are one mandatory zstd level-3 frame per resource. The
+signed `ExecutableResource` binds its stored frame, signed decoded length,
+resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
+compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
+capped at 8 MiB and rejects truncated or extra frames, trailing bytes, and
+decoded length mismatch. `authorize` requires the supplied acceptance string to
+exactly equal the signed publisher namespace; signatures authenticate the stored
+frame and its decoded length, while acceptance records trust and license terms.
 
 ## Serving metadata
 

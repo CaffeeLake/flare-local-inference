@@ -82,7 +82,7 @@ then hands graph handles, metadata, and retained resource owners to Heliopause.
 The native exporter writes compiled CUDA modules, allocation contents, graph
 descriptions, and frontend assets to content-addressed payload blobs with a
 metadata-only `.safetensors` primary. Native stderr phases report scanning,
-hashing, copying, cache reuse, encryption, and publication progress. Every
+hashing, copying, cache reuse, compression, and publication progress. Every
 destination must be unused. Ignition exits without opening a listener after
 publication. Launch the exported package
 with `flare run PACKAGE`. Qwen, GLM, and DeepSeek provide native package storage support.
@@ -100,7 +100,7 @@ flare/target/release/flare run PACKAGE --gpus 0 --host 127.0.0.1 --port 8000
 ```
 flare run [PACKAGE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared package
-flare inspect PACKAGE [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
+flare inspect PACKAGE [--tensor-parallel N] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -136,8 +136,10 @@ address toward its first peer; an explicit `--rendezvous` overrides it.
 
 Serving package distribution uses 1..64 streams per peer, selected by rank
 zero's `--transfer-streams` (default 8). Direct and switched fabrics route to
-the peer; `--roce-ring` uses intermediate ranks. `--package-cache` sets the
-receiving rank's cache root (default `~/.cache/flare`). Rank zero's
+the peer; `--roce-ring` uses intermediate ranks. `--model-cache` selects the
+receiving rank's prepared-model cache; `--package-cache` is the compatible
+fallback when `--model-cache` is absent. The default is `paths.package_cache`,
+otherwise `~/.cache/flare/packages`. Rank zero's
 `--stage-only` distributes and verifies packages without GPU loading, and exits
 all ranks. Manual ranks need no agents, route signatures, or routing keys.
 All launch modes use the same native distribution and serving bootstrap.
@@ -200,9 +202,11 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--port N` | Listening port. `serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
-| `--shard-size SIZE` | Hard payload-file limit for export/sign/convert, at most 64 GiB | `[publishing] shard_size`, else `64G` |
 | `--no-weights` | Export only when exact stored-data blobs are cached | Off |
-| `--repo-id NAMESPACE/REPOSITORY` | Export repository namespace for the default local snapshot path | Recipe `export_repository` |
+| `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
+| `--output PATH` | Additional export destination: `FILE` with `--form packed`, otherwise a directory copy; must not exist | Cache entry only |
+| `--form packed\|directory` | Canonical form of an `--output` export | `directory` |
+| `--staging PATH` | Export workspace | `paths.export_staging` |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Preparation flags are grouped by capacity/compression, speculative decoding,
@@ -630,16 +634,14 @@ Both commands accept these download options:
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
 | `--cache-dir PATH` | Hugging Face hub cache directory | `~/.cache/huggingface/hub` from the OS user account |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
-| `--offline` | Resolve only from cached refs and snapshots and skip the publisher identity check; make no network requests. Accepted with a local package path | Off |
+| `--offline` | Resolve prepared packages only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local package path | Off |
+| `--model-cache PATH` | Flare prepared-model cache directory | `paths.package_cache`, otherwise `~/.cache/flare/packages` |
 
-The native client uses Hugging Face's `refs`, `snapshots`, and `blobs` cache
-layout. It loads regular snapshot files directly. Multi-file snapshots containing
-symlinks, including those created by Python's Hub client, use regular hardlinks in
-the cache's `flare-packages` directory. These links share the cached file's bytes
-and preserve companion paths when the primary path is canonicalized. Filesystems
-without hardlink support report an error instead of copying payloads. Local
-package companions may also be symbolic links to regular files on other storage
-devices; the loader validates and retains the opened targets.
+Online acquisition uses Hugging Face's `refs`, `snapshots`, and `blobs` as a
+transport cache, then installs the selected prepared deployments in the Flare
+model cache. Snapshot symlinks are resolved through temporary acquisition trees
+under the Flare cache, using hardlinks or cross-filesystem copies. The returned
+package is a leased Flare cache entry.
 
 When a file is absent from a snapshot, Flare checks its Hub ETag and size against
 the repository's blob cache. An existing blob is hardlinked into the snapshot
@@ -650,57 +652,92 @@ downloads use resumable HTTP transfers through `hf-hub`, without Xet chunk
 reconstruction. A cached blob with an unexpected size or file type reports an
 error. Package signature verification still occurs when serving.
 
-Offline automatic filename selection considers the files present in that cached
-snapshot; use `--filename` to select one explicitly. Cache paths, endpoint, and
+Successful downloads record repository, requested revision, resolved commit,
+filename, TP selection, and the SHA-256 of the exact signed envelope authenticated
+during acquisition in the Flare cache. Offline resolution uses those references
+and verifies the selected entry's signatures and stored payloads. It never reads
+or imports HF snapshots. Source records written before envelope binding remain
+readable but are unbound; offline resolution rejects them with instructions to
+refresh the source online or load a cached entry by explicit path. A bound record
+whose entry envelope differs is rejected before the default changes. Automatic
+filename resolution requires a preceding download that selected its filename
+automatically; an explicit `--filename` resolves the corresponding recorded
+package. Missing or evicted entries and unavailable TP deployments fail without
+network access.
+A branch resolves its last successfully acquired commit; requesting another TP
+size cannot silently select an older commit. Cache paths, endpoint, and
 authentication are configured explicitly; native commands do not interpret
 `HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, or `HF_ENDPOINT`.
 
 ### Package snapshots
 
-`ignition export MODEL` writes a unique local snapshot without requiring
-`--output`. A recipe's `export_repository` supplies its Hugging Face target;
-`--repo-id NAMESPACE/REPOSITORY` overrides it. Recipes without a target use their
-local recipe name as the cache namespace. For Qwen Flash:
+`ignition export MODEL` publishes a prepared entry in the shared model cache
+without requiring `--output`. A recipe's `export_repository` supplies its Hugging
+Face target; `--repo-id NAMESPACE/REPOSITORY` overrides it. For Qwen Flash:
 
 ```sh
 ignition export qwen3.8-flash
 ignition export qwen3.8-flash --no-weights
 ```
 
-With the default package cache, the layout is:
+The cache holds the directory canonical form of each entry:
 
 ```text
 ~/.cache/flare/packages/
-  blobs/<sha256>.safetensors
-  models--qwen38/
-    snapshots/<snapshot-id>/
-      model.safetensors
-      <sha256>.safetensors
+  blobs/<payload-id>.safetensors          # immutable payload objects
+  blobs/legacy/<container-digest>.safetensors
+  models/<model-key>/<version>/
+    model.safetensors
+    weights/layer-000.safetensors         # hardlink to a payload object
+    deployments/<deployment>/rank-<n>/graphs.safetensors
+  refs/<model-key>                        # selected default entry
+  staging/                                # unpublished work
+  locks/                                  # stable lock inodes
 ```
 
-Each payload filename hashes the complete file. Snapshot payloads are read-only
-hardlinks to `blobs/`, so identical bytes occupy disk space once. Every primary
-contains only the signed model envelope and the storage layout. All model payloads,
-including graphs and kernels, follow in separate files no larger than 64 GB
-(64,000,000,000 bytes). Size suffixes are binary; packing also applies this
-publication cap when the configured limit is `64G`.
-`--output FILE` selects another primary location on the cache's filesystem;
-a different filesystem requires a package cache on that filesystem. Configure
-`paths.package_cache` accordingly.
+Payload object names hash the exact stored payload bytes, so entries and revisions
+share one copy of each object through hard links. Entry companions keep readable
+semantic names (`weights/…`, `deployments/…`) and are hard links to those objects,
+never copies. The primary carries the signed manifest, the unsigned physical
+locations, and any embedded frontend assets (such as the tokenizer and chat
+template). Weight, executable, and state payloads live in companions.
 
-Weight resources are packed into shards by rank and logical file, separately
-from executable and supporting resources. `--no-weights` requires both the
-captured allocations and the resulting stored-data shards to be cached.
-A missing or changed payload fails export before publishing
-the primary. This includes initialized persistent buffers as well as weights.
+Export writes the directory canonical form by default. `--form packed` with
+`--output FILE` writes the single-file canonical form instead; `--output DIR`
+writes a copy of the directory form at that path. Both forms use the same
+metadata, payloads, signatures, and location records, and converting between them
+needs no signing key or GPU. `--output` refuses an existing destination. A
+destination on another filesystem is assembled by copying bytes, so those files
+share no storage with the cache; a destination on the cache's filesystem shares
+inodes where it can. The 64 GB publication limit applies to legacy blob
+publication and `--shard-size`. Payload-format packages keep the payload
+boundaries their export declared, and `--shard-size` does not regroup them.
+
+Weight payloads are declared per semantic layer and stored as their own payload
+objects; tuning-dependent layouts and residual initialization bytes form separate
+payloads. Executable and state payloads are stored separately from weight
+payloads. Whether a graph or capacity change leaves weight object identities
+unchanged is an export-acceptance property for the supported recipes, not a format
+guarantee.
+
+For payload packages, `--no-weights` requires every stable and tuned weight
+payload object the export names to be cached; a missing or changed weight payload
+fails export before publishing the primary. Declared direct capture records no
+allocation payload objects, so it needs no captured-allocation cache. Initial-state
+payloads (residual state, module globals) and executable resources are not
+weights: a graph or capacity change may produce new state and compressed executable
+frames, which such an export writes normally. Legacy blob packages retain
+their existing all-stored-data requirement, including captured-allocation data.
 The flag avoids temporary allocation files and duplicate weight writes. It still
 loads and prepares the checkpoint and reads captured storage to establish exact
-content identity. Changed graph captures and encrypted executable resources may
-produce additional blobs. Regular exports also reuse matching cached blobs.
+content identity. Changed graph captures and compressed executable resources may
+produce additional blobs. Regular exports also reuse matching cached payloads.
 
-Multi-host preparation keeps a blob cache on each host. Peers send manifests;
-rank zero requests only files absent from its own cache. Native serving distributes
-only the payload blobs needed by each rank and reuses blobs across snapshots.
+Multi-host preparation keeps the shared model cache on each host. Peers send
+manifests; the coordinator requests only objects absent from its own cache and
+holds leases on received objects until combining finishes. Native serving
+distributes only the payload blobs needed by each rank and reuses blobs across
+entries.
 
 Convert an existing package without a GPU or private signing key:
 
@@ -712,22 +749,22 @@ ignition convert /models/existing.safetensors \
 Conversion accepts monolithic, numbered-shard, and snapshot packages, verifies
 signed resources and stored data, and preserves the exact signed envelope. Supply
 the public publisher profile for a production package; the local development
-profile is loaded automatically. `--output FILE` selects a destination. Conversion
-leaves its source intact and needs space for payload bytes absent from the cache.
-It reads the complete package to verify its contents. Identical conversions reuse
-blobs without rewriting them. A resource larger than the selected limit is
-rejected because native resources must remain contiguous.
+profile is loaded automatically. `--output` selects a destination and `--form`
+selects the canonical form for payload packages; legacy packages keep
+shard-size conversion and reject `--form packed`. Conversion leaves its source
+intact. Identical conversions reuse payload objects without rewriting them, and a
+resource larger than the legacy limit is rejected because legacy native resources
+must remain contiguous.
 
-The printed snapshot directory is self-contained. Upload that directory to the
-recipe's repository using the Hugging Face upload client; hardlinks appear as
-ordinary files. Export and conversion do not upload or change publisher trust.
-Keep every referenced payload beside its primary when copying a snapshot. Removing
-a snapshot removes its hardlinks; cached blobs remain available for other exports.
-There is no automatic blob garbage collection.
+The printed cache entry is self-contained and can be uploaded to the recipe's
+repository with the Hugging Face upload client as either canonical form. Export
+and conversion do not upload or change publisher trust. Removing an entry removes
+its hard links; shared payload objects remain available for other entries, and
+`flare cache gc` reclaims objects nothing references.
 
 ### Signing and local development
 
-Final exports always carry signatures and encrypted executable resources.
+Final exports always carry signatures and zstd-compressed executable resources.
 Configure published exports with all three values:
 
 ```toml
@@ -744,11 +781,13 @@ accepted. Runtime publisher profiles contain only the verification key.
 identity field requires all three identity fields. `[publishing] shard_size` may
 be configured independently and does not select a production identity.
 
-`shard_size = "64G"` is the hard payload-file limit; export/sign/convert
-accept `--shard-size SIZE` up to 64 GiB, including each file's header. Zero and
-limits at or below 4096 bytes are invalid. A resource larger than the limit fails
-export. The primary contains metadata only; all resources reside in immutable
-content-addressed blobs. See [package snapshots](#package-snapshots).
+`shard_size = "64G"` is the hard payload-file limit for legacy blob packages;
+`ignition sign` and `ignition convert` accept `--shard-size SIZE` up to 64 GiB, including each
+file's header. Zero and limits at or below 4096 bytes are invalid. A legacy
+resource larger than the limit fails conversion. Payload-format packages keep
+their own payload boundaries in either canonical form. The primary contains
+metadata only; resources reside in immutable content-addressed payload objects.
+See [package snapshots](#package-snapshots).
 
 `ignition keygen` creates an encrypted production key and public profile.
 `ignition key-password` changes the key's passphrase while preserving its identity.
@@ -794,8 +833,8 @@ signed official source prints a warning naming both on every load.
 The disclosure names the model license the exporter recorded from the
 checkpoint's model card, with a link to the license text in the repository.
 Typing the publisher namespace agrees to the terms at that link and trusts the
-signing key; the typed string is the key material Helios derives executable
-decryption keys from, so acceptance is what decrypts the package's kernels.
+signing key. The typed string must exactly equal the signed publisher namespace;
+it records trust and license acceptance and is not executable key material.
 
 To load a locally exported development package using the default public profile:
 
@@ -953,12 +992,16 @@ decoded-source windows are accounted for separately at startup.
 ### 5.1 `ignition export`
 
 Resolve `MODEL`, discover GPUs through NVML, and derive the preparation plan.
-Download missing checkpoint weights, then prepare and write a runtime package
-in a unique local snapshot under the recipe's export repository.
-`--output FILE` selects another destination, appending `.safetensors` if needed;
-the destination must not exist. `--no-weights` requires exact cached stored-data
-blobs. Export closes the prepared model and exits without starting a listener.
-Preparation failures leave no published package.
+Download missing checkpoint weights, then prepare and publish an entry in the
+shared model cache under `paths.package_cache`.
+`--output PATH` writes an additional copy: with `--form packed` the single-file
+canonical form (`FILE`, no `.safetensors` suffix is appended), otherwise a
+directory copy; the destination must not exist. Multi-host export requires
+`--output DIR`, and the coordinator publishes the shared cache entry.
+`--staging PATH` selects the export workspace. `--no-weights` requires exact
+cached weight payloads; initial state and executable resources may be produced
+fresh. Export closes the prepared model and exits without starting a listener.
+Preparation failures publish no entry.
 
 SIGINT and SIGTERM end preparation immediately. Preparation exit codes are
 0 for success, 2 for usage, 3 for fetch, 4 for capacity, and 5 for preparation.
@@ -995,9 +1038,17 @@ The command verifies the signed index using embedded publisher profiles, profile
 provided with `--publisher-keys` (development packages default to
 `~/.config/flare/development-publisher.json`), and remembered trust-store keys.
 It opens referenced companion files to check their layout, but reads no stored
-weights, decrypts no executables, initializes no GPU, and requests no license
+weights, decodes no executables, initializes no GPU, and requests no license
 acceptance. Verification uses no network access. `--rank N` selects one rank of a
 multi-host package, including a copy holding only that rank's payloads.
+
+A payload package may contain several tensor-parallel deployments.
+`--tensor-parallel N` selects one by its authenticated prepared size. With no
+selector, a single-deployment package remains the default and a package with
+several deployments fails with the available sizes. An absent size lists the
+available sizes; a duplicated size fails rather than choosing one. `--rank`
+selects a rank within the chosen deployment. Legacy packages have one prepared
+rank count and reject an explicit tensor-parallel selector.
 
 Detail flags are additive:
 
@@ -1030,9 +1081,12 @@ from physical backing, which serving selects at load time.
 
 `--unverified` reads only the bounded primary-file metadata, without requiring a
 publisher key, verifying signatures, or opening companion files. Output explicitly
-labels this mode unverified. It accepts the same section flags, JSON output, and
-rank selection. `--publisher-keys` and `--trust-store` cannot be combined with it.
-Inspection supports model index versions 4 and 5 without re-export.
+labels this mode unverified. It accepts the same section flags, JSON output, rank
+selection, and tensor-parallel selection. The latter filters the decoded catalog
+to the selected deployment and reports `selected_tensor_parallel` and the filtered
+`rank_count`; a missing or duplicated size is an error. `--publisher-keys` and
+`--trust-store` cannot be combined with it. Inspection accepts payload format version 2, including compressed executable
+resources, and old-layout internal `ProtectedIndex` envelope 6.
 
 ## 6. Capacity errors
 
@@ -1202,3 +1256,54 @@ Cross-node tensor parallelism across supported hosts is in scope. The
 `flare orbit` commands and `flare agent` own host discovery, pairing, package
 distribution, and rank process management. `flare run` executes its assigned
 rank. See [Orbit](orbit.md) and [multi-host serving](multi-host.md).
+
+## Prepared-model cache commands
+
+`flare cache` manages the prepared-model cache selected by the global
+`--model-cache PATH` flag, which resolves exactly as `HubOptions.model_cache`
+does: an explicit path wins, then `paths.package_cache` from
+`~/.config/flare/config.toml`, then `~/.cache/flare/packages`.
+
+```sh
+flare cache list [MODEL] [--json]
+flare cache inspect MODEL@VERSION [inspection flags]
+flare cache select MODEL@VERSION
+flare cache remove MODEL@VERSION [--clear-default]
+flare cache gc [--json]
+```
+
+Entries are immutable directory-form packages. `select` writes the model's
+default ref atomically and refuses an entry that is not published. `remove`
+refuses an entry that any process leases and refuses the selected default unless
+`--clear-default` is given; it never replaces the default with another entry
+silently. `gc` runs the cache's collection pass: it removes abandoned staging
+trees, unreferenced payload objects, and unreferenced legacy containers. It does
+not evict published entries, selected refs, or leased objects. A failed export
+leaves only an abandoned staging tree, which `gc` reclaims; an entry that was
+already published under `models/` is removed only by `cache remove`. There is no
+automatic reclamation of published entries.
+
+`list` reports each model, its versions, the selected default, per-deployment
+tensor-parallel size and serving capacities, and three distinct byte figures:
+
+- `logical_bytes` is the sum of unique payload lengths named by the signed
+  manifests. It is not disk usage and is never reclaimable by deleting the cache.
+- `disk_logical_bytes` sums apparent file sizes of unique inodes in the entry
+  tree, so hard links are not double-counted.
+- `disk_physical_bytes` sums allocated blocks (`st_blocks * 512`) of those same
+  inodes, which is what the filesystem actually holds.
+- `shared_logical_bytes` and `shared_physical_bytes` count inodes with more than
+  one link. The filesystem cannot distinguish cache-internal sharing from
+  external hard links, so both are reported as shared rather than reclaimable.
+- `reclaimable_bytes` is reported only when it can be attributed: the entry is
+  not the selected default, nothing leases it, and its single-linked inodes can
+  be freed by removing the entry. Otherwise it is `null` with a
+  `reclaimable_note` explaining why. `--json` preserves the same fields.
+
+`list` metadata is explicitly unverified: it decodes the manifest to report
+identity, deployments, and capacities without claiming authentication.
+`inspect` resolves `MODEL@VERSION` to the entry directory while holding its
+lease and then runs the normal package inspection path, so
+`--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
+`--tensor-parallel`, and the section flags keep their established semantics. It does not gain a separate
+verification path.

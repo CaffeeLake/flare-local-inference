@@ -52,7 +52,9 @@ and retained owners to `flare_heliopause`. Recipes describe file-backed table
 ranges and generated frontend text without creating package files or payload
 offsets. Heliopause records CUPTI resources, traverses graphs and pointer-bearing
 storage, downloads retained bytes, serializes resources, and owns asset writes,
-hashing, encryption, signing, conversion, rank payload transfer, and publication.
+hashing, zstd level-3 executable compression, signing, conversion, rank payload
+transfer, and publication. Each executable resource is one zstd level-3 frame
+with a signed decoded length and compressed-chunk commitments.
 Keep captured buffers, contexts, graph templates, and kernel owners alive until
 native work confirms a drain; an unsuccessful drain retains their owners.
 
