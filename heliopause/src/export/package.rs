@@ -1294,7 +1294,7 @@ pub(crate) fn publish_payload(
                 .payload
                 .as_ref()
                 .ok_or_else(|| invalid("frontend asset lacks a payload"))?;
-            let (id, nbytes, path) = materialize(
+            let (id, nbytes, source) = payload_source(
                 &payload,
                 span,
                 &staging,
@@ -1323,7 +1323,7 @@ pub(crate) fn publish_payload(
             package_payloads.push(payload_export::PublishPayload {
                 role: pwire::PayloadRole::Frontend,
                 relative: String::new(),
-                source: payload_export::pin_file(&path, nbytes)?,
+                source,
                 id,
                 tensor: Some(tensor),
             });
@@ -1603,6 +1603,30 @@ pub(crate) fn publish_payload(
 
 type Materialized = (helios_core::package::PayloadId, u64, PathBuf);
 
+fn payload_source(
+    payload: &[FilePart],
+    span: &wire::Span,
+    staging: &Path,
+    name: &str,
+) -> Result<(
+    helios_core::package::PayloadId,
+    u64,
+    helios_core::package::container::Slice,
+)> {
+    use helios_core::package::{container::Slice, export::pin_file};
+    let pieces = locate(payload, span)?;
+    if let [piece] = pieces.as_slice() {
+        let source = Slice::new(
+            std::sync::Arc::new(File::open(&piece.path)?),
+            piece.offset,
+            piece.nbytes,
+        )?;
+        return Ok((source.digest()?, span.nbytes, source));
+    }
+    let (id, nbytes, path) = materialize(payload, span, staging, name)?;
+    Ok((id, nbytes, pin_file(&path, nbytes)?))
+}
+
 fn materialize(
     payload: &[FilePart],
     span: &wire::Span,
@@ -1806,7 +1830,7 @@ fn package_engram(
     let mut tables = Vec::new();
     for (index, table) in engram.tables.iter().enumerate() {
         let (weights, scales, shards) = if table.shards.is_empty() {
-            let weights = materialize(
+            let weights = payload_source(
                 payload,
                 table
                     .weights
@@ -1815,7 +1839,7 @@ fn package_engram(
                 staging,
                 &format!("engram-{index}-w.payload"),
             )?;
-            let scales = materialize(
+            let scales = payload_source(
                 payload,
                 table
                     .scales
@@ -1828,7 +1852,7 @@ fn package_engram(
                 installed.push(helios_core::package::export::PublishPayload {
                     role: pwire::PayloadRole::Weights,
                     relative: format!("weights/engram-{index}-{plane}.safetensors"),
-                    source: helios_core::package::export::pin_file(&materialized.2, materialized.1)?,
+                    source: materialized.2.clone(),
                     id: materialized.0,
                     tensor: None,
                 });
@@ -1853,7 +1877,7 @@ fn package_engram(
                         shard.rank
                     )));
                 }
-                let weights = materialize(
+                let weights = payload_source(
                     payload,
                     shard
                         .weights
@@ -1862,7 +1886,7 @@ fn package_engram(
                     staging,
                     &format!("engram-{index}-shard-{position}-w.payload"),
                 )?;
-                let scales = materialize(
+                let scales = payload_source(
                     payload,
                     shard
                         .scales
@@ -1877,10 +1901,7 @@ fn package_engram(
                         relative: format!(
                             "deployments/{deployment}/engram-{index}-shard-{position}-{plane}.safetensors"
                         ),
-                        source: helios_core::package::export::pin_file(
-                            &materialized.2,
-                            materialized.1,
-                        )?,
+                        source: materialized.2.clone(),
                         id: materialized.0,
                         tensor: None,
                     });
@@ -3812,6 +3833,82 @@ mod payload_export_tests {
     }
 
     #[test]
+    fn payload_source_pins_exact_file_range_without_staging() {
+        use helios_core::package::PayloadId;
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("checkpoint.bin");
+        fs::write(&path, b"prefix-weights-suffix").unwrap();
+        let parts = [FilePart {
+            offset: 4096,
+            source: FileSource {
+                path: path.clone(),
+                offset: 3,
+                nbytes: 14,
+            },
+        }];
+        let span = wire::Span {
+            offset: 4100,
+            nbytes: 7,
+            ..Default::default()
+        };
+        let staging = base.path().join("absent-staging");
+        let (id, nbytes, source) = payload_source(&parts, &span, &staging, "unused").unwrap();
+        assert_eq!(id, PayloadId::of(b"weights"));
+        assert_eq!(nbytes, 7);
+        assert_eq!(source.offset(), 7);
+        assert!(!staging.exists());
+        let mut bytes = [0; 7];
+        source.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"weights");
+
+        fs::rename(&path, base.path().join("retained.bin")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert_eq!(source.digest().unwrap(), id);
+        fs::write(base.path().join("retained.bin"), b"prefix-changed-suffix").unwrap();
+        assert_ne!(source.digest().unwrap(), id);
+    }
+
+    #[test]
+    fn payload_source_joins_fragmented_ranges() {
+        use helios_core::package::PayloadId;
+        let base = tempfile::tempdir().unwrap();
+        let first = base.path().join("first.bin");
+        let second = base.path().join("second.bin");
+        fs::write(&first, b"xxabcdyy").unwrap();
+        fs::write(&second, b"zefghzz").unwrap();
+        let parts = [
+            FilePart {
+                offset: 100,
+                source: FileSource {
+                    path: first,
+                    offset: 2,
+                    nbytes: 4,
+                },
+            },
+            FilePart {
+                offset: 104,
+                source: FileSource {
+                    path: second,
+                    offset: 1,
+                    nbytes: 4,
+                },
+            },
+        ];
+        let span = wire::Span {
+            offset: 102,
+            nbytes: 4,
+            ..Default::default()
+        };
+        let (id, nbytes, source) = payload_source(&parts, &span, base.path(), "joined").unwrap();
+        assert_eq!(id, PayloadId::of(b"cdef"));
+        assert_eq!(nbytes, 4);
+        assert_eq!(fs::read(base.path().join("joined")).unwrap(), b"cdef");
+        let mut bytes = [0; 4];
+        source.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"cdef");
+    }
+
+    #[test]
     fn package_engram_preserves_shared_and_partitioned_plane_layouts() {
         use helios_core::package::schema::wire as pwire;
         let base = std::env::temp_dir().join(format!(
@@ -3946,6 +4043,22 @@ mod payload_export_tests {
                     nbytes: nbytes as u64,
                 },
             });
+        }
+        let assembly = base.join("assembly");
+        fs::create_dir(&assembly).unwrap();
+        let mut installed = Vec::new();
+        package_engram(
+            rank.index.engram.as_ref().unwrap(),
+            &rank.payload,
+            &assembly,
+            "gb202-tp2",
+            &mut installed,
+        )
+        .unwrap();
+        assert_eq!(installed.len(), 6);
+        assert_eq!(fs::read_dir(&assembly).unwrap().count(), 0);
+        for payload in &installed {
+            assert_eq!(payload.source.digest().unwrap(), payload.id);
         }
         let output = base.join("package");
         let mut second = rank.clone();

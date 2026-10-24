@@ -127,3 +127,21 @@ with phase(progress, 'Prepare serving graphs') as stage:
     assert plain.count("Graph catalog: 1 graphs") == 1
     assert "packed_speculative" in plain and "later work" in plain and "OK" in plain
     assert "…" not in plain
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_nonlive_export_only_prints_its_terminal_result(fail):
+    stream = io.StringIO()
+    progress = StartupProgress(stream=stream)
+    progress.console = Console(file=stream, width=120, color_system=None)
+    try:
+        with phase(progress, 'Export native package', live=False):
+            assert stream.getvalue() == ''
+            if fail:
+                raise RuntimeError('publication failed')
+    except RuntimeError:
+        assert fail
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith('[  FAILED  ]' if fail else '[    OK    ]')
+    assert progress.active is None

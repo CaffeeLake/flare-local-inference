@@ -63,7 +63,10 @@ def test_native_export_terminal_progress(tmp_path, rank):
               "Export frontend assets", "Hash and publish payload blobs",
               "Sign and publish package metadata")
     if rank == 0:
-        assert plain.count("Export native package.") == 2, plain
+        assert plain.count("Export native package.") == 1, plain
+        assert "[ STARTED  ] Export native package." not in plain, plain
+        assert "[    OK    ] Export native package." in plain, plain
+        assert "[  FAILED  ]" not in plain, plain
         for label in labels:
             assert label in plain, plain
     else:

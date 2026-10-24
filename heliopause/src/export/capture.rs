@@ -763,6 +763,8 @@ struct Downloader<'a> {
     slots: Vec<DownloadSlot>,
     drained: bool,
     downloaded: u64,
+    #[cfg(test)]
+    copies: u64,
 }
 impl<'a> Downloader<'a> {
     const CHUNK: usize = 8 << 20;
@@ -773,6 +775,8 @@ impl<'a> Downloader<'a> {
             slots: Vec::new(),
             drained: true,
             downloaded: 0,
+            #[cfg(test)]
+            copies: 0,
         };
         cu!(
             cuda,
@@ -830,6 +834,8 @@ impl<'a> Downloader<'a> {
         for (index, chunk) in output.chunks_mut(Self::CHUNK).enumerate() {
             self.drained = false;
             self.downloaded += chunk.len() as u64;
+            #[cfg(test)]
+            { self.copies += 1; }
             let pointer = self.slots[0].pointer;
             cu!(
                 self.cuda,
@@ -888,6 +894,8 @@ impl<'a> Downloader<'a> {
             slot.nbytes = size;
             self.drained = false;
             self.downloaded += size as u64;
+            #[cfg(test)]
+            { self.copies += 1; }
             cu!(
                 self.cuda,
                 "cuMemcpyDtoHAsync_v2",
@@ -1279,6 +1287,8 @@ impl PackedDownload<'_, '_> {
             let bytes = (length - relative).min((count - copied) as u64) as usize;
             self.downloader.drained = false;
             self.downloader.downloaded += bytes as u64;
+            #[cfg(test)]
+            { self.downloader.copies += 1; }
             cu!(
                 self.downloader.cuda,
                 "cuMemcpyDtoHAsync_v2",
@@ -1366,6 +1376,114 @@ impl PackedDownload<'_, '_> {
             self.queue(index, self.next)?;
         }
         Ok(())
+    }
+}
+
+// Transfer whole chunks while consumers retain owner-relative zero-block boundaries.
+struct WeightDownload<'a, 'cuda> {
+    downloader: &'a mut Downloader<'cuda>,
+    spans: &'a [weight_payload::PayloadSpan],
+    allocations: Vec<&'a Allocation>,
+    next_span: usize,
+    next_offset: u64,
+    pending: std::collections::VecDeque<(usize, usize, usize)>,
+}
+
+impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
+    fn new(
+        downloader: &'a mut Downloader<'cuda>,
+        allocations: &'a [Allocation],
+        spans: &'a [weight_payload::PayloadSpan],
+    ) -> ExportResult<Self> {
+        let allocations = spans.iter().map(|span| {
+            allocations.iter().find(|allocation| allocation.name == span.allocation)
+                .ok_or_else(|| invalid("owner reads require a retained allocation"))
+        }).collect::<ExportResult<Vec<_>>>()?;
+        downloader.drain()?;
+        let mut reader = Self {
+            downloader, spans, allocations, next_span: 0, next_offset: 0,
+            pending: std::collections::VecDeque::new(),
+        };
+        for index in 0..reader.downloader.slots.len() {
+            reader.queue(index)?;
+        }
+        Ok(reader)
+    }
+
+    fn queue(&mut self, index: usize) -> ExportResult<()> {
+        while self.next_span < self.spans.len()
+            && self.next_offset == self.spans[self.next_span].nbytes
+        {
+            self.next_span += 1;
+            self.next_offset = 0;
+        }
+        let Some(span) = self.spans.get(self.next_span) else { return Ok(()); };
+        let allocation = self.allocations[self.next_span];
+        let size = (span.nbytes - self.next_offset).min(Downloader::CHUNK as u64) as usize;
+        let destination = span.destination_offset.checked_add(self.next_offset)
+            .ok_or_else(|| invalid("weight span offset overflow"))?;
+        let downloader = &mut self.downloader;
+        let slot = &mut downloader.slots[index];
+        slot.offset = destination;
+        slot.nbytes = size;
+        let buffer = unsafe { std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>(), size) };
+        let whole = [(0, allocation.nbytes)];
+        let ranges = allocation.snapshot_spans.as_deref().unwrap_or(&whole);
+        copy_recorded_ranges(ranges, allocation.nbytes, destination, buffer, |offset, output| {
+            if allocation.memory == "mapped_host" {
+                unsafe {
+                    std::ptr::copy_nonoverlapping((allocation.address + offset) as *const u8,
+                        output.as_mut_ptr(), output.len());
+                }
+            } else {
+                downloader.drained = false;
+                downloader.downloaded += output.len() as u64;
+                #[cfg(test)]
+                { downloader.copies += 1; }
+                cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
+                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)?;
+            }
+            Ok(())
+        })?;
+        if allocation.memory != "mapped_host" {
+            cu!(downloader.cuda, "cuEventRecord", (Handle, Handle), slot.event, downloader.stream)?;
+        }
+        self.pending.push_back((index, self.next_span, 0));
+        self.next_offset += size as u64;
+        Ok(())
+    }
+
+    fn read_into(&mut self, allocation: &str, mut destination: u64, mut output: &mut [u8]) -> ExportResult<()> {
+        while !output.is_empty() {
+            let (index, span, consumed) = self.pending.front_mut()
+                .ok_or_else(|| invalid("weight read exceeds its declared spans"))?;
+            let slot = &self.downloader.slots[*index];
+            if self.spans[*span].allocation != allocation || slot.offset + *consumed as u64 != destination {
+                return Err(invalid("weight payload reads must follow declared span order"));
+            }
+            if *consumed == 0 && self.allocations[*span].memory != "mapped_host" {
+                cu!(self.downloader.cuda, "cuEventSynchronize", (Handle), slot.event)?;
+            }
+            let count = output.len().min(slot.nbytes - *consumed);
+            output[..count].copy_from_slice(unsafe {
+                std::slice::from_raw_parts(slot.pointer.cast::<u8>().add(*consumed), count)
+            });
+            *consumed += count;
+            destination += count as u64;
+            output = &mut output[count..];
+            if *consumed == slot.nbytes {
+                let (index, _, _) = self.pending.pop_front().unwrap();
+                self.queue(index)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WeightDownload<'_, '_> {
+    fn drop(&mut self) {
+        // A consumer can stop while the next chunk is still being copied.
+        let _ = self.downloader.drain();
     }
 }
 
@@ -1770,37 +1888,18 @@ fn resolve_weight_payload(
     )> = Vec::with_capacity(payloads.len());
     for (is_weight, name, storage, spans) in payloads.drain(..) {
         if let Some(root) = &root {
-            let mut cache_reader = RetainedReader::new(&retained, &parts);
-            let mut scan = |allocation: &str, destination: u64, buffer: &mut [u8]| {
-                match device_reader.as_deref_mut() {
-                    Some(downloader) => {
-                        let target = device_allocations
-                            .iter()
-                            .find(|candidate| candidate.name == allocation)
-                            .ok_or_else(|| invalid("owner reads require a retained allocation"))?;
-                        let ranges = target
-                            .snapshot_spans
-                            .clone()
-                            .unwrap_or_else(|| vec![(0, target.nbytes)]);
-                        copy_recorded_ranges(
-                            &ranges,
-                            target.nbytes,
-                            destination,
-                            buffer,
-                            |offset, output| {
-                                downloader.read(
-                                    target.address + offset,
-                                    &target.memory,
-                                    output,
-                                )?;
-                                Ok(())
-                            },
-                        )
+            let (payload_id, length, blocks) = {
+                let mut download = device_reader.as_deref_mut()
+                    .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
+                    .transpose()?;
+                let mut cache_reader = RetainedReader::new(&retained, &parts);
+                scan_group_blocks(&mut |allocation, destination, buffer| {
+                    match download.as_mut() {
+                        Some(download) => download.read_into(allocation, destination, buffer),
+                        None => cache_reader.read_into(allocation, destination, buffer),
                     }
-                    None => cache_reader.read_into(allocation, destination, buffer),
-                }
+                }, spans)?
             };
-            let (payload_id, length, blocks) = scan_group_blocks(&mut scan, spans)?;
             if length == 0 {
                 // A group with no stored bytes produces no payload object and no
                 // catalog entry; `no_weights` must not look for an empty object.
@@ -1826,46 +1925,20 @@ fn resolve_weight_payload(
             } else {
                 None
             };
-            let mut insert_reader = RetainedReader::new(&retained, &parts);
-            let mut read = |allocation: &str, destination: u64, buffer: &mut [u8]| {
-                match device_reader.as_deref_mut() {
-                    Some(downloader) => {
-                        let target = device_allocations
-                            .iter()
-                            .find(|candidate| candidate.name == allocation)
-                            .ok_or_else(|| invalid("owner reads require a retained allocation"))?;
-                        let ranges = target
-                            .snapshot_spans
-                            .clone()
-                            .unwrap_or_else(|| vec![(0, target.nbytes)]);
-                        copy_recorded_ranges(
-                            &ranges,
-                            target.nbytes,
-                            destination,
-                            buffer,
-                            |offset, output| {
-                                downloader.read(
-                                    target.address + offset,
-                                    &target.memory,
-                                    output,
-                                )?;
-                                Ok(())
-                            },
-                        )
-                    }
-                    None => insert_reader.read_into(allocation, destination, buffer),
-                }
+            let object = {
+                let mut download = device_reader.as_deref_mut()
+                    .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
+                    .transpose()?;
+                let mut insert_reader = RetainedReader::new(&retained, &parts);
+                root.insert_payload(payload_id, length, ElidedBlocks::new(
+                    |allocation: &str, destination: u64, buffer: &mut [u8]| {
+                        match download.as_mut() {
+                            Some(download) => download.read_into(allocation, destination, buffer),
+                            None => insert_reader.read_into(allocation, destination, buffer),
+                        }
+                    }, spans,
+                ))?
             };
-            let object = root.insert_payload(
-                payload_id,
-                length,
-                ElidedBlocks::new(
-                    move |allocation: &str, destination: u64, buffer: &mut [u8]| {
-                        read(allocation, destination, buffer)
-                    },
-                    spans,
-                ),
-            )?;
             drop(existing);
             output.payload_leases.0.push(object);
             resolved.push((
@@ -3455,6 +3528,101 @@ mod tests {
         assert_eq!(missing, [0u8; 4]);
         let _ = fs::remove_dir_all(&directory);
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn weight_payload_device_materialization_matches_staged_bytes() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        let size = (256 << 20) + 97;
+        let mut address = 0u64;
+        let result = (|| -> ExportResult<()> {
+            let mut bytes = vec![0x37; size];
+            let block = weight_payload::ELIDE_BLOCK as usize;
+            bytes[13 + block..13 + 2 * block].fill(0);
+            let hole = (Downloader::CHUNK - 19, Downloader::CHUNK + 35);
+            bytes[hole.0..hole.1].fill(0);
+            cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, size)?;
+            cu!(&cuda, "cuMemcpyHtoD_v2", (u64, *const u8, usize), address, bytes.as_ptr(), size)?;
+            // Omitted storage must read as zero even when its backing is poisoned.
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), address + hole.0 as u64, 0xAA, hole.1 - hole.0)?;
+            cuda.synchronize()?;
+            let reference = tempfile::tempdir()?;
+            let device = tempfile::tempdir()?;
+            let prepare = |directory: &Path| -> ExportResult<(CaptureRequest, RankOutput)> {
+                let (mut request, mut output) = declared_capture(directory, &bytes, false)?;
+                let view = &mut request.weight_payload.as_mut().unwrap()["views"][0];
+                view["address"] = (address + 13).into();
+                view["shape"] = serde_json::json!([size - 29]);
+                output.allocations[0].address = address;
+                output.allocations[0].snapshot_spans = Some(vec![
+                    (0, hole.0 as u64), (hole.1 as u64, (size - hole.1) as u64),
+                ]);
+                output.index.ranks[0].allocations[0].address = Some(address);
+                Ok((request, output))
+            };
+            let (reference_request, mut reference_output) = prepare(reference.path())?;
+            let expected = resolve_weight_payload(&reference_request, &mut reference_output, None)?.unwrap();
+            let (mut request, mut output) = prepare(device.path())?;
+            let allocations = output.allocations.clone();
+            let mut downloader = Downloader::new(&cuda)?;
+            for pass in 0..2 {
+                request.options.no_weights = pass == 1;
+                let copies = downloader.copies;
+                let downloaded = downloader.downloaded;
+                let started = std::time::Instant::now();
+                let actual = resolve_weight_payload(&request, &mut output,
+                    Some((&mut downloader, &allocations)))?.unwrap();
+                downloader.drain()?;
+                eprintln!("weight materialization: bytes={size}, cached={}, copies={}, elapsed={:?}",
+                    pass == 1, downloader.copies - copies, started.elapsed());
+                assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(&expected)?);
+                assert_eq!(downloader.downloaded - downloaded, 2 * (size - (hole.1 - hole.0)) as u64);
+                assert!(downloader.copies - copies <= 2 * (size.div_ceil(Downloader::CHUNK) + 4) as u64);
+            }
+            let mut host = allocation("host", bytes.as_ptr() as u64, size as u64);
+            host.memory = "mapped_host".into();
+            let mixed = [allocations[0].clone(), host];
+            let spans: Vec<_> = [
+                ("device-0", (size - 7) as u64, 7),
+                ("host", 13, 2 * block as u64 + 1),
+                ("device-0", 17, (2 * Downloader::CHUNK + 97) as u64),
+                ("host", 0, 0),
+                ("device-0", 0, 13),
+            ].into_iter().map(|(allocation, destination_offset, nbytes)| weight_payload::PayloadSpan {
+                payload_offset: 0, allocation: allocation.into(), destination_offset, nbytes,
+            }).collect();
+            {
+                let mut reader = WeightDownload::new(&mut downloader, &mixed, &spans)?;
+                for span in &spans {
+                    let mut offset = 0usize;
+                    for amount in [7, block, 2 * Downloader::CHUNK + 97] {
+                        let amount = amount.min(span.nbytes as usize - offset);
+                        let mut actual = vec![0xAA; amount];
+                        reader.read_into(&span.allocation, span.destination_offset + offset as u64, &mut actual)?;
+                        let begin = span.destination_offset as usize + offset;
+                        assert_eq!(actual, bytes[begin..begin + amount]);
+                        offset += amount;
+                    }
+                    assert_eq!(offset as u64, span.nbytes);
+                }
+            }
+            {
+                let mut reader = WeightDownload::new(&mut downloader, &mixed, &spans)?;
+                assert!(reader.read_into("wrong allocation", 0, &mut [0]).is_err());
+            }
+            assert!(downloader.drained);
+            Ok(())
+        })();
+        cuda.synchronize()?;
+        if address != 0 { cu!(&cuda, "cuMemFree_v2", (u64), address)?; }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
     }
 
     #[test]
