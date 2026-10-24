@@ -521,7 +521,6 @@ impl RequestScheduler {
     }
 
     pub(super) fn split_candidates(&self, output: &mut Vec<Candidate>, values: &[LaneValue; REQUEST_LANES], age_price: f64, optimistic: bool) {
-        if !self.submissions.is_empty() { return; }
         if self.costs.packed_round_shapes().next().is_some() {
             self.packed_round_candidates(output, values, age_price, optimistic);
         }
@@ -1480,6 +1479,32 @@ mod tests {
         }
         s.advance_to(s.now_ns + nanos).unwrap();
         s.complete(fence, &records, capture_time(nanos)).unwrap();
+    }
+
+    #[test]
+    fn terminal_snapshot_waits_for_owned_probe_verification() {
+        let mut s = engine(2);
+        s.configure_policy(PolicyConfig::throughput()).unwrap();
+        let handles = [ready(&mut s), ready(&mut s)];
+        let target = cost::Key { drafts: 0, kind: GraphKind::Proposal,
+            batch: 1, tokens: 8, prefill: 0, packed: 0 };
+        stale_only(&mut s, target);
+        let proposal = s.plan().unwrap();
+        assert_eq!(proposal.origin, PlanOrigin::RefreshStart(target));
+        assert_eq!(proposal.lanes.len(), 1);
+        let waiting = *handles.iter().find(|&&h| h != proposal.lanes[0].request).unwrap();
+        finish_refresh_proposal(&mut s, &proposal, &[[0.9; 7]; 2], 1000);
+        let episode = s.refresh_episode().unwrap().id;
+        s.finish_early(waiting, true).unwrap();
+        assert_eq!(s.request(waiting).unwrap().phase, RequestPhase::Snapshot);
+        let verify = s.plan().unwrap();
+        assert_eq!(verify.kind, GraphKind::Verification);
+        assert_eq!(verify.origin, PlanOrigin::RefreshContinuation(episode));
+        finish_refresh_verification(&mut s, &verify, 1000);
+        assert!(s.refresh_episode().is_none());
+        let snapshot = s.plan().unwrap();
+        assert_eq!(snapshot.kind, GraphKind::Snapshot);
+        assert!(snapshot.lanes.iter().any(|lane| lane.request == waiting));
     }
 
     #[test]

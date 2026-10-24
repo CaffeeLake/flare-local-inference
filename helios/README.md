@@ -364,7 +364,10 @@ page sequence while transferring complete pages to the cache. Admission reuse
 counts stay fixed. Duplicate publication never remaps the live request.
 
 `finish` publishes exact terminal consumed state after its successful snapshot
-copy, excluding the final pending sampled token. A child at T after parent S owns
+copy, excluding the final pending sampled token. Terminal retirement competes by
+its own intrinsic value and waiting-age cost under both scheduler policies.
+A winning feedback operation drains queued work before submission; terminal
+snapshots have no unconditional priority. A child at T after parent S owns
 `floor(T/64)-floor(S/64)` complete pages. Partial payloads restore from the snapshot
 into private pages. Failed copies prevent publication. `cancel` stops scheduling
 immediately and retains slot/page/snapshot ownership through final GPU use.

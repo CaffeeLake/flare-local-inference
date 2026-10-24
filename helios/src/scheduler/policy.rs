@@ -11,6 +11,8 @@ pub struct PolicyConfig {
     pub token_fairness: f64,
     pub delivery_fairness: f64,
     pub decode_age_price: f64,
+    pub terminal_value: f64,
+    pub terminal_age_price: f64,
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
@@ -23,6 +25,8 @@ impl Default for PolicyConfig {
             token_fairness: 16.0,
             delivery_fairness: 4.0,
             decode_age_price: 0.1,
+            terminal_value: 256.0,
+            terminal_age_price: 1.0,
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
@@ -43,6 +47,7 @@ pub struct RequestAccounting {
     pub arrival_ns: u64,
     pub last_progress_ns: u64,
     pub last_output_ns: Option<u64>,
+    pub terminal_since_ns: Option<u64>,
     pub last_output_fence: Option<Fence>,
     pub published_deliveries: u64,
     pub committed_prefill_tokens: u64,
@@ -161,6 +166,8 @@ impl RequestScheduler {
                 policy.token_fairness,
                 policy.delivery_fairness,
                 policy.decode_age_price,
+                policy.terminal_value,
+                policy.terminal_age_price,
             ]
             .into_iter()
             .any(|v| !v.is_finite() || v < 0.0)
@@ -339,7 +346,9 @@ impl RequestScheduler {
         let references = self.delivery_reference_intervals(&rates.map(|(_, d)| d));
         let mut scale = 0.0f64
             .max(self.policy.output_token_value.ln())
-            .max(self.policy.decode_age_price.ln());
+            .max(self.policy.decode_age_price.ln())
+            .max(self.policy.terminal_value.ln())
+            .max(self.policy.terminal_age_price.ln());
         for (slot, entry) in self.slots.iter().enumerate() {
             let Some(r) = entry
                 .request
@@ -349,6 +358,17 @@ impl RequestScheduler {
                 continue;
             };
             let (tokens, deliveries) = rates[slot];
+            if terminal_cleanup(r) {
+                values[slot].terminal = self.policy.terminal_value;
+                values[slot].age_ms = self.now_ns.saturating_add(window_ns).saturating_sub(
+                    r.accounting.terminal_since_ns.expect("terminal retirement has a start time"),
+                ) as f64 / 1e6;
+                if let Some(reference) = references[slot] {
+                    values[slot].reference_delivery_ms = reference;
+                    values[slot].age_price = self.policy.terminal_age_price;
+                }
+                continue;
+            }
             let service = self.projected_service(r);
             if let Some(rate) = tokens {
                 token_log[slot] = service
@@ -389,6 +409,7 @@ impl RequestScheduler {
             value.output_token =
                 self.policy.output_token_value * unit + (token_log[slot] - scale).exp();
             value.delivery = (delivery_log[slot] - scale).exp();
+            value.terminal *= unit;
             value.age_price *= unit;
             age_price += value.age_price;
         }
@@ -485,7 +506,8 @@ impl RequestScheduler {
         value: LaneValue,
     ) -> f64 {
         if terminal_cleanup(r) {
-            return value.decode(0.0, duration_ns as f64 / 1e6);
+            let ms = duration_ns as f64 / 1e6;
+            return value.finish(ms, ms);
         }
         let Some((mut following, work)) = self.next_progress(r, value) else {
             return 0.0;
@@ -722,7 +744,8 @@ impl RequestScheduler {
         for slot in
             bits(mask).filter(|s| terminal_cleanup(self.slots[*s].request.as_ref().unwrap()))
         {
-            terminal[count] = (slot, values[slot].decode(0.0, duration_ns as f64 / 1e6));
+            let ms = duration_ns as f64 / 1e6;
+            terminal[count] = (slot, values[slot].finish(ms, ms));
             count += 1;
         }
         if count > 0 {
@@ -846,9 +869,6 @@ impl RequestScheduler {
                                 &(r.consumed_tokens as usize + self.prefill_work(r, capacity)),
                             ).is_ok()))
             });
-        if feedback && !self.submissions.is_empty() {
-            return;
-        }
         let (selected, rate) = self
             .continuation_candidate(
                 kind,
@@ -956,9 +976,6 @@ impl RequestScheduler {
         age_price: f64,
         optimistic: bool,
     ) {
-        if !self.submissions.is_empty() {
-            return;
-        }
         let decode = if self.speculative_widths.is_empty() {
             GraphKind::Decode
         } else {
@@ -1088,11 +1105,10 @@ impl RequestScheduler {
             );
             let count = if episode.target.is_none() { self.prune_padding(&mut continuations) } else { continuations.len() };
             let candidate = *continuations[..count].iter().max_by(|a, b| compare(a, b))?;
-            return Some(self.materialize(candidate, log_scale,
-                episode.continuation()));
+            return self.available_plan(candidate, log_scale, episode.continuation());
         }
         if ordinary.rate.duration_ns == 0 {
-            return Some(self.materialize(ordinary, log_scale, PlanOrigin::Discovery));
+            return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
         }
         if self.refresh_ready() && self.submissions.is_empty() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
@@ -1115,15 +1131,27 @@ impl RequestScheduler {
                 }
             }
             if let Some((_, target, candidate)) = best {
-                return Some(self.materialize(candidate, log_scale, PlanOrigin::RefreshStart(target)));
+                return self.available_plan(candidate, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
         if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() && self.submissions.is_empty() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
-                return Some(self.materialize(candidate, log_scale, PlanOrigin::AcceptanceStart));
+                return self.available_plan(candidate, log_scale, PlanOrigin::AcceptanceStart);
             }
         }
-        Some(self.materialize(ordinary, log_scale, PlanOrigin::Ordinary))
+        self.available_plan(ordinary, log_scale, PlanOrigin::Ordinary)
+    }
+
+    fn available_plan(
+        &self, candidate: Candidate, log_scale: f64, origin: PlanOrigin,
+    ) -> Option<ScheduledPlan> {
+        let plan = self.materialize(candidate, log_scale, origin);
+        // A winning feedback operation drains the queue instead of yielding to
+        // lower-value work that would keep its execution window occupied.
+        if self.plan_requires_feedback(&plan) && !self.submissions.is_empty() {
+            return None;
+        }
+        Some(plan)
     }
 
     fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {

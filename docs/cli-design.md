@@ -149,8 +149,8 @@ All launch modes use the same native distribution and serving bootstrap.
 defaulting to `~/.config/flare/orbit.toml` and
 `~/.config/flare/orbit/controller.key`. `flare orbit run` takes the serving
 flags of `flare run` and applies them to every rank; `--host`, `--port`,
-`--served-model-name`, `--scheduler-policy`, and `--api-key-file` apply to rank
-zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
+`--served-model-name`, `--scheduler-policy`, `--scheduler-terminal-value`,
+`--scheduler-terminal-age-price`, and `--api-key-file` apply to rank zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
 not upload it. Package inputs are Hugging Face repositories
 `ORG/NAME[@REVISION]`, controller-local files, or `NODE:/absolute/path` on a
 paired node. Orbit downloads repository packages on a candidate node and
@@ -438,6 +438,13 @@ throughput with output cadence. For throughput-oriented serving, use
 `flare run model.safetensors --gpus 0,1,2,3 --scheduler-policy throughput`.
 This preference retains token-service fairness and can produce longer gaps
 between larger output bursts. It uses the package's existing graphs.
+Both policies retain terminal-retirement value and urgency. The independent
+`--scheduler-terminal-value VALUE` (default 256 prompt-token units) and
+`--scheduler-terminal-age-price PRICE` (default 1 value/ms²) override those
+coefficients after policy selection. Values must be finite and nonnegative;
+zero disables that term. Terminal age starts when termination is observed and
+includes queued-work drainage. These are scheduling preferences, not deadlines.
+The controls use existing snapshot graphs and require no package re-export.
 
 `flare run PACKAGE` loads an exported file without the Ignition configuration
 reader. `PACKAGE` can also be a Hugging Face repository ID with an optional

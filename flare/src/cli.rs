@@ -456,6 +456,8 @@ impl OrbitPush {
             stage_only: false,
             api_key_file: None,
             scheduler_policy: "balanced".into(),
+            scheduler_terminal_value: None,
+            scheduler_terminal_age_price: None,
             serving: self.serving.clone(),
         }
     }
@@ -549,6 +551,14 @@ pub struct OrbitRun {
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: Option<String>,
 
+    /// Value per terminal retirement in prompt-token units [default: 256].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_value: Option<f64>,
+
+    /// Terminal waiting cost in value/ms², independent of output cadence [default: 1].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_age_price: Option<f64>,
+
     /// File on rank zero's node containing the serving API key; omit to disable authentication.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
@@ -588,6 +598,12 @@ impl OrbitRun {
         if let Some(policy) = &self.scheduler_policy {
             options.extend(["--scheduler-policy".into(), policy.clone()]);
         }
+        if let Some(value) = self.scheduler_terminal_value {
+            options.extend(["--scheduler-terminal-value".into(), value.to_string()]);
+        }
+        if let Some(price) = self.scheduler_terminal_age_price {
+            options.extend(["--scheduler-terminal-age-price".into(), price.to_string()]);
+        }
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
@@ -616,6 +632,8 @@ impl OrbitRun {
                 .scheduler_policy
                 .clone()
                 .unwrap_or_else(|| "balanced".into()),
+            scheduler_terminal_value: self.scheduler_terminal_value,
+            scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             serving: self.serving.clone(),
         }
     }
@@ -733,6 +751,14 @@ pub struct Run {
     #[arg(long, value_name = "MODE", default_value = "balanced",
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: String,
+
+    /// Value per terminal retirement in prompt-token units [default: 256].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_value: Option<f64>,
+
+    /// Terminal waiting cost in value/ms², independent of output cadence [default: 1].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_age_price: Option<f64>,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -905,6 +931,12 @@ fn served_model_name(value: &str) -> Result<String, String> {
     } else {
         Ok(value.to_owned())
     }
+}
+
+fn scheduler_coefficient(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| "scheduler coefficient must be finite and nonnegative".into())
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
@@ -1102,6 +1134,10 @@ mod tests {
                     "8000",
                     "--scheduler-policy",
                     "balanced",
+                    "--scheduler-terminal-value",
+                    "256",
+                    "--scheduler-terminal-age-price",
+                    "0",
                     "--mtp-adaptive-verification-alpha",
                     "1.0",
                     "--kv-cache-limit",
@@ -1135,6 +1171,10 @@ mod tests {
                 "8001".into(),
                 "--scheduler-policy".into(),
                 "throughput".into(),
+                "--scheduler-terminal-value".into(),
+                "512".into(),
+                "--scheduler-terminal-age-price".into(),
+                "2".into(),
                 "--mtp-adaptive-verification-alpha".into(),
                 "0.5".into(),
                 "--kv-cache-limit".into(),
@@ -1148,6 +1188,10 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
+            assert_eq!(effective.scheduler_terminal_value, Some(if explicit { 256.0 } else { 512.0 }));
+            assert_eq!(effective.scheduler_terminal_age_price, Some(if explicit { 0.0 } else { 2.0 }));
+            assert_eq!(orbit.run_args().scheduler_terminal_value, orbit.scheduler_terminal_value);
+            assert_eq!(orbit.run_args().scheduler_terminal_age_price, orbit.scheduler_terminal_age_price);
             assert_eq!(
                 effective.mtp_adaptive_verification_alpha,
                 Some(if explicit { 1.0 } else { 0.5 })
@@ -1176,6 +1220,21 @@ mod tests {
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
                 explicit
             );
+        }
+    }
+
+    #[test]
+    fn terminal_preferences_parse_independently_and_reject_invalid_numbers() {
+        let defaults = run(&["flare", "run", "model"]);
+        assert_eq!(defaults.scheduler_terminal_value, None);
+        assert_eq!(defaults.scheduler_terminal_age_price, None);
+        for flag in ["--scheduler-terminal-value", "--scheduler-terminal-age-price"] {
+            for value in ["0", "0.5", "256", "1024"] {
+                assert!(Cli::try_parse_from(["flare", "run", "model", flag, value]).is_ok());
+            }
+            for value in ["-1", "NaN", "inf", "garbage"] {
+                assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={value}")]).is_err());
+            }
         }
     }
 

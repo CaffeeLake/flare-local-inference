@@ -273,9 +273,26 @@ nor require host caching. Existing snapshot and restore operations preserve
 partial pages and every declared continuation history.
 
 A terminal snapshot enables the visible response completion and frees the
-request's execution resources. It contributes a delivery with zero output
-tokens. Its delivery-rate reference comes from applicable snapshot graphs.
-The completion event's price can grow while other requests run. Error and
+request's execution resources. Terminal retirement has its own value and age
+cost, independent of output-token and streaming-delivery prices. Its age starts
+when validated completion identifies termination, or when preemption initiates
+retirement. Queued work and final-token publication do not reset that clock.
+Preemption retires a resident execution request without completing its response.
+
+For snapshot duration `T`, terminal age `A`, and the snapshot family's existing
+batch-feasible reference interval `sigma`, the lane contributes
+`terminal_value + terminal_age_price * sigma * (A + T)`. Its age coefficient also
+enters every candidate's common waiting cost. In a two-stage sequence, a terminal
+row's age stops at its snapshot completion, including the saved waiting cost over
+the remaining sequence. Nonterminal snapshots retain prerequisite utility.
+
+Terminal work competes through the same value-per-time score, cohort selection,
+and padding rules as inference. It has no priority override or admission-order
+constraint. Unknown snapshot timings retain discovery semantics; no duration or
+reference interval is invented. Snapshot execution earns no token or streaming
+burst credit. Both balanced and throughput policies retain terminal value and
+urgency. Successful snapshot completion and cache publication precede admission
+of an immediate continuation after normal response completion. Error and
 cancellation paths preserve fenced resource ownership regardless of utility.
 
 ## Duration estimates
@@ -439,6 +456,14 @@ that change the request phase require completion feedback. A finishing prefill
 therefore exposes its decoder and checkpoint operation before another decision
 is committed.
 
+Feedback-dependent candidates remain visible while ordinary work is queued.
+Selection uses projected prices and ages at the queue's expected end. When the
+final winner requires an empty window, the scheduler submits nothing until
+queued work drains, then replans. Lower-value queueable work cannot displace that
+winner merely because it is immediately submit-ready. This gate also applies to
+discovery and probe selections; owned probe verification retains its existing
+completion obligation.
+
 There is no millisecond cap on either a frame or the sum of queued frames.
 Expected finish times provide the planning start time of an appended frame. An
 overrun suspends further queueing until completion supplies feedback; it does
@@ -460,6 +485,8 @@ Defaults specify these preferences:
 | `token_fairness` | 16 | Token-rate log-utility coefficient, value/ms |
 | `delivery_fairness` | 4 | Delivery-rate log-utility coefficient, value/ms |
 | `decode_age_price` | 0.1 | Linear output-age cost coefficient, value/ms² |
+| `terminal_value` | 256 | Value per terminal retirement, in prompt-token units |
+| `terminal_age_price` | 1 | Linear terminal-wait cost coefficient, value/ms² |
 | `adaptation_ms` | 100 | Service-price adaptation time |
 | `estimate_ttl_ns` | 30,000,000,000 | Timing freshness interval |
 
@@ -471,7 +498,11 @@ which uses these coefficients. `--scheduler-policy throughput` retains token
 fairness and output-token value while setting delivery fairness and decode-age
 price to zero. It favors token throughput and can select longer output bursts.
 It changes scheduling preferences without changing captured capacities or
-sampling policy.
+sampling policy. `--scheduler-terminal-value` and `--scheduler-terminal-age-price`
+override the terminal coefficients after preset selection. Values must be finite
+and nonnegative; zero disables the corresponding preference. Disabling both
+removes terminal service value under throughput policy. These coefficients are
+preferences, not latency bounds.
 
 ## Mixed execution contract
 

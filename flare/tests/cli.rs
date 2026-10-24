@@ -117,6 +117,8 @@ fn help_exits_successfully_before_accessing_files() {
             assert!(help.contains("--host"), "{help}");
             assert!(help.contains("--port"), "{help}");
             assert!(help.contains("--served-model-name"), "{help}");
+            assert!(help.contains("--scheduler-terminal-value"), "{help}");
+            assert!(help.contains("--scheduler-terminal-age-price"), "{help}");
             assert!(help.contains("127.0.0.1"), "{help}");
             assert!(!help.contains("--bind"), "{help}");
         }

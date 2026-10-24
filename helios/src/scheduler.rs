@@ -1299,6 +1299,7 @@ impl RequestScheduler {
     /// returns its unused reservation and retains its state in a terminal checkpoint when
     /// KV backing allows; a preempted request is readmitted by the runtime.
     fn finish_early(&mut self, handle: RequestHandle, preempted: bool) -> Result<()> {
+        let now_ns = self.now_ns;
         let request = self.request_mut(handle)?;
         request.preempted = preempted;
         request.phase = RequestPhase::Finishing;
@@ -1311,6 +1312,7 @@ impl RequestScheduler {
             let request = self.request_mut(handle)?;
             request.terminal_snapshot = Some(snapshot);
             request.phase = RequestPhase::Snapshot;
+            request.accounting.terminal_since_ns.get_or_insert(now_ns);
         }
         Ok(())
     }
@@ -2495,6 +2497,9 @@ impl RequestScheduler {
             } else {
                 RequestPhase::Decode
             };
+            if request.phase == RequestPhase::Snapshot {
+                request.accounting.terminal_since_ns.get_or_insert(now_ns);
+            }
             if kind.is_prefill() && request.error_code.is_none() {
                 let endpoint = request.consumed_tokens;
                 if !finished

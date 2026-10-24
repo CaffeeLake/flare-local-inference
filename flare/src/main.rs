@@ -258,6 +258,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config["mtp_adaptive_verification_alpha"] = alpha.into();
     }
     config["scheduler_policy"] = args.scheduler_policy.into();
+    if let Some(value) = args.scheduler_terminal_value {
+        config["scheduler_terminal_value"] = value.into();
+    }
+    if let Some(price) = args.scheduler_terminal_age_price {
+        config["scheduler_terminal_age_price"] = price.into();
+    }
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }
