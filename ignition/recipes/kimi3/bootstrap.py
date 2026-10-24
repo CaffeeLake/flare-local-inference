@@ -27,6 +27,7 @@ from ignition.preparation.collectives import (CollectivePreparation, create_all_
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -435,7 +436,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         memory.update(speculative_shapes=config.speculative_shapes)
     draft_disposable = [] if speculation is None else [speculation.draft_scratch.scratch_tensors(), speculation.context_buffers,
         speculation.kda_records.corrections, speculation.kda_records.keys_and_gates]
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'output_res_score', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

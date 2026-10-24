@@ -31,6 +31,7 @@ from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import device_memory_info
@@ -589,7 +590,13 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         from ignition.preparation.disposable import storage_ranges
 
         export_zero_ranges = (*export_zero_ranges, *storage_ranges(graph_buffers.chunks))
-        return PreparedModel(rebuild_weights={"weights": weights, "mtp": mtp_weights}, device=device.index, max_active=config.max_active, graphs=graphs, buffers=buffers, signatures=signatures,
+        return PreparedModel(rebuild_weights=declare_weights({'weights': weights, 'mtp': mtp_weights}, components={
+        'tree.model.language_model.embed_tokens': 'embedding',
+        'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',
+        'tree.lm_head': 'head',
+        'vision': 'vision',
+        'mtp': 'mtp',
+    }, layers=('layers', 'tree.model.language_model.layers')), device=device.index, max_active=config.max_active, graphs=graphs, buffers=buffers, signatures=signatures,
             export_zero_ranges=(*export_zero_ranges, *(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges(),
                                 *((t.data_ptr(), t.nbytes) for t in table.buffers().values())),
             export_events=table.events(), package_data=table if rank == 0 else None,

@@ -32,6 +32,7 @@ from ignition.components.speculation import SpeculativeRngState
 from ignition.components.state_transfer import StateCommands
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
@@ -350,7 +351,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             disposable.append(forward.context.scratch_tensors())
         if hasattr(forward, "encoder"):
             disposable.extend((forward.errors, forward.encoder.scratch_tensors()))
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'draft', 'vision')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),

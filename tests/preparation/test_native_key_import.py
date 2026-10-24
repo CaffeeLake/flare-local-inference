@@ -29,7 +29,7 @@ def _verify_signatures(path, public):
         envelope = proto.ProtectedIndex.FromString(read_container(source)[2])
     assert envelope.signer == hashlib.sha256(public.public_bytes_raw()).digest()
     for group in [*envelope.groups, *envelope.ranks]:
-        values = (b'flare-package-signature-v4', struct.pack('<I', 4), envelope.package_id,
+        values = (b'flare-package-signature-v6', struct.pack('<I', 6), envelope.package_id,
                   envelope.signer, struct.pack('<I', group.kind), group.body)
         message = b''.join(struct.pack('<Q', len(value)) + value for value in values)
         public.verify(group.signature, message)

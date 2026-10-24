@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 mod agent_client;
+mod cache_commands;
+mod cache_support;
 mod cli;
 mod cluster;
 #[cfg(unix)]
@@ -50,11 +52,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::Command::Run(args) => *args,
         cli::Command::Download(args) => {
             environment::configure(&args.gpus)?;
-            let path = hub::download(&args.repository, &args.hub, args.gpus.len())?;
-            println!("{}", path.display());
+            let entry = hub::download(
+                &args.repository,
+                &args.hub,
+                args.gpus.len(),
+                &args.publisher_keys,
+                args.trust_store.as_deref(),
+                &[],
+            )?;
+            println!("{}", entry.directory().display());
             return Ok(());
         }
         cli::Command::Inspect(args) => return inspect::run(args),
+        cli::Command::Cache(args) => return cache_commands::run(args),
         cli::Command::HardwareRevision { gpu_count } => {
             let devices: Vec<_> = (0..gpu_count).collect();
             environment::configure(&devices)?;
@@ -147,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let mut launched = None;
     #[cfg(unix)]
-    let _lease;
+    let _lease: Option<flare_helios::package::cache::Entry>;
     #[cfg(unix)]
     let (authorized, mut membership) = if args.rank.is_some_and(|rank| rank != 0) {
         if !args.hosts.is_empty() {
@@ -157,9 +167,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _lease = received.lease;
         (received.authorized, Some(received.membership))
     } else {
-        let (root, authorized, publisher) = load_package(&args, &mut progress)?;
+        let (root, authorized, publisher, lease) = load_package(&args, &mut progress)?;
         configure_package_devices(&mut args, &authorized, &mut progress)?;
-        _lease = None;
+        _lease = lease;
         if !args.hosts.is_empty() {
             launched = Some(
                 launch::Peers::start(&mut args, &authorized, &publisher, &root)
@@ -195,10 +205,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (authorized, membership)
     };
     #[cfg(windows)]
-    let authorized = {
-        let (_, authorized, _) = load_package(&args, &mut progress)?;
+    let (authorized, _lease): (
+        flare_helios::runtime_package::AuthorizedPackage,
+        Option<flare_helios::package::cache::Entry>,
+    ) = {
+        let (_, authorized, _, lease) = load_package(&args, &mut progress)?;
         configure_package_devices(&mut args, &authorized, &mut progress)?;
-        authorized
+        (authorized, lease)
     };
     #[cfg(windows)]
     let mut membership: Option<cluster::Membership> = None;
@@ -276,6 +289,29 @@ fn configure_package_devices(
     Ok(())
 }
 
+fn local_package_lease(
+    path: &std::path::Path,
+    model_cache: Option<&std::path::Path>,
+    package_cache: Option<&std::path::Path>,
+) -> Result<Option<flare_helios::package::cache::Entry>, String> {
+    use flare_helios::package::cache::Root;
+
+    let cache_root = crate::cache_support::model_root(model_cache.or(package_cache))
+        .map_err(|error| error.to_string())?;
+    let canonical_root = cache_root
+        .canonicalize()
+        .unwrap_or_else(|_| cache_root.clone());
+    let canonical_path = path.canonicalize().map_err(|error| error.to_string())?;
+    // Do not create or open the cache for unmanaged local paths.
+    if !canonical_path.starts_with(&canonical_root) {
+        return Ok(None);
+    }
+    Root::open(&cache_root)
+        .map_err(|error| error.to_string())?
+        .entry_for_path(&canonical_path)
+        .map_err(|error| error.to_string())
+}
+
 fn load_package(
     args: &cli::Run,
     progress: &mut StartupProgress,
@@ -284,6 +320,7 @@ fn load_package(
         std::path::PathBuf,
         flare_helios::runtime_package::AuthorizedPackage,
         flare_helios::runtime_package::Publisher,
+        Option<flare_helios::package::cache::Entry>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -292,10 +329,25 @@ fn load_package(
         .as_ref()
         .ok_or("rank zero requires a package")?;
     let mut origin = None;
+    let mut lease = None;
     let path = if hub::is_repository(package) {
         let text = package.to_str().ok_or("repository must be UTF-8")?;
         origin = Some(hub::repository(text)?.0.to_owned());
-        hub::download(text, &args.hub, args.gpus.len().max(1))?
+        let mut hub_options = args.hub.clone();
+        if hub_options.model_cache.is_none() {
+            hub_options.model_cache = args.package_cache.clone();
+        }
+        let entry = hub::download(
+            text,
+            &hub_options,
+            args.gpus.len().max(1),
+            &args.publisher_keys,
+            args.trust_store.as_deref(),
+            &[],
+        )?;
+        let directory = entry.directory().to_path_buf();
+        lease = Some(entry);
+        directory
     } else {
         if args.hub.revision.is_some()
             || args.hub.filename.is_some()
@@ -311,8 +363,16 @@ fn load_package(
     let root = path
         .canonicalize()
         .map_err(|e| format!("cannot access package {}: {e}", path.display()))?;
+    if !hub::is_repository(package) {
+        lease = local_package_lease(
+            &root,
+            args.hub.model_cache.as_deref(),
+            args.package_cache.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     let (authorized, publisher) = trust::load(&root, args, progress, origin.as_deref())?;
-    Ok((root, authorized, publisher))
+    Ok((root, authorized, publisher, lease))
 }
 
 /// Run one `flare orbit` command as the controller on this machine.
@@ -538,5 +598,135 @@ unsafe extern "system" fn stop_console(event: u32) -> i32 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser as _;
+    use flare_helios::package::cache::{PackageSource, Root, model_key};
+    use flare_helios::package::reader;
+
+    fn run_args(
+        package: &Path,
+        profile: &Path,
+        model_root: &Path,
+        trust_store: &Path,
+        approved: Option<&flare_helios::runtime_package::Publisher>,
+    ) -> crate::cli::Run {
+        let mut arguments = vec![
+            "flare".to_owned(),
+            "run".to_owned(),
+            package.to_str().unwrap().to_owned(),
+            "--publisher-keys".to_owned(),
+            profile.to_str().unwrap().to_owned(),
+            "--model-cache".to_owned(),
+            model_root.to_str().unwrap().to_owned(),
+            "--trust-store".to_owned(),
+            trust_store.to_str().unwrap().to_owned(),
+            "--offline".to_owned(),
+        ];
+        if let Some(publisher) = approved {
+            arguments.extend([
+                "--dangerously-approve-key".to_owned(),
+                publisher.fingerprint(),
+                "--dangerously-accept-publisher".to_owned(),
+                publisher.namespace.clone(),
+            ]);
+        }
+        let cli = crate::cli::Cli::try_parse_from(arguments).unwrap();
+        match cli.command {
+            crate::cli::Command::Run(run) => *run,
+            _ => panic!("expected run command"),
+        }
+    }
+
+    fn install_fixture(
+        package: &Path,
+        publisher: &flare_helios::runtime_package::Publisher,
+        model_root: &Path,
+        entry: &str,
+    ) -> (Root, String) {
+        let store = Root::open(model_root).unwrap();
+        let metadata = reader::Metadata::open(package).unwrap();
+        let selections = crate::cache_support::select_deployments(
+            &metadata,
+            std::slice::from_ref(publisher),
+            &[1],
+        )
+        .unwrap();
+        let source = PackageSource::open(package, std::slice::from_ref(publisher), selections[0])
+            .unwrap()
+            .union(std::slice::from_ref(publisher), &selections)
+            .unwrap();
+        let installed = store
+            .install_package(source, &model_key("owner/offline").unwrap(), entry)
+            .unwrap();
+        let entry_id = installed.id().to_owned();
+        drop(installed);
+        (store, entry_id)
+    }
+
+    #[test]
+    fn actual_load_package_leases_managed_local_entries_and_releases_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let (package, profile, publisher, _commit) =
+            crate::hub::tests::signed_payload_fixture(temp.path());
+        let model_root = temp.path().join("flare");
+        let trust_store = temp.path().join("trust.toml");
+        let key = model_key("owner/offline").unwrap();
+
+        let (store, entry_id) = install_fixture(&package, &publisher, &model_root, "loaded-entry");
+        let cached_primary = {
+            let entry = store.entry(&key, &entry_id).unwrap();
+            let path = entry.directory().join("model.safetensors");
+            drop(entry);
+            path
+        };
+        let run = run_args(
+            &cached_primary,
+            &profile,
+            &model_root,
+            &trust_store,
+            Some(&publisher),
+        );
+        let mut progress = flare_helios::startup::StartupProgress::silent();
+        let (_, authorized, signing, lease) = super::load_package(&run, &mut progress).unwrap();
+        assert!(
+            lease.is_some(),
+            "load_package returned no managed-entry lease"
+        );
+        assert!(store.evict(&key, &entry_id).is_err());
+        drop(lease);
+        drop(authorized);
+        drop(signing);
+        store.evict(&key, &entry_id).unwrap();
+
+        let (store, entry_id) = install_fixture(&package, &publisher, &model_root, "failed-entry");
+        let cached_primary = {
+            let entry = store.entry(&key, &entry_id).unwrap();
+            let path = entry.directory().join("model.safetensors");
+            drop(entry);
+            path
+        };
+        let empty_profile = temp.path().join("empty-publisher.json");
+        std::fs::write(&empty_profile, b"[]").unwrap();
+        let failed_trust_store = temp.path().join("failed-trust.toml");
+        let run = run_args(
+            &cached_primary,
+            &empty_profile,
+            &model_root,
+            &failed_trust_store,
+            None,
+        );
+        let mut progress = flare_helios::startup::StartupProgress::silent();
+        assert!(
+            super::load_package(&run, &mut progress).is_err(),
+            "load_package should fail without an accepted signer"
+        );
+        // The failed load dropped its entry lease, so eviction is possible.
+        store.evict(&key, &entry_id).unwrap();
     }
 }

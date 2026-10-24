@@ -23,6 +23,7 @@ from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -294,7 +295,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

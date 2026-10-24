@@ -25,6 +25,7 @@ from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -83,6 +84,31 @@ class PreparationConfig:
     def speculative_shapes(self):
         return (speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
                 if self.mtp else ())
+
+
+def _declared_weight_roots(weights):
+    """One semantic root per decoder layer: its canonical module and prepared projections.
+
+    A single `projections` payload would hold every layer's packed projections,
+    so one layer's change would rename the whole model. Each layer's prepared
+    projections are grouped with that layer instead; keys are matched by their
+    declared `layers.N.` prefix here, never by native path inference.
+    """
+    roots = {'embedding': weights.tree.embed_tokens, 'norm': weights.tree.norm,
+             'head': weights.head, 'draft': weights.draft}
+    components = {name: name for name in roots}
+    prepared = dict(weights.projections)
+    for index, layer in enumerate(weights.tree.layers):
+        prefix = f'layers.{index}.'
+        owned = {name: value for name, value in prepared.items() if name.startswith(prefix)}
+        for name in owned:
+            del prepared[name]
+        group = f'layer-{index:03d}'
+        roots[group] = (layer, owned)
+        components[group] = group
+    if prepared:
+        raise ValueError(f"unassigned prepared projections: {sorted(prepared)}")
+    return roots, components
 
 
 @torch.no_grad()
@@ -260,7 +286,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         speculative_shapes=shapes, graph_buffer_bytes=graph_buffers.nbytes, private_buffer_bytes=private_buffers.nbytes)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
+    roots, components = _declared_weight_roots(weights)
+    return PreparedModel(rebuild_weights=declare_weights(roots, components=components, layers=()), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

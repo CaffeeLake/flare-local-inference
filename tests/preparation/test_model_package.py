@@ -1,5 +1,6 @@
 """Atomic publication and rank ownership in native model packages."""
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -7,7 +8,19 @@ import pytest
 from helios.tests.signing import publisher
 from ignition.preparation import model_package
 from ignition.preparation.runtime_package_pb2 import Asset, ModelIndex, BundleIndex, Span
-from ignition.preparation.package_file import combine, read_index, write_sources
+from ignition.preparation.package_file import PackageFiles, combine, read_index, write_sources
+
+
+def payload_bytes(path, span):
+    with PackageFiles(path, '', 0, 0) as files:
+        return files.files.read_at('', span.offset, span.nbytes)
+from ignition.preparation.package_snapshot import export_options
+
+
+@pytest.fixture(autouse=True)
+def configured_cache(tmp_path):
+    with export_options(tmp_path / '.flare-cache'):
+        yield
 
 
 @pytest.mark.parametrize('world', [1, 2])
@@ -73,24 +86,28 @@ def test_combined_file_preserves_rank_resources_and_frontend_ranges(tmp_path):
     for rank, data in enumerate([b'rank-zero-tokenizer', b'rank-one']):
         source = tmp_path / f'payload-{rank}'
         source.write_bytes(data)
-        index = ModelIndex(version=4, ranks=[BundleIndex(
-            resources={'weights': Span(offset=3, nbytes=len(data))})])
+        bundle = BundleIndex(resources={'weights': Span(offset=3, nbytes=len(data))})
+        bundle.allocations.add(name='weights', file='weights')
+        index = ModelIndex(version=4, ranks=[bundle])
         if rank == 0:
-            index.assets.append(Asset(name='tokenizer', payload=Span(offset=13, nbytes=9)))
+            index.assets.append(Asset(
+                name='tokenizer',
+                payload=Span(offset=13, nbytes=9),
+                sha256=hashlib.sha256(b'tokenizer').hexdigest(),
+            ))
             index.contract.model_id = "test"
         path = tmp_path / f'rank-{rank}.json'
         write_sources(path, index, [(3, source, 0, len(data))])
         ranks.append(path)
     model = tmp_path / 'model.safetensors'
-    combine(model, ranks, [])
+    combine(model, ranks, [], publisher=publisher())
     index, start = read_index(model)
-    with model.open('rb') as source:
-        for rank, expected in zip(index.ranks, [b'rank-zero-tokenizer', b'rank-one']):
+    with PackageFiles(model, '', 0, 0) as package:
+        for rank, expected in zip(index.ranks, [b'rank-zero-tokenizer', b'rank-one'], strict=True):
             span = rank.resources['weights']
-            source.seek(start + span.offset)
-            assert source.read(span.nbytes) == expected
-        source.seek(start + index.assets[0].payload.offset)
-        assert source.read(index.assets[0].payload.nbytes) == b'tokenizer'
+            assert package.files.read_at('', span.offset, span.nbytes) == expected
+        asset = index.assets[0].payload
+        assert package.files.read_at('', asset.offset, asset.nbytes) == b'tokenizer'
     assert index.contract.model_id == 'test'
     with model.open('r+b') as source:
         source.truncate(model.stat().st_size - 1)
@@ -114,18 +131,16 @@ def test_offloaded_engram_planes_are_stored_once_and_bounds_checked(tmp_path):
         write_sources(path, index, payload)
         ranks.append(path)
     output = tmp_path / 'model.safetensors'
-    combine(output, ranks, [])
+    combine(output, ranks, [], publisher=publisher())
     index, start = read_index(output)
     assert len(index.engram.tables) == 1
-    with output.open('rb') as package:
-        for field, expected in [('weights', b'weights'), ('scales', b'scales')]:
-            span = getattr(index.engram.tables[0], field)
-            package.seek(start + span.offset)
-            assert package.read(span.nbytes) == expected
+    for field, expected in [('weights', b'weights'), ('scales', b'scales')]:
+        span = getattr(index.engram.tables[0], field)
+        assert payload_bytes(output, span) == expected
     with pytest.raises(ValueError, match='stored once on rank zero'):
-        combine(tmp_path / 'duplicated', [ranks[0], ranks[0]], [])
+        combine(tmp_path / 'duplicated', [ranks[0], ranks[0]], [], publisher=publisher())
     with source.open('r+b') as table:
         table.truncate(12 + 5)
     with pytest.raises(ValueError, match='source range exceeds file'):
-        combine(tmp_path / 'truncated', ranks, [])
+        combine(tmp_path / 'truncated', ranks, [], publisher=publisher())
     assert not (tmp_path / 'truncated').exists()

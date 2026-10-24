@@ -3,7 +3,8 @@
 use std::{fmt::Write as _, io::IsTerminal};
 
 use flare_helios::runtime_package::{
-    InspectionOptions, PackageClaim, VerifiedPackage, unverified_metadata,
+    InspectionOptions, NativeResources, PackageClaim, PackageFormat, VerifiedPackage,
+    unverified_metadata_selected,
 };
 use serde_json::Value;
 
@@ -19,7 +20,7 @@ pub fn run(args: Inspect) -> Result<()> {
         all: args.all,
     };
     let mut value = if args.unverified {
-        unverified_metadata(&args.package, options, args.rank)?
+        unverified_metadata_selected(&args.package, options, args.rank, args.tensor_parallel)?
     } else {
         verified(&args, options)?
     };
@@ -27,6 +28,9 @@ pub fn run(args: Inspect) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
+    }
+    if args.unverified && value["package"]["format"] == "payload" {
+        return render_payload(&value);
     }
     let stdout = std::io::stdout();
     let color =
@@ -58,19 +62,36 @@ fn verified(args: &Inspect, options: InspectionOptions) -> Result<Value> {
             profiles.push(profile);
         }
     }
-    let package = VerifiedPackage::open(&root, &profiles, args.rank).map_err(
-        |error| -> Box<dyn std::error::Error> {
-            if error.to_string().contains("unknown package publisher") {
-                return format!(
-                    "cannot verify signing key {}: no embedded, remembered, or --publisher-keys \
-                     profile names it (publisher {} at {})",
-                    claim.signer, claim.namespace, claim.official_source
-                )
-                .into();
+    let package = match args.tensor_parallel {
+        Some(tensor_parallel) => {
+            if NativeResources::package_format(&root).map_err(|error| error.to_string())?
+                != PackageFormat::Payload
+            {
+                return Err(
+                    "--tensor-parallel applies only to payload packages with multiple deployments"
+                        .into(),
+                );
             }
-            error.into()
-        },
-    )?;
+            let rank = args
+                .rank
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "rank exceeds the package rank domain")?;
+            VerifiedPackage::open_tensor_parallel(&root, &profiles, tensor_parallel, rank)
+        }
+        None => VerifiedPackage::open(&root, &profiles, args.rank),
+    }
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        if error.to_string().contains("unknown package publisher") {
+            return format!(
+                "cannot verify signing key {}: no embedded, remembered, or --publisher-keys \
+                     profile names it (publisher {} at {})",
+                claim.signer, claim.namespace, claim.official_source
+            )
+            .into();
+        }
+        error.into()
+    })?;
     Ok(package.describe(options)?)
 }
 
@@ -223,6 +244,156 @@ fn text(value: &Value) -> String {
         }
     }
     output
+}
+
+/// Deliberate plain rendering for payload-format metadata: per-deployment capacities and native
+/// per-rank graph/allocation sections, with no invented single-model values.
+fn render_payload(value: &Value) -> Result<()> {
+    let model = &value["model"];
+    println!(
+        "format     payload ({})",
+        if value["package"]["signatures_verified"].as_bool() == Some(true) {
+            "verified"
+        } else {
+            "unverified"
+        }
+    );
+    if let Some(publisher) = value["package"]["publisher"].as_object() {
+        println!(
+            "publisher  {} <{}>",
+            text(&publisher["namespace"]),
+            text(&publisher["official_source"])
+        );
+    }
+    println!("model      {}", text(&model["identity"]));
+    println!("hardware   {}", text(&model["hardware"]));
+    for deployment in value["deployments"].as_array().into_iter().flatten() {
+        println!(
+            "deployment {} tp{} vocabulary {} context {} tokens prefill {} tokens concurrency {} requests",
+            text(&deployment["id"]),
+            text(&deployment["tensor_parallel"]),
+            text(&deployment["vocabulary"]),
+            deployment["max_sequence_tokens"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), thousands),
+            deployment["prefill_chunk_size"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), thousands),
+            deployment["max_active"]
+                .as_u64()
+                .map_or_else(|| "unknown".into(), thousands),
+        );
+        if !deployment["frontend"].is_null() {
+            println!("  frontend {}", deployment["frontend"]);
+        }
+        if !deployment["vision"].is_null() {
+            println!("  vision {}", deployment["vision"]);
+        }
+    }
+    for rank in value["ranks"].as_array().into_iter().flatten() {
+        if let Some(graphs) = rank["graphs"].as_array() {
+            println!(
+                "Graphs · rank {} · deployment {}",
+                text(&rank["rank"]),
+                text(&rank["deployment"])
+            );
+            for graph in graphs {
+                if graph.get("node_count").is_some() {
+                    println!(
+                        "  {} nodes {} edges {}",
+                        text(&graph["name"]),
+                        text(&graph["node_count"]),
+                        text(&graph["edge_count"])
+                    );
+                } else {
+                    println!("  {}", text(&graph["name"]));
+                }
+                if let Some(execution) = rank["execution_graphs"]
+                    .as_array()
+                    .and_then(|graphs| graphs.iter().find(|g| g["name"] == graph["name"]))
+                {
+                    println!(
+                        "    kind {} sampling {} batch {} tokens {} packed {} prefill {} duration {} ns",
+                        text(&execution["kind"]),
+                        text(&execution["sampling_mode"]),
+                        text(&execution["batch_capacity"]),
+                        text(&execution["token_capacity"]),
+                        text(&execution["packed_token_capacity"]),
+                        text(&execution["prefill_capacity"]),
+                        text(&execution["estimated_duration_ns"])
+                    );
+                }
+            }
+        }
+        if let Some(allocations) = rank["allocations"].as_array() {
+            println!(
+                "Memory map · rank {} · deployment {}",
+                text(&rank["rank"]),
+                text(&rank["deployment"])
+            );
+            for allocation in allocations {
+                println!(
+                    "  allocation {} {} bytes",
+                    text(&allocation["name"]),
+                    text(&allocation["nbytes"])
+                );
+            }
+            for reservation in rank["reservations"].as_array().into_iter().flatten() {
+                println!(
+                    "  reservation address {} nbytes {}",
+                    text(&reservation["address"]),
+                    text(&reservation["nbytes"])
+                );
+            }
+            for buffer in rank["execution_buffers"].as_array().into_iter().flatten() {
+                println!(
+                    "  buffer {} allocation {} offset {} dtype {} shape {} strides {}",
+                    text(&buffer["name"]),
+                    text(&buffer["allocation"]),
+                    text(&buffer["offset"]),
+                    text(&buffer["dtype"]),
+                    array_text(&buffer["shape"]),
+                    array_text(&buffer["strides"])
+                );
+            }
+            for initializer in rank["initializers"].as_array().into_iter().flatten() {
+                let payload = &initializer["payload"];
+                println!(
+                    "  initializer allocation {} destination_offset {} payload {} offset {} nbytes {}",
+                    text(&initializer["allocation"]),
+                    text(&initializer["destination_offset"]),
+                    text(&payload["id"]),
+                    text(&payload["offset"]),
+                    text(&payload["nbytes"])
+                );
+            }
+        }
+    }
+    for asset in value["assets"].as_array().into_iter().flatten() {
+        println!(
+            "asset {} {} bytes",
+            text(&asset["name"]),
+            text(&asset["bytes"])
+        );
+    }
+    Ok(())
+}
+
+fn array_text(value: &Value) -> String {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .map_or_else(|| text(value), |n| n.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
 }
 
 fn u64_of(value: &Value) -> u64 {
@@ -870,7 +1041,10 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
                 ),
             );
             if speculation["history_drafts"].as_bool().unwrap_or(false) {
-                canvas.row("recorded history default", "enabled; override with --no-history-drafts");
+                canvas.row(
+                    "recorded history default",
+                    "enabled; override with --no-history-drafts",
+                );
             }
         }
         canvas.close();
@@ -995,13 +1169,16 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
             canvas.row("image profile", &text(&image["profile"]));
             canvas.number(
                 "image tokens per prompt",
-                &vision["max_image_tokens_per_prompt"].as_u64()
+                &vision["max_image_tokens_per_prompt"]
+                    .as_u64()
                     .map(|limit| format!("{} (shared context)", thousands(limit)))
                     .unwrap_or_else(|| "not declared".into()),
             );
             canvas.number(
                 "images per prompt",
-                &vision["max_images"].as_u64().map(thousands)
+                &vision["max_images"]
+                    .as_u64()
+                    .map(thousands)
                     .unwrap_or_else(|| "not declared".into()),
             );
             canvas.number(
@@ -1222,7 +1399,40 @@ fn memory_map(canvas: &mut Canvas, rank: &Value, memory: &Value) {
                 b["reference"]["offset"]
             ),
         );
-        canvas.row("  strides", &format!("{} elements", text(&b["strides"])));
+        canvas.row(
+            "  strides",
+            &format!("{} elements", array_text(&b["strides"])),
+        );
+    }
+    if let Some(initializers) = memory["initializers"].as_array() {
+        canvas.open(&format!("Initializers · rank {}", rank["rank"]));
+        canvas.table(
+            &["Source", "Tensor", "Slice", "Payload", "Destination"],
+            &initializers
+                .iter()
+                .map(|initializer| {
+                    vec![
+                        if initializer["file"] == "" {
+                            "primary".to_string()
+                        } else {
+                            text(&initializer["file"])
+                        },
+                        text(&initializer["tensor"]),
+                        format!(
+                            "{} + {}",
+                            text(&initializer["source_offset"]),
+                            text(&initializer["nbytes"])
+                        ),
+                        text(&initializer["payload_id"]),
+                        format!(
+                            "{} + {}",
+                            text(&initializer["allocation"]),
+                            text(&initializer["destination_offset"])
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        );
     }
 }
 

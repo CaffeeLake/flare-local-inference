@@ -19,6 +19,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
@@ -593,7 +594,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),

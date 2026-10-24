@@ -43,7 +43,7 @@ message StoredData {
   // Empty retains the primary-file range above. Otherwise hashes the concatenated parts.
   repeated Span parts = 4;
 }
-// One rank's bundle, its encrypted executables, its supporting resources and its stored data.
+// One rank's bundle, its compressed executables, its supporting resources and its stored data.
 message RankProtection {
   uint32 rank = 1;
   BundleIndex bundle = 2;

@@ -228,3 +228,112 @@ def test_cluster_export_combines_native_received_manifests_into_signed_snapshot(
             span = index.ranks[rank].resources['weights']
             source, base, _ = files.get(span.filename)
             assert source.read_at(span.nbytes, base + span.offset) == f'weights-{rank}'.encode()
+
+
+def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monkeypatch):
+    """Cache-only host export passes no destination, propagates staging, and sets cache_only."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import flare_heliopause
+    from ignition.preparation import host_ranks, package_file, runtime_package
+
+    calls = {}
+
+    class Stage:
+        def __init__(self, destination, staging, cache):
+            calls['stage'] = (destination, staging, cache)
+            self.path = str(tmp_path / 'workspace')
+            (tmp_path / 'workspace').mkdir(exist_ok=True)
+
+        def rank_path(self, rank):
+            return str(tmp_path / 'workspace' / f'rank-{rank}.json')
+
+        def retain_sources(self, paths):
+            calls.setdefault('retained', []).append(list(paths))
+
+        def close(self):
+            calls['closed'] = True
+
+    def fake_export_model(model, images, storage, path, **kwargs):
+        Path(path).write_text('{}')
+        return SimpleNamespace(memory_inventory={})
+
+    def fake_combine(destination, roots, peers, **kwargs):
+        calls['combine'] = (destination, list(roots), kwargs)
+        return SimpleNamespace(model='m', entry='e')
+
+    monkeypatch.setattr(flare_heliopause, 'NativeExportStage', Stage)
+    monkeypatch.setattr(runtime_package, 'export_model', fake_export_model)
+    monkeypatch.setattr(package_file, 'combine', fake_combine)
+    monkeypatch.setattr(host_ranks, 'send_object', lambda control, value: None)
+    from ignition.preparation import memory_inventory
+    monkeypatch.setattr(memory_inventory, 'print_inventory', lambda *args, **kwargs: None)
+    monkeypatch.setattr(host_ranks, '_export_channels', lambda channels: [])
+    monkeypatch.setattr(
+        flare_heliopause, 'export_receive_ranks',
+        lambda requests, cache, no_weights, owners, stage: __import__('json').dumps(
+            [{'inventory': {}, 'channels': [{'sent': 0, 'received': 0}], 'stats': {
+                'payload_bytes': 0, 'payload_seconds': 0.0, 'payload_gbps': 0.0,
+                'streams': 1, 'transport': 'fabric-tcp'}}]))
+
+    group = object.__new__(host_ranks.HostRankGroup)
+    control = SimpleNamespace(fileno=lambda: 7)
+    group.rendezvous = SimpleNamespace(world=2, peers={1: SimpleNamespace(control=control)})
+    group.model = object()
+    channel = SimpleNamespace(sent=0, received=0)
+    group.checkpoint_fabric = SimpleNamespace(
+        readers={(1, 0): SimpleNamespace(channel=channel)}, streams=1, close=lambda: None)
+    group._started = False
+    group._closed = False
+    group._close_checkpoint_fabric = lambda: None
+    group.close = lambda: None
+    storage = SimpleNamespace(host_regions=[])
+    staging = tmp_path / 'staging'
+
+    options = {}
+
+    from ignition.preparation.package_snapshot import export_options
+    with export_options(tmp_path / 'cache'):
+        result = host_ranks.HostRankGroup.export(
+            group, None, options=options, export_id='export', images=None,
+            storage=storage, publisher=object(), staging=staging, form='directory')
+    assert calls['stage'] == (None, staging, tmp_path / 'cache')
+    assert calls['closed'] is True
+    destination, _roots, kwargs = calls['combine']
+    assert destination is None
+    assert kwargs['cache_only'] is True
+    assert result.model == 'm'
+
+
+def test_host_export_without_configured_cache_fails_before_peer_commands(tmp_path, monkeypatch):
+    """Missing package-cache configuration fails before any workspace or peer side effect."""
+    from types import SimpleNamespace
+
+    import flare_heliopause
+    from ignition.preparation import host_ranks
+
+    side_effects = []
+
+    class Stage:
+        def __init__(self, *args):
+            side_effects.append(('stage', args))
+
+    monkeypatch.setattr(flare_heliopause, 'NativeExportStage', Stage)
+    monkeypatch.setattr(host_ranks, 'send_object',
+                        lambda control, value: side_effects.append(('send', value)))
+
+    control = SimpleNamespace(fileno=lambda: 7)
+    group = object.__new__(host_ranks.HostRankGroup)
+    group.rendezvous = SimpleNamespace(world=2, peers={1: SimpleNamespace(control=control)})
+    group.model = object()
+    group.checkpoint_fabric = SimpleNamespace(readers={}, streams=1, close=lambda: None)
+    group._started = False
+    group._closed = False
+
+    # No export_options context: settings are absent.
+    with pytest.raises(RuntimeError, match='configured package cache'):
+        host_ranks.HostRankGroup.export(
+            group, None, options={}, export_id='export', images=None,
+            storage=SimpleNamespace(host_regions=[]), publisher=object())
+    assert side_effects == [], f"peer or workspace side effects: {side_effects}"

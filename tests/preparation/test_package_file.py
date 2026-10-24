@@ -7,10 +7,17 @@ import struct
 import pytest
 from safetensors import safe_open
 
+from helios.tests.signing import publisher
 from ignition.preparation import runtime_package_pb2 as proto
 from ignition.preparation.package_file import (
-    ALIGNMENT, MAX_HEADER_BYTES, MAX_INDEX_BYTES, align, combine, publish, read_index, write_sources,
+    ALIGNMENT, MAX_HEADER_BYTES, MAX_INDEX_BYTES, PackageFiles, align, combine, publish, read_index,
+    write_sources,
 )
+
+
+def payload_bytes(path, span):
+    with PackageFiles(path, '', 0, 0) as files:
+        return files.files.read_at('', span.offset, span.nbytes)
 
 
 def index():
@@ -75,7 +82,7 @@ def test_tp8_kernel_catalogs_fit_the_combined_index(tmp_path):
         write_sources(path, description, [])
         ranks.append(path)
     combined = tmp_path / "model.safetensors"
-    combine(combined, ranks, [])
+    combine(combined, ranks, [], publisher=publisher())
     description, _ = read_index(combined)
     assert [len(rank.functions) for rank in description.ranks] == [8192] * 8
     assert description.ByteSize() > 16 << 20
@@ -118,7 +125,12 @@ def test_tp_weights_and_tables_precede_all_execution_data(tmp_path, world):
     for generation in range(2):
         ranks = []
         for rank in range(world):
-            contents = [b"graph" * (1 + generation * 2000), f"weights-{rank}".encode(), b"embedding-table"]
+            contents = [
+                b"graph" * (1 + generation * 2000),
+                f"weights-{rank}".encode(),
+                b"embedding-table",
+                b"embedding-scales",
+            ]
             source = tmp_path / f"source-{generation}-{rank}"
             source.write_bytes(b"".join(contents))
             description = index()
@@ -132,27 +144,28 @@ def test_tp_weights_and_tables_precede_all_execution_data(tmp_path, world):
             if rank == 0:
                 table = description.engram.tables.add(layer=1)
                 table.weights.CopyFrom(proto.Span(offset=cursor, nbytes=len(contents[2])))
+                cursor += len(contents[2])
+                table.scales.CopyFrom(proto.Span(offset=cursor, nbytes=len(contents[3])))
             path = tmp_path / f"rank-{generation}-{rank}.json"
             write_sources(path, description, [(0, source, 0, source.stat().st_size)])
             ranks.append(path)
         output = tmp_path / f"model-{generation}.safetensors"
-        combine(output, ranks, [])
+        combine(output, ranks, [], publisher=publisher())
         description, start = read_index(output)
         storage = [bundle.resources["storage.bin"] for bundle in description.ranks]
         storage.append(description.engram.tables[0].weights)
+        storage.append(description.engram.tables[0].scales)
         graphs = [bundle.resources["graph.bin"] for bundle in description.ranks]
         assert max(span.offset + span.nbytes for span in storage) <= min(span.offset for span in graphs)
-        with output.open("rb") as source:
+        with PackageFiles(output, '', 0, 0) as package:
             for rank, bundle in enumerate(description.ranks):
-                for name, expected in (("storage.bin", f"weights-{rank}".encode()),
-                                       ("graph.bin", b"graph" * (1 + generation * 2000))):
-                    span = bundle.resources[name]
-                    source.seek(start + span.offset)
-                    assert source.read(span.nbytes) == expected
-            source.seek(start)
-            outputs.append(source.read(min(span.offset for span in graphs)))
-        with safe_open(output, framework="numpy") as tensors:
-            assert tensors.get_slice("flare.payload").get_shape()[0] >= graphs[-1].offset + graphs[-1].nbytes
+                storage_span = bundle.resources["storage.bin"]
+                assert package.files.read_at('', storage_span.offset, storage_span.nbytes) == f"weights-{rank}".encode()
+                graph_span = bundle.resources["graph.bin"]
+                assert len(package.files.read_at('', graph_span.offset, graph_span.nbytes)) == graph_span.nbytes
+            outputs.append(package.files.read_at('', 0, min(span.offset for span in graphs)))
+        with PackageFiles(output, '', 0, 0) as package:
+            assert package.files.length('') >= graphs[-1].offset + graphs[-1].nbytes
     assert outputs[0] == outputs[1]
 
 
@@ -173,24 +186,27 @@ def test_combined_tables_copy_every_recorded_shard_of_one_span(tmp_path):
     for number, part in enumerate(parts):
         payload.append((cursor, shards[number], number, len(part)))
         cursor += len(part)
+    scales = tmp_path / "scales"
+    scales.write_bytes(b"s" * 3)
+    table.scales.CopyFrom(proto.Span(offset=cursor, nbytes=3))
+    payload.append((cursor, scales, 0, 3))
+    cursor += 3
     recorded = tmp_path / "rank.json"
     write_sources(recorded, description, payload)
     output = tmp_path / "model.safetensors"
-    combine(output, [recorded], [])
+    combine(output, [recorded], [], publisher=publisher())
     combined, start = read_index(output)
     span = combined.engram.tables[0].weights
-    with output.open("rb") as source:
-        source.seek(start + span.offset)
-        assert source.read(span.nbytes) == b"".join(parts)
+    assert payload_bytes(output, span) == b"".join(parts)
     # A span over a gap between its recorded ranges is rejected.
     gapped = index()
     gapped.ranks[0].CopyFrom(description.ranks[0])
     gapped.engram.CopyFrom(description.engram)
     gapped.engram.tables[0].weights.CopyFrom(proto.Span(offset=12, nbytes=len(parts[0]) + 2))
     path = tmp_path / "gapped.json"
-    write_sources(path, gapped, [payload[0], payload[1], (13 + len(parts[0]), *payload[2][1:])])
+    write_sources(path, gapped, [payload[0], payload[1], (13 + len(parts[0]), *payload[2][1:]), payload[-1]])
     with pytest.raises(ValueError, match="outside its recorded sources"):
-        combine(tmp_path / "gapped.safetensors", [path], [])
+        combine(tmp_path / "gapped.safetensors", [path], [], publisher=publisher())
 
 
 @pytest.mark.parametrize("field,value", [
@@ -271,7 +287,7 @@ def test_multi_host_package_combines_every_rank_and_preserves_transport_geometry
         files.append(tmp_path / f"rank-{rank}.json")
         write_sources(files[-1], description, [(0, source, 0, len(data))])
     output = tmp_path / "model.safetensors"
-    combine(output, files, [], cluster=(2, "export-a"))
+    combine(output, files, [], publisher=publisher(), cluster=(2, "export-a"))
     result, start = read_index(output)
     assert (result.cluster.world, result.cluster.export_id) == (2, "export-a")
     assert result.contract.model_id == "glm"
@@ -280,11 +296,10 @@ def test_multi_host_package_combines_every_rank_and_preserves_transport_geometry
     assert [bundle.roce.varlen_bytes for bundle in result.ranks] == [0, 8 << 20]
     assert all(field not in proto.RoceTransport.DESCRIPTOR.fields_by_name
                for field in ("hcas", "gid_index", "traffic_class", "rails", "routes"))
-    with output.open("rb") as package:
+    with PackageFiles(output, '', 0, 0) as package:
         for bundle, expected in zip(result.ranks, contents, strict=True):
             span = bundle.resources["storage.bin"]
             assert span.offset % ALIGNMENT == 0
-            package.seek(start + span.offset)
-            assert package.read(span.nbytes) == expected
+            assert package.files.read_at('', span.offset, span.nbytes) == expected
     with pytest.raises(ValueError):
-        combine(tmp_path / "incomplete.safetensors", files[:1], [], cluster=(2, "export-a"))
+        combine(tmp_path / "incomplete.safetensors", files[:1], [], publisher=publisher(), cluster=(2, "export-a"))

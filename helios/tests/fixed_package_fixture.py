@@ -18,7 +18,7 @@ from ignition.preparation.execution import GraphSignature, PreparedExecution
 from ignition.preparation.module_images import ModuleImages
 from ignition.preparation.package_storage import PackageStorage
 from ignition.preparation.runtime_package import export_model
-from ignition.preparation.package_file import read_index
+from ignition.preparation.package_file import combine, read_sources
 
 
 @triton.jit(do_not_specialize=["scalar"])
@@ -80,7 +80,7 @@ __global__ void no_arguments() {}
     return module, function, empty
 
 
-def prepare(root, shard_size=64 << 30):
+def prepare(root, shard_size=64 << 30, legacy=False):
     with ModuleImages() as images:
         torch.cuda.set_device(0)
         with PackageStorage() as storage:
@@ -156,7 +156,8 @@ def prepare(root, shard_size=64 << 30):
             assert any(start <= freed_address < end for start, end in storage.unused_ranges())
             graph_segments = storage.graph_pool.snapshot(include_traces=False)
             assert graph_segments
-    package = export_model(prepared, images, storage, root / "package", options={}, publisher=publisher(), shard_size=shard_size)
+    package = export_model(prepared, images, storage, root / "rank.json", options={},
+                           sources=True, shard_size=shard_size)
     assert not any(a.address <= unused_address < a.address + a.nbytes for a in package.allocations)
     assert not any(a.address <= freed_address < a.address + a.nbytes for a in package.allocations)
     assert any(a.address == segment["address"] for a in package.allocations for segment in graph_segments)
@@ -165,10 +166,15 @@ def prepare(root, shard_size=64 << 30):
     assert any(a.name.startswith("external-") and a.address <= external.value < a.address + a.nbytes
                for a in package.allocations)
     zero_reference = allocation_reference(package.allocations, transient)
-    document = read_index(root / "package")[0].ranks[0]
+    document = read_sources(root / "rank.json")[0].ranks[0]
     allocation = next(a for a in document.allocations if a.name == zero_reference["allocation"])
     start, end = zero_reference["offset"], zero_reference["offset"] + transient.nbytes
     assert all(span.offset + span.nbytes <= start or span.offset >= end for span in allocation.data_spans)
+    if legacy:
+        from signing import publish_captured_legacy
+        publish_captured_legacy(root / "package", root / "rank.json", shard_size=shard_size)
+    else:
+        combine(root / "package", [root / "rank.json"], [], publisher=publisher())
     (root / "expected.json").write_text(json.dumps({
         "reference": allocation_reference(package.allocations, output), "bytes": list(expected),
         "addresses": {allocation.name: allocation.address for allocation in package.allocations},
@@ -186,8 +192,9 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("executable", nargs="?")
     parser.add_argument("--shard-size", type=int, default=64 << 30)
+    parser.add_argument("--legacy", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size)
+    prepare(args.directory, args.shard_size, args.legacy)
     if args.executable:
         os.execv(args.executable, [args.executable, str(args.directory)])

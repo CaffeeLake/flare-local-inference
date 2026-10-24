@@ -42,6 +42,28 @@ def test_prepared_views_preserve_names_aliases_strides_and_packing_owner():
     assert not catalog['unavailable']
 
 
+def test_payload_dispatch_keeps_legacy_conversion_and_rejects_packed_form(tmp_path):
+    from ignition.preparation.package_snapshot import payload_form
+
+    source = tmp_path / 'weights'
+    source.write_bytes(b'\x01' * 64)
+    bundle = proto.BundleIndex(allocations=[proto.Allocation(name='weights', nbytes=64, file='weight-bytes')])
+    bundle.resources['weight-bytes'].CopyFrom(proto.Span(nbytes=64))
+    index = proto.ModelIndex(version=4, ranks=[bundle])
+    path = tmp_path / 'rank.json'
+    write_sources(path, index, [(0, source, 0, 64)])
+    package = tmp_path / 'legacy.safetensors'
+    combine(package, [path], [], publisher=publisher())
+
+    assert payload_form(package) == 'legacy'
+    converted = tmp_path / 'legacy-converted' / 'package.safetensors'
+    convert(package, converted, profiles=[profile()], cache=tmp_path / 'cache')
+    assert read_index(converted)[0].version == 4
+    with pytest.raises(ValueError, match='packed'):
+        convert(package, tmp_path / 'legacy-packed.safetensors', profiles=[profile()],
+                cache=tmp_path / 'cache', form='packed')
+
+
 def test_tensor_metadata_bounds_cycles_and_defers_storage_resolution():
     stored = torch.ones(8)
     disposable = torch.zeros(8)

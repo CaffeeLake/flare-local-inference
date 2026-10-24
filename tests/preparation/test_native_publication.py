@@ -1,17 +1,14 @@
-"""Native publication preserves signed bytes, crypto geometry, and source coverage."""
+"""Native publication preserves signed bytes, compressed geometry, and source coverage."""
 
 import hashlib
 import json
 from pathlib import Path
+import random
 import struct
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import pytest
 
-from helios.tests.signing import publisher
+from helios.tests.signing import publisher, zstd_decompress
 from ignition.preparation import runtime_package_pb2 as proto
 from ignition.preparation.package_file import publish
 from ignition.preparation.package_snapshot import convert, export_options
@@ -61,7 +58,7 @@ def fixture(directory):
         module = rank.modules.add(name='kernel', file='kernel')
         module.globals.add(symbol='constant', file='constant', nbytes=13)
         for name, data in [('weights', bytes([owner + 1]) * 8193),
-                           ('kernel', bytes(range(251)) * ((CHUNK + 39) // 251 + 1) if owner == 0 else b'rank-one-code'),
+                           ('kernel', random.Random(0).randbytes(CHUNK + 39) if owner == 0 else b'rank-one-code'),
                            ('constant', b'constant-data')]:
             if name == 'kernel' and owner == 0:
                 data = data[:CHUNK + 39]
@@ -80,54 +77,46 @@ def fixture(directory):
     return index, payload, contents
 
 
-def test_native_signatures_and_multichunk_ciphertext_match_independent_crypto(tmp_path):
+def test_native_signatures_and_compressed_chunks_match_independent_codec(tmp_path):
     index, payload, contents = fixture(tmp_path / 'inputs')
     signer = publisher()
     output = tmp_path / 'model.safetensors'
     publish(output, index, payload, publisher=signer)
     encoded, logical = snapshot(output)
     envelope = proto.ProtectedIndex.FromString(encoded)
-    assert envelope.version == 4 and len(envelope.package_id) == 32
+    assert envelope.version == 6 and len(envelope.package_id) == 32
     assert envelope.signer == hashlib.sha256(signer.public_key).digest()
     for kind, group in [*enumerate(envelope.groups, 1), *((4, group) for group in envelope.ranks)]:
         assert group.kind == kind
-        message = fields(b'flare-package-signature-v4', struct.pack('<I', 4), envelope.package_id,
+        message = fields(b'flare-package-signature-v6', struct.pack('<I', 6), envelope.package_id,
                          envelope.signer, struct.pack('<I', kind), group.body)
         signer.key.public_key().verify(group.signature, message)
     shared = proto.PublisherMetadata.FromString(envelope.groups[0].body)
     assert list(shared.group_hashes) == [hashlib.sha256(group.body).digest() for group in envelope.groups[1:]]
     assert not shared.index.ranks and shared.ranks == 2
-    stored = [proto.StoredData.FromString(envelope.groups[2].body)]
+    stored_ranges = [proto.StoredData.FromString(envelope.groups[2].body)]
     for owner, group in enumerate(envelope.ranks):
         rank = proto.RankProtection.FromString(group.body)
         assert rank.rank == owner
-        stored.append(rank.data)
+        stored_ranges.append(rank.data)
         weights = rank.bundle.resources['weights']
         assert logical[weights.filename][weights.offset:weights.offset + weights.nbytes] == contents[owner, 'weights']
         for name in ['kernel', 'constant']:
             span = rank.bundle.resources[name]
             catalog = rank.executables if name == 'kernel' else rank.support
             resource = next(entry for entry in catalog.resources if entry.offset == span.offset)
-            ciphertext = logical[span.filename][span.offset:span.offset + span.nbytes]
+            stored_bytes = logical[span.filename][span.offset:span.offset + span.nbytes]
             if name == 'constant':
-                assert ciphertext == contents[owner, name]
-                assert list(resource.sha256) == [hashlib.sha256(ciphertext).digest()]
+                assert stored_bytes == contents[owner, name]
+                assert list(resource.sha256) == [hashlib.sha256(stored_bytes).digest()]
                 continue
-            key = HKDF(algorithm=hashes.SHA256(), length=32, salt=envelope.package_id,
-                       info=fields(b'flare-executable-v3', struct.pack('<Q', span.offset), signer.namespace.encode())).derive(signer.public_key)
-            cipher = AESGCM(key)
-            plaintext = bytearray()
-            for counter, offset in enumerate(range(0, len(ciphertext), CHUNK + 16)):
-                chunk = ciphertext[offset:offset + CHUNK + 16]
+            assert resource.plain_bytes == len(contents[owner, name])
+            assert len(resource.sha256) == -(-len(stored_bytes) // CHUNK)
+            for counter, offset in enumerate(range(0, len(stored_bytes), CHUNK)):
+                chunk = stored_bytes[offset:offset + CHUNK]
                 assert hashlib.sha256(chunk).digest() == resource.sha256[counter]
-                aad = fields(b'flare-executable-chunk-v3', envelope.package_id,
-                             struct.pack('<Q', span.offset), struct.pack('<Q', resource.plain_bytes),
-                             struct.pack('<Q', counter))
-                plaintext.extend(cipher.decrypt(counter.to_bytes(12, 'big'), chunk, aad))
-                with pytest.raises(InvalidTag):
-                    cipher.decrypt(counter.to_bytes(12, 'big'), chunk, aad + b'changed')
-            assert bytes(plaintext) == contents[owner, name]
-    for data in stored:
+            assert zstd_decompress(stored_bytes) == contents[owner, name]
+    for data in stored_ranges:
         parts = list(data.parts) or [proto.Span(offset=data.offset, nbytes=data.nbytes)]
         raw = b''.join(logical[part.filename][part.offset:part.offset + part.nbytes] for part in parts)
         assert hashlib.sha256(raw).digest() == data.sha256

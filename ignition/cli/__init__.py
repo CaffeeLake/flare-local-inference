@@ -30,8 +30,10 @@ def _parser() -> argparse.ArgumentParser:
         return subparser
 
     exporting = command("export", serve.export, "prepare a native model package")
-    exporting.add_argument("--output", type=Path, metavar="FILE",
-                           help="destination .safetensors file (default: a snapshot in the package cache)")
+    exporting.add_argument("--output", type=Path, metavar="PATH",
+                           help="exact destination path: a package directory (default form) or one .safetensors file with --form packed; omit to publish a shared cache entry")
+    exporting.add_argument("--form", choices=("directory", "packed"), default="directory",
+                           help="payload package form at --output (default: directory)")
     exporting.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
@@ -90,11 +92,21 @@ def _parser() -> argparse.ArgumentParser:
     signing.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     signing.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     signing.add_argument("--development-publisher", type=Path, help="source public profile (default: beside config)")
-    converting = command("convert", publishing.convert, "convert a signed package to an immutable blob snapshot")
+    combining = command("combine", publishing.combine, "combine prepared TP packages into one signed package")
+    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format packages")
+    combining.add_argument("--output", required=True, type=Path, help="destination package directory; must not exist")
+    combining.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
+    combining.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
+    combining.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
+    combining.add_argument("--publisher-keys", type=Path, action="append", default=[],
+                           help="trusted public publisher profiles of the sources; repeatable")
+    converting = command("convert", publishing.convert, "convert a package to the selected canonical container form")
     converting.add_argument("package", type=Path, help="existing signed .safetensors package")
     converting.add_argument("--output", type=Path, help="destination primary (default: package cache snapshot)")
     converting.add_argument("--publisher-keys", type=Path, action="append", default=[],
                             help="trusted public publisher profiles; repeatable")
+    converting.add_argument("--form", choices=("directory", "packed"), default="directory",
+                            help="payload container form: a directory of companions or one packed .safetensors file (default: directory)")
     def shard_size(value):
         from .config import parse_size
         try:
@@ -103,9 +115,9 @@ def _parser() -> argparse.ArgumentParser:
             raise argparse.ArgumentTypeError(str(error)) from error
         return value
 
-    for publishing in (exporting, signing, converting):
+    for publishing in (signing, converting):
         publishing.add_argument("--shard-size", type=shard_size, metavar="SIZE",
-                                help="maximum payload file size including its header; at most 64G (default: 64G)")
+                                help="legacy blob conversion: maximum payload file size including its header; at most 64G (default: 64G)")
     return parser
 
 

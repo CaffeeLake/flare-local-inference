@@ -1,11 +1,12 @@
-//! Publisher signatures and acceptance-bound executable encryption.
+//! Publisher signatures and independently compressed executable resources.
 use super::io::{Identity, IoBudget, Source};
 use super::package::{self, Role};
 use super::{ExportResult as Result, FilePart, FileSource, invalid, wire};
 use prost::Message;
 use rayon::prelude::*;
+use helios_core::package::protection::compress_stream;
 use ring::{
-    aead, digest, hkdf,
+    digest,
     rand::{SecureRandom, SystemRandom},
     signature::{self, KeyPair},
 };
@@ -32,50 +33,13 @@ pub(crate) fn fields(values: &[&[u8]]) -> Vec<u8> {
 }
 pub(crate) fn signature_message(package: &[u8], signer: &[u8], kind: u32, body: &[u8]) -> Vec<u8> {
     fields(&[
-        b"flare-package-signature-v4",
-        &4u32.to_le_bytes(),
+        b"flare-package-signature-v6",
+        &6u32.to_le_bytes(),
         package,
         signer,
         &kind.to_le_bytes(),
         body,
     ])
-}
-pub(crate) fn resource_key(
-    public: &[u8],
-    package: &[u8],
-    offset: u64,
-    namespace: &str,
-) -> Result<aead::LessSafeKey> {
-    let info = fields(&[
-        b"flare-executable-v3",
-        &offset.to_le_bytes(),
-        namespace.as_bytes(),
-    ]);
-    let key = hkdf::Salt::new(hkdf::HKDF_SHA256, package).extract(public);
-    let parts = [info.as_slice()];
-    let mut bytes = [0; 32];
-    key.expand(&parts, hkdf::HKDF_SHA256)
-        .map_err(|_| invalid("derive executable key"))?
-        .fill(&mut bytes)
-        .map_err(|_| invalid("derive executable key"))?;
-    Ok(aead::LessSafeKey::new(
-        aead::UnboundKey::new(&aead::AES_256_GCM, &bytes)
-            .map_err(|_| invalid("invalid executable key"))?,
-    ))
-}
-pub(crate) fn chunk_aad(package: &[u8], offset: u64, size: u64, chunk: u64) -> Vec<u8> {
-    fields(&[
-        b"flare-executable-chunk-v3",
-        package,
-        &offset.to_le_bytes(),
-        &size.to_le_bytes(),
-        &chunk.to_le_bytes(),
-    ])
-}
-pub(crate) fn nonce(counter: u64) -> aead::Nonce {
-    let mut bytes = [0; 12];
-    bytes[4..].copy_from_slice(&counter.to_be_bytes());
-    aead::Nonce::assume_unique_for_key(bytes)
 }
 pub(crate) fn validate_namespace(value: &str) -> Result<()> {
     if value.is_empty()
@@ -141,6 +105,11 @@ pub(crate) struct Publisher {
     pub license: Option<wire::License>,
 }
 impl Publisher {
+    /// Signing key retained by this publisher for payload-format publication.
+    pub(crate) fn signing_key(&self) -> &signature::Ed25519KeyPair {
+        &self.key
+    }
+
     pub(crate) fn from_seed(
         seed: &[u8],
         namespace: String,
@@ -399,7 +368,7 @@ impl Protected {
             })
             .collect();
         let encoded = wire::ProtectedIndex {
-            version: 4,
+            version: 6,
             package_id: self.package_id.clone(),
             signer,
             groups,
@@ -417,6 +386,28 @@ struct Input {
     role: Role,
     sources: Vec<FileSource>,
     plain: u64,
+    stored: u64,
+    compressed: Option<PathBuf>,
+    chunk_sha256: Vec<Vec<u8>>,
+}
+
+struct SourceReader {
+    source: Source,
+    position: u64,
+}
+
+impl Read for SourceReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.source.length {
+            return Ok(0);
+        }
+        let count = (self.source.length - self.position).min(output.len() as u64) as usize;
+        self.source
+            .read_at(self.position, &mut output[..count])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.position += count as u64;
+        Ok(count)
+    }
 }
 fn layout(
     mut index: wire::ModelIndex,
@@ -449,12 +440,7 @@ fn layout(
     let mut locations = Vec::new();
     for input in inputs {
         let role = &input.role;
-        let stored = input.plain
-            + if role.kind == 2 {
-                16 * input.plain.div_ceil(CHUNK)
-            } else {
-                0
-            };
+        let stored = input.stored;
         if sharded && role.kind == 4 {
             if data_file.is_empty()
                 || positions[&data_file] > 0
@@ -511,7 +497,7 @@ fn layout(
                 sha256: vec![
                     vec![0; 32];
                     if role.kind == 2 {
-                        input.plain.div_ceil(CHUNK) as usize
+                        input.chunk_sha256.len()
                     } else {
                         1
                     }
@@ -633,6 +619,9 @@ pub(crate) fn prepare(
             }
             Ok(Input {
                 plain: role.span.nbytes,
+                stored: role.span.nbytes,
+                compressed: None,
+                chunk_sha256: Vec::new(),
                 role,
                 sources,
             })
@@ -659,6 +648,37 @@ pub(crate) fn prepare(
             i.role.span.offset,
         )
     });
+    for (index, input) in inputs.iter_mut().enumerate() {
+        if input.role.kind != 2 {
+            continue;
+        }
+        let source = source_files[&input.sources[0].path]
+            .source(input.sources[0].offset, input.sources[0].nbytes)?;
+        if source.length != input.plain {
+            return Err(invalid(
+                "executable source length differs from its declared payload",
+            ));
+        }
+        let path = stage.join(format!("compressed-resource-{index}.zst"));
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let compressed = compress_stream(
+            SourceReader {
+                source: source.clone(),
+                position: 0,
+            },
+            input.plain,
+            &mut output,
+        )?;
+        output.sync_all()?;
+        source.check_unchanged()?;
+        phase.advance_bytes(input.plain);
+        input.stored = compressed.stored_nbytes;
+        input.chunk_sha256 = compressed.chunk_sha256;
+        input.compressed = Some(path);
+    }
     let mut package_id = vec![0; 32];
     SystemRandom::new()
         .fill(&mut package_id)
@@ -674,36 +694,13 @@ pub(crate) fn prepare(
     let length = locations
         .iter()
         .zip(&inputs)
-        .map(|((_, offset), i)| {
-            offset
-                + i.plain
-                + if i.role.kind == 2 {
-                    16 * i.plain.div_ceil(CHUNK)
-                } else {
-                    0
-                }
-        })
+        .map(|((_, offset), i)| offset + i.stored)
         .max()
         .unwrap_or(0);
     if 4096 + length + result.envelope(publisher, &BTreeMap::new())?.len() as u64 > shard_size
         && inputs.iter().any(|i| i.role.kind == 4)
     {
         (result, locations) = layout(index, &inputs, true, shard_size, basename, package_id)?;
-    }
-    let mut encrypted_files = BTreeMap::new();
-    for input in inputs.iter().filter(|i| i.role.kind == 2) {
-        let owner = input.role.owner.unwrap();
-        if let std::collections::btree_map::Entry::Vacant(entry) = encrypted_files.entry(owner) {
-            let path = stage.join(format!("executables-rank-{owner}.bin"));
-            let file = Arc::new(
-                OpenOptions::new()
-                    .write(true)
-                    .read(true)
-                    .create_new(true)
-                    .open(&path)?,
-            );
-            entry.insert((path, file));
-        }
     }
     let processed: Result<Vec<_>> = inputs
         .par_iter()
@@ -712,52 +709,17 @@ pub(crate) fn prepare(
             let mut parts = Vec::new();
             let mut hashes = Vec::new();
             if input.role.kind == 2 {
-                let (encrypted, output) = &encrypted_files[&input.role.owner.unwrap()];
-                let mut buffer = budget.buffer()?;
-                let source = source_files[&input.sources[0].path]
-                    .source(input.sources[0].offset, input.plain)?;
-                let cipher = resource_key(
-                    publisher.public_key(),
-                    &result.package_id,
-                    *offset,
-                    &publisher.namespace,
-                )?;
-                let mut position = 0;
-                let mut counter = 0;
-                while position < input.plain {
-                    let count = CHUNK.min(input.plain - position);
-                    let block = &mut buffer.bytes_mut()[..count as usize];
-                    budget.read_at(&source, position, block)?;
-                    phase.advance_bytes(count);
-                    let tag = cipher
-                        .seal_in_place_separate_tag(
-                            nonce(counter),
-                            aead::Aad::from(chunk_aad(
-                                &result.package_id,
-                                *offset,
-                                input.plain,
-                                counter,
-                            )),
-                            block,
-                        )
-                        .map_err(|_| invalid("encrypt executable resource"))?;
-                    let mut hash = digest::Context::new(&digest::SHA256);
-                    hash.update(block);
-                    hash.update(tag.as_ref());
-                    hashes.push(hash.finish().as_ref().to_vec());
-                    let destination = *offset + position + 16 * counter;
-                    super::io::write_all_at(output, block, destination)?;
-                    super::io::write_all_at(output, tag.as_ref(), destination + count)?;
-                    position += count;
-                    counter += 1;
-                }
-                source.check_unchanged()?;
+                let compressed = input
+                    .compressed
+                    .as_ref()
+                    .ok_or_else(|| invalid("executable resource lacks compressed bytes"))?;
+                hashes = input.chunk_sha256.clone();
                 parts.push(FilePart {
                     offset: *offset,
                     source: FileSource {
-                        path: encrypted.clone(),
-                        offset: *offset,
-                        nbytes: input.plain + 16 * input.plain.div_ceil(CHUNK),
+                        path: compressed.clone(),
+                        offset: 0,
+                        nbytes: input.stored,
                     },
                 });
             } else {
@@ -812,9 +774,6 @@ pub(crate) fn prepare(
             };
             catalog.resources[catalog_positions[&(kind, owner, offset)]].sha256 = hashes;
         }
-    }
-    for (_, file) in encrypted_files.values() {
-        file.sync_all()?;
     }
     for source in &source_snapshots {
         source.check_unchanged()?;

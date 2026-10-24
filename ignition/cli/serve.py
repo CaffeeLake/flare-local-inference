@@ -118,19 +118,22 @@ def _check_host_shape(args) -> None:
 
 def export(args) -> int:
     from ignition.preparation.package_snapshot import export_options
-    from .publishing import snapshot_destination, validate_repository
+    from .publishing import validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
     model = resolve_model(configuration, args.model)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
         validate_repository(repository)
-    if args.output is None:
-        args.output = snapshot_destination(configuration, repository or model.recipe.name)
-    if args.output.suffix != ".safetensors":
-        args.output = args.output.with_name(args.output.name + ".safetensors")
-    if args.output.exists():
-        raise UsageError(f"export destination already exists: {args.output}")
+    form = getattr(args, 'form', 'directory')
+    output = args.output
+    if output is not None and output.exists():
+        raise UsageError(f"export destination already exists: {output}")
+    if output is None:
+        if form == 'packed':
+            raise UsageError('--form packed requires --output FILE; a packed package is one exact file path')
+        if args.ranks > 1:
+            raise UsageError('multi-host export requires --output DIRECTORY; the shared cache entry is published by one host')
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
@@ -139,16 +142,20 @@ def export(args) -> int:
         raise UsageError('--no-weights requires an existing blob cache; export or convert a package first')
     with export_options(cache, no_weights=getattr(args, 'no_weights', False)):
         if args.ranks > 1:
-            code = _export_hosts(args, export_path=args.output)
+            code, result = _export_hosts(args, export_path=output, form=form)
         else:
-            code = _prepare(args, export_path=args.output)
-    print(f'Exported package: {args.output}')
+            code, result = _prepare(args, export_path=output, form=form)
+    if output is None:
+        entry_path = getattr(result, 'entry_path', None) or f"{result.model}/{result.entry}"
+        print(f'Exported cache entry: {entry_path}')
+    else:
+        print(f'Exported package: {output}')
     if repository:
         print(f'Hugging Face target: {repository}')
     return code
 
 
-def _export_hosts(args, *, export_path) -> int:
+def _export_hosts(args, *, export_path, form='directory'):
     """Prepare one rank per host and collect a shared package snapshot on rank zero."""
     import uuid
 
@@ -218,19 +225,20 @@ def _export_hosts(args, *, export_path) -> int:
                 from ignition.preparation.rebuild_manifest import from_plan
 
                 options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
-                prepared.export(export_path, options=options, export_id=uuid.uuid4().hex, images=recorder,
+                result = prepared.export(export_path, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
+                                staging=configuration.directory("export_staging"),
                                 shard_size=configuration.shard_size(getattr(args, "shard_size", None)),
-                                progress=progress if args.verbose else None)
+                                progress=progress if args.verbose else None, form=form)
                 stage.update(f"{export_path} on each of {plan.world_size} hosts")
         for region in storage.host_regions:
             region.close()
-        return 0
+        return 0, result
     finally:
         signals.__exit__(None, None, None)
 
 
-def _prepare(args, *, export_path) -> int:
+def _prepare(args, *, export_path, form='directory'):
     from ignition.progress import StartupProgress, phase
 
     class Progress(StartupProgress):
@@ -338,16 +346,17 @@ def _prepare(args, *, export_path) -> int:
                     from ignition.preparation.rebuild_manifest import from_plan
 
                     options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
-                    export_package(prepared, recorder, storage, export_path, options=options, publisher=publisher,
+                    result = export_package(prepared, recorder, storage, export_path, options=options, publisher=publisher,
                                  progress=progress if args.verbose else None, console=progress.console,
                                  staging=configuration.directory("export_staging"),
-                                 shard_size=configuration.shard_size(getattr(args, "shard_size", None)))
+                                 shard_size=configuration.shard_size(getattr(args, "shard_size", None)),
+                                 form=form)
                 except Exception as error:
                     if args.verbose:
                         traceback.print_exc()
                     raise PreparationError(f"native package export failed: {error}") from error
-                stage.update(str(export_path))
-            return 0
+                stage.update(str(export_path) if export_path is not None else 'shared cache entry')
+            return 0, result
     finally:
         signals.__exit__(None, None, None)
 

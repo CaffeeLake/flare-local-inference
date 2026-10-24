@@ -51,7 +51,8 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
     };
     let root = std::path::PathBuf::from(std::env::var_os("FLARE_ENGRAM_TEST_PACKAGE").unwrap());
     let table_rank: usize = std::env::var("FLARE_ENGRAM_TEST_RANK")
-        .map(|rank| rank.parse().unwrap()).unwrap_or(0);
+        .map(|rank| rank.parse().unwrap())
+        .unwrap_or(0);
     let reference_rows: Vec<usize> =
         serde_json::from_slice(&std::fs::read(root.join("reference_rows.json")).unwrap()).unwrap();
     for (storage, cache_bytes, fail_read, resident_scales) in [
@@ -64,8 +65,9 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         (Storage::Disk, 1 << 20, false, true),
         (Storage::Disk, 1 << 20, true, true),
     ] {
-        let AuthorizedPackage { archive, mut index } =
-            test_support::authorize(root.join("package"));
+        let authorized = test_support::authorize(root.join("package"));
+        let mut index = authorized.legacy_index().unwrap().clone();
+        let archive = authorized.legacy_archive().unwrap();
         let package = protobuf::decode(index.ranks.remove(0)).unwrap();
         package.validate().unwrap();
         archive.validate(&package).unwrap();
@@ -80,7 +82,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         };
         let tables = super::engram::decode(
             catalog,
-            &archive,
+            archive,
             std::slice::from_ref(&package),
             table_rank,
             world,
@@ -92,9 +94,9 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         unsafe {
             owner.reserve(&package).unwrap();
             owner.allocate(&package, &phase).unwrap();
-            owner.load_payload(&archive, &package, &phase, 1).unwrap();
-            owner.prepare_kernels(&archive, &package, &phase).unwrap();
-            owner.prepare_graphs(&archive, &package, &phase).unwrap();
+            owner.load_payload(archive, &package, &phase, 1).unwrap();
+            owner.prepare_kernels(archive, &package, &phase).unwrap();
+            owner.prepare_graphs(archive, &package, &phase).unwrap();
         }
         let failed_source = std::env::temp_dir().join(format!(
             "helios-engram-truncated-{}.safetensors",
@@ -114,7 +116,8 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&failed_source, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::set_permissions(&failed_source, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
             }
             #[cfg(windows)]
             {

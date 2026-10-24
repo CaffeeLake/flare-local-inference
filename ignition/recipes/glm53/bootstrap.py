@@ -21,6 +21,7 @@ from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -660,7 +661,14 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         vision_state, vision_inputs, vision_prefill, vision_storage, vision_owners)
     from .export import disposable_ranges
 
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components={
+        'tree.model.language_model.embed_tokens': 'embedding',
+        'tree.model.language_model.norm': 'norm',
+        'tree.lm_head': 'head',
+        'head': 'head',
+        'mtp': 'mtp',
+        'vision': 'vision',
+    }), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, resources=resources, session=session,
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

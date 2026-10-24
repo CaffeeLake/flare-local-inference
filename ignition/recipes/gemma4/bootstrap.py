@@ -31,6 +31,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.speculation import SpeculativeRngState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
@@ -597,7 +598,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             seen_ids.add(id(res))
             close_resources.append(res)
     return PreparedModel(
-        rebuild_weights={"weights": weights},
+        rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'ple', 'draft'),
+            aliases=(('weights.head', 'weights.embedding'),) if weights.head is weights.embedding else ()),
         device=device_id,
         graphs=graphs,
         buffers=buffers,

@@ -2,6 +2,7 @@
 
 import hashlib
 from itertools import chain
+import random
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import subprocess
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import pytest
 
-from helios.tests.signing import publisher
+from helios.tests.signing import publisher, zstd_compress
 from ignition.preparation import runtime_package_pb2 as proto
 from ignition.preparation.package_file import align, publish, read_index
 from ignition.preparation.protection import CHUNK, License, Publisher, signature_message
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(autouse=True)
 def legacy_container_fixtures(monkeypatch):
-    """Retain coverage of published version 4/5 container bytes and signatures."""
+    """Retain coverage of published envelope-6 container bytes and signatures."""
     from helios.tests.signing import publish_legacy
     from ignition.preparation import package_file
     monkeypatch.setattr(package_file, 'publish', publish_legacy)
@@ -52,7 +53,7 @@ def fixture(tmp_path, *, size=CHUNK + 39, signer=None):
     module = rank.modules.add(name='kernel', file='kernel')
     module.globals.add(symbol='constant', file='constant', nbytes=13)
     rank.graphs.add(name='decode', resource='graph')
-    data = {'weights': bytes(range(251)) * 31, 'kernel': (b'kernel-code-' * (size // 12 + 1))[:size],
+    data = {'weights': bytes(range(251)) * 31, 'kernel': random.Random(0).randbytes(size),
             'constant': b'constant-data', 'graph': b'graph-records', 'tokenizer': b'tokenizer-data'}
     payload, cursor = [], 0
     for name, contents in data.items():
@@ -122,7 +123,7 @@ def test_multichunk_export_is_read_and_authenticated_by_rust(native, tmp_path):
     kernel = index.ranks[0].resources['kernel']
     assert data['kernel'] not in contents
     assert contents[start:start + len(data['weights'])] == data['weights']
-    assert kernel.nbytes == len(data['kernel']) + 32
+    assert kernel.nbytes == len(zstd_compress(data['kernel']))
 
 
 def cluster_package(tmp_path, monkeypatch):
@@ -288,11 +289,10 @@ def test_every_signature_group_is_verified_before_access(native, tmp_path, group
     assert result.returncode != 0 and f'signature failed for {label}' in result.stderr
 
 
-def test_the_accepted_string_is_the_key_material(native, tmp_path):
-    # The exporter encrypts under the publisher namespace; any other accepted string opens nothing.
+def test_acceptance_must_exactly_match_the_signed_publisher_namespace(native, tmp_path):
     path, _ = fixture(tmp_path, size=41)
     result = read(native, path, namespace='yes')
-    assert result.returncode != 0 and 'executable decryption failed' in result.stderr
+    assert result.returncode != 0 and 'publisher namespace acceptance does not match' in result.stderr
     assert read(native, path).returncode == 0
 
 
@@ -315,7 +315,7 @@ def test_invalid_license_metadata_is_rejected(native, tmp_path):
 
 
 @pytest.mark.parametrize('change', ['key', 'namespace'])
-def test_resigning_ciphertext_under_different_identity_cannot_decrypt(native, tmp_path, change):
+def test_resigning_preserves_authenticated_compressed_resources(native, tmp_path, change):
     path, _ = fixture(tmp_path, size=41)
     original = publisher()
     signer = Publisher(Ed25519PrivateKey.generate() if change == 'key' else original.key,
@@ -325,7 +325,7 @@ def test_resigning_ciphertext_under_different_identity_cannot_decrypt(native, tm
     replace_envelope(path, value, payload)
     profile = profiles(tmp_path / 'publisher.json', signer)
     result = read(native, path, namespace=signer.namespace, profile=profile)
-    assert result.returncode != 0 and 'executable decryption failed' in result.stderr
+    assert result.returncode == 0, result.stderr
 
 
 def test_independently_prepared_publisher_is_supported(native, tmp_path):

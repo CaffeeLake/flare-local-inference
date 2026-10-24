@@ -29,6 +29,7 @@ from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
@@ -558,7 +559,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             disposable.append(forward.decoder.scratch_tensors())
         if getattr(forward, "context", None) is not None:
             disposable.append(forward.context.scratch_tensors())
-    return PreparedModel(rebuild_weights={"weights": weights},
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'draft', 'vision')),
         device=config.devices[rank],
         graphs=graphs,
         buffers=buffers,

@@ -51,6 +51,124 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    /// List, inspect, select, and remove prepared-model cache entries.
+    Cache(CacheArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub command: CacheCommand,
+
+    /// Prepared-model cache root [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(
+        long,
+        value_name = "PATH",
+        global = true,
+        help_heading = "Cache options"
+    )]
+    pub model_cache: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// List cached models, their versions, default selection, deployments, and usage.
+    List(CacheList),
+    /// Inspect one cached entry with the normal package inspection flags.
+    Inspect(CacheInspect),
+    /// Select one cached entry as a model's default.
+    Select(CacheSpec),
+    /// Remove one cached entry.
+    Remove(CacheRemove),
+    /// Reclaim abandoned staging trees and unreferenced payload blobs.
+    Gc(CacheGc),
+}
+
+#[derive(Debug, Args)]
+pub struct CacheList {
+    /// Model key to list; every model when omitted.
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Print the listing as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheSpec {
+    /// MODEL@VERSION entry in the prepared-model cache.
+    #[arg(value_name = "MODEL@VERSION")]
+    pub spec: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheRemove {
+    /// MODEL@VERSION entry in the prepared-model cache.
+    #[arg(value_name = "MODEL@VERSION")]
+    pub spec: String,
+
+    /// Remove the entry even though it is the model's selected default.
+    #[arg(long)]
+    pub clear_default: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheGc {
+    /// Print the reclaimed counts as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheInspect {
+    /// MODEL@VERSION entry in the prepared-model cache.
+    #[arg(value_name = "MODEL@VERSION")]
+    pub spec: String,
+
+    /// Print the selected sections as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Disable terminal styling.
+    #[arg(long, conflicts_with = "json")]
+    pub plain: bool,
+
+    /// Include allocation addresses, reservations, and execution buffer views.
+    #[arg(long)]
+    pub memory_map: bool,
+
+    /// Include graph capacities, timings, and node counts for every selected rank.
+    #[arg(long)]
+    pub graphs: bool,
+
+    /// Include tokenizer, parser, vision, asset, and auxiliary table details.
+    #[arg(long)]
+    pub frontend: bool,
+
+    /// Include every detail section and the complete serving contract.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Read only primary-file metadata without checking signatures or opening companions.
+    #[arg(long, conflicts_with_all = ["publisher_keys", "trust_store"])]
+    pub unverified: bool,
+
+    /// Verify only this rank of a multi-host package whose copy holds that rank's bytes alone.
+    #[arg(long, value_name = "N")]
+    pub rank: Option<usize>,
+
+    /// Select a deployment by tensor-parallel size for a multi-deployment payload package.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub tensor_parallel: Option<u32>,
+
+    /// Additional publisher verification profiles (JSON).
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub publisher_keys: Vec<PathBuf>,
+
+    /// Persistent trust file whose remembered keys also verify [default: ~/.config/flare/trust.toml].
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,7 +181,9 @@ pub struct HubOptions {
     #[arg(long, value_name = "FILE", help_heading = "Download options")]
     pub filename: Option<String>,
 
-    /// Hugging Face hub cache [default: ~/.cache/huggingface/hub].
+    /// Parent directory for operation-scoped transport staging of prepared
+    /// packages. The tree is cleaned when the acquisition ends; source checkpoint
+    /// and publisher-profile caches are configured separately.
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub cache_dir: Option<PathBuf>,
 
@@ -71,9 +191,22 @@ pub struct HubOptions {
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub token_file: Option<PathBuf>,
 
-    /// Use only cached files, without contacting Hugging Face.
+    /// Resolve prepared packages only from the Flare model cache, without contacting Hugging Face.
     #[arg(long, help_heading = "Download options")]
     pub offline: bool,
+
+    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count.
+    #[arg(
+        long,
+        value_name = "N[,N...]",
+        value_delimiter = ',',
+        help_heading = "Download options"
+    )]
+    pub tensor_parallel: Vec<u32>,
+
+    /// Prepared-model cache root [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(long, value_name = "PATH", help_heading = "Download options")]
+    pub model_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -114,6 +247,10 @@ pub struct Inspect {
     #[arg(long, value_name = "N")]
     pub rank: Option<usize>,
 
+    /// Select a deployment by tensor-parallel size for a multi-deployment payload package.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub tensor_parallel: Option<u32>,
+
     /// Additional publisher verification profiles (JSON).
     /// Development packages default to ~/.config/flare/development-publisher.json.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
@@ -135,6 +272,14 @@ pub struct Download {
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
         default_value = "0", value_parser = clap::value_parser!(i32).range(0..))]
     pub gpus: Vec<i32>,
+
+    /// Additional publisher verification profiles (JSON); repeatable.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub publisher_keys: Vec<PathBuf>,
+
+    /// Persistent trust file whose remembered keys also verify.
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 
     #[command(flatten)]
     pub hub: HubOptions,
@@ -380,7 +525,11 @@ pub struct OrbitRun {
 
     /// Experimental chain in rank order: like --roce-ring, with no link between the first and
     /// last rank; hosts cabled directly as a chain.
-    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    #[arg(
+        long,
+        conflicts_with = "roce_ring",
+        help_heading = "Multi-host options"
+    )]
     pub roce_chain: bool,
 
     /// IP address for rank zero's HTTP server [default: saved group or 127.0.0.1].
@@ -411,7 +560,9 @@ pub struct OrbitRun {
 impl OrbitRun {
     /// Serving options every rank loads with.
     pub fn rank_options(&self, matches: &clap::ArgMatches) -> Vec<String> {
-        let mut options = self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
+        let mut options = self
+            .serving
+            .rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
         // Explicit defaults must override saved values, while omitted defaults must not.
         if self.serving.kv_cache_limit == KvCacheLimit::Memory
             && matches.value_source("kv_cache_limit")
@@ -519,7 +670,11 @@ pub struct Run {
 
     /// Experimental chain in rank order: like --roce-ring, with no link between the first and
     /// last rank; hosts cabled directly as a chain.
-    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    #[arg(
+        long,
+        conflicts_with = "roce_ring",
+        help_heading = "Multi-host options"
+    )]
     pub roce_chain: bool,
 
     /// Rank zero's rendezvous address: where rank zero listens, or on a peer, where it joins rank zero.
@@ -561,7 +716,8 @@ pub struct Run {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64), help_heading = "Multi-host options")]
     pub transfer_streams: Option<u8>,
 
-    /// Cache root for received rank packages [default: ~/.cache/flare].
+    /// Fallback prepared-model cache root when --model-cache is absent
+    /// [default: paths.package_cache, else ~/.cache/flare/packages].
     #[arg(long, value_name = "PATH", help_heading = "Multi-host options")]
     pub package_cache: Option<PathBuf>,
 
@@ -671,11 +827,19 @@ pub struct ServingOptions {
     pub mtp_draft_tokens: Option<usize>,
 
     /// Augment learned drafts with shared decoded history; requires prepared history inputs.
-    #[arg(long, overrides_with = "no_history_drafts", help_heading = "Speculation options")]
+    #[arg(
+        long,
+        overrides_with = "no_history_drafts",
+        help_heading = "Speculation options"
+    )]
     pub history_drafts: bool,
 
     /// Disable shared decoded history proposals.
-    #[arg(long, overrides_with = "history_drafts", help_heading = "Speculation options")]
+    #[arg(
+        long,
+        overrides_with = "history_drafts",
+        help_heading = "Speculation options"
+    )]
     pub no_history_drafts: bool,
 
     /// Advanced: fix the total verification-row budget, including pending inputs, using
@@ -744,7 +908,10 @@ fn served_model_name(value: &str) -> Result<String, String> {
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
-    value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| "adaptive verification alpha must be finite and greater than zero".into())
 }
 
@@ -765,7 +932,8 @@ impl Run {
     /// graphs and capacities on every host.
     #[cfg(test)]
     pub fn rank_options(&self) -> Vec<String> {
-        self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
+        self.serving
+            .rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
     }
 
     pub fn load_options(&self) -> LoadOptions {
@@ -822,7 +990,10 @@ impl ServingOptions {
             options.push("--no-mtp-adaptive-verification".into());
         }
         if let Some(alpha) = self.mtp_adaptive_verification_alpha {
-            options.extend(["--mtp-adaptive-verification-alpha".into(), alpha.to_string()]);
+            options.extend([
+                "--mtp-adaptive-verification-alpha".into(),
+                alpha.to_string(),
+            ]);
         }
         if let Some(storage) = self.embedding_table_storage {
             options.extend([
@@ -839,10 +1010,7 @@ impl ServingOptions {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
         }
         if let Some(bytes) = self.embedding_table_cache_size {
-            options.extend([
-                "--embedding-table-cache-size".into(),
-                bytes.to_string(),
-            ]);
+            options.extend(["--embedding-table-cache-size".into(), bytes.to_string()]);
         }
         if self.embedding_table_resident_scales {
             options.push("--embedding-table-resident-scales".into());
@@ -853,7 +1021,10 @@ impl ServingOptions {
             options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
         }
         if let Some(directory) = &self.prefix_cache_disk {
-            options.extend(["--prefix-cache-disk".into(), directory.display().to_string()]);
+            options.extend([
+                "--prefix-cache-disk".into(),
+                directory.display().to_string(),
+            ]);
         }
         if let Some(bytes) = self.prefix_cache_disk_limit {
             options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
@@ -977,7 +1148,10 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
-            assert_eq!(effective.mtp_adaptive_verification_alpha, Some(if explicit { 1.0 } else { 0.5 }));
+            assert_eq!(
+                effective.mtp_adaptive_verification_alpha,
+                Some(if explicit { 1.0 } else { 0.5 })
+            );
             assert_eq!(
                 effective.host.to_string(),
                 if explicit { "127.0.0.1" } else { "0.0.0.0" }
@@ -1091,7 +1265,11 @@ mod tests {
         assert_eq!(options.device_labels, None);
         assert_eq!(options.embedding_table_storage, None);
         assert_eq!(options.embedding_table_cache_bytes, None);
-        assert!(!args.rank_options().contains(&"--embedding-table-cache-size".to_owned()));
+        assert!(
+            !args
+                .rank_options()
+                .contains(&"--embedding-table-cache-size".to_owned())
+        );
         assert_eq!(options.max_concurrency, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
@@ -1116,8 +1294,26 @@ mod tests {
             let args = run(&command);
             assert_eq!(args.load_options().history_drafts, Some(expected));
             let options = args.rank_options();
-            assert!(options.contains(&if expected { "--history-drafts" } else { "--no-history-drafts" }.to_owned()));
-            assert!(!options.contains(&if expected { "--no-history-drafts" } else { "--history-drafts" }.to_owned()));
+            assert!(
+                options.contains(
+                    &if expected {
+                        "--history-drafts"
+                    } else {
+                        "--no-history-drafts"
+                    }
+                    .to_owned()
+                )
+            );
+            assert!(
+                !options.contains(
+                    &if expected {
+                        "--no-history-drafts"
+                    } else {
+                        "--history-drafts"
+                    }
+                    .to_owned()
+                )
+            );
         }
     }
 
@@ -1255,7 +1451,14 @@ mod tests {
         assert_eq!(push.to, ["zero", "one", "two", "three"]);
         assert_eq!(push.transfer_streams, Some(8));
         assert!(push.run_args().roce_ring);
-        let arguments = ["flare", "orbit", "push", "model.safetensors", "--to", "zero,one,two"];
+        let arguments = [
+            "flare",
+            "orbit",
+            "push",
+            "model.safetensors",
+            "--to",
+            "zero,one,two",
+        ];
         let parsed = Cli::try_parse_from([&arguments[..], &["--roce-chain"]].concat()).unwrap();
         let Command::Orbit(OrbitArgs {
             command: OrbitCommand::Push(push),
@@ -1267,7 +1470,8 @@ mod tests {
         let run = push.run_args();
         assert!(run.roce_chain && !run.roce_ring);
         assert!(
-            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat()).is_err()
+            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat())
+                .is_err()
         );
     }
 
@@ -1419,16 +1623,37 @@ mod tests {
     #[test]
     fn adaptive_verification_alpha_is_validated_and_forwarded() {
         for value in ["0.5", "1.0", "2.0"] {
-            let args = run(&["flare", "run", "model.safetensors", "--mtp-adaptive-verification-alpha", value]);
-            assert_eq!(args.mtp_adaptive_verification_alpha, Some(value.parse().unwrap()));
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--mtp-adaptive-verification-alpha",
+                value,
+            ]);
+            assert_eq!(
+                args.mtp_adaptive_verification_alpha,
+                Some(value.parse().unwrap())
+            );
             let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
             forwarded.extend(args.rank_options());
-            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
-            assert_eq!(peer.mtp_adaptive_verification_alpha, args.mtp_adaptive_verification_alpha);
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+                panic!()
+            };
+            assert_eq!(
+                peer.mtp_adaptive_verification_alpha,
+                args.mtp_adaptive_verification_alpha
+            );
         }
         for value in ["0", "-0.5", "NaN", "inf", "-inf", "invalid"] {
-            assert!(Cli::try_parse_from(["flare", "run", "model.safetensors",
-                &format!("--mtp-adaptive-verification-alpha={value}")]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    &format!("--mtp-adaptive-verification-alpha={value}")
+                ])
+                .is_err()
+            );
         }
     }
 
@@ -1493,14 +1718,25 @@ mod tests {
     #[test]
     fn embedding_row_cache_accepts_a_binary_memory_budget() {
         for (size, bytes) in [("0", 0), ("1G", 1 << 30), ("4GiB", 4 << 30)] {
-            let args = run(&["flare", "run", "model.safetensors", "--embedding-table-cache-size", size]);
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--embedding-table-cache-size",
+                size,
+            ]);
             let options = args.load_options();
             assert_eq!(options.embedding_table_cache_bytes, Some(bytes));
             assert_eq!(options.embedding_table_storage, None);
-            assert_eq!(args.rank_options(), ["--embedding-table-cache-size".to_owned(), bytes.to_string()]);
+            assert_eq!(
+                args.rank_options(),
+                ["--embedding-table-cache-size".to_owned(), bytes.to_string()]
+            );
             let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
             forwarded.extend(args.rank_options());
-            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+                panic!()
+            };
             assert_eq!(peer.load_options().embedding_table_cache_bytes, Some(bytes));
         }
     }
@@ -1540,17 +1776,37 @@ mod tests {
             run(&forwarded).load_options().prefix_cache,
             args.load_options().prefix_cache
         );
-        assert!(run(&["flare", "run", "model.safetensors"]).rank_options().is_empty());
+        assert!(
+            run(&["flare", "run", "model.safetensors"])
+                .rank_options()
+                .is_empty()
+        );
     }
 
     #[test]
     fn resident_embedding_scales_are_forwarded_to_every_rank() {
-        let args = run(&["flare", "run", "model.safetensors", "--embedding-table-resident-scales",
-                         "--embedding-table-cache-size", "1G"]);
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--embedding-table-resident-scales",
+            "--embedding-table-cache-size",
+            "1G",
+        ]);
         assert!(args.load_options().embedding_table_resident_scales);
-        assert_eq!(args.load_options().embedding_table_cache_bytes, Some(1 << 30));
-        assert!(args.rank_options().contains(&"--embedding-table-resident-scales".to_owned()));
-        assert!(!run(&["flare", "run", "model.safetensors"]).load_options().embedding_table_resident_scales);
+        assert_eq!(
+            args.load_options().embedding_table_cache_bytes,
+            Some(1 << 30)
+        );
+        assert!(
+            args.rank_options()
+                .contains(&"--embedding-table-resident-scales".to_owned())
+        );
+        assert!(
+            !run(&["flare", "run", "model.safetensors"])
+                .load_options()
+                .embedding_table_resident_scales
+        );
     }
 
     #[test]
@@ -1598,5 +1854,78 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_cli_tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> CacheArgs {
+        let parsed = Cli::try_parse_from(arguments).unwrap();
+        match parsed.command {
+            Command::Cache(args) => args,
+            other => panic!("expected cache command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_commands_parse_with_the_shared_model_cache_flag() {
+        let list = parse(&[
+            "flare",
+            "cache",
+            "--model-cache",
+            "/cache",
+            "list",
+            "--json",
+        ]);
+        assert_eq!(
+            list.model_cache.as_deref(),
+            Some(std::path::Path::new("/cache"))
+        );
+        match list.command {
+            CacheCommand::List(CacheList {
+                model: None,
+                json: true,
+            }) => {}
+            other => panic!("unexpected list command: {other:?}"),
+        }
+        let inspect = parse(&[
+            "flare",
+            "cache",
+            "inspect",
+            "model@v1",
+            "--json",
+            "--unverified",
+        ]);
+        match inspect.command {
+            CacheCommand::Inspect(CacheInspect {
+                spec,
+                json: true,
+                unverified: true,
+                ..
+            }) => {
+                assert_eq!(spec, "model@v1");
+            }
+            other => panic!("unexpected inspect command: {other:?}"),
+        }
+        let remove = parse(&["flare", "cache", "remove", "model@v1", "--clear-default"]);
+        match remove.command {
+            CacheCommand::Remove(CacheRemove {
+                spec,
+                clear_default: true,
+            }) => {
+                assert_eq!(spec, "model@v1");
+            }
+            other => panic!("unexpected remove command: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["flare", "cache", "select", "model@v1"]).command,
+            CacheCommand::Select(CacheSpec { spec }) if spec == "model@v1"
+        ));
+        assert!(matches!(
+            parse(&["flare", "cache", "gc", "--json"]).command,
+            CacheCommand::Gc(CacheGc { json: true })
+        ));
     }
 }
