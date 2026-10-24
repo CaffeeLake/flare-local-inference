@@ -331,7 +331,10 @@ key material.
 
 Downloads and locally materialized payloads are hashed against their signed
 content IDs before installation. Cached loading retains the optional full weight
-scan: `--verify-weights` hashes actual payload bytes, not digest lists. A signed
+scan: `--verify-weights` hashes allocation initializers and shared or rank-sharded
+embedding-table planes. Ordinary loading validates their signed descriptors and
+physical bounds without hashing their contents. The full scan hashes actual
+payload bytes, not digest lists. A signed
 digest without a byte scan is not evidence that local weight bytes were checked.
 Executable authentication remains mandatory. A consumer using only a slice of a
 payload may need the whole payload for full digest verification; download planning

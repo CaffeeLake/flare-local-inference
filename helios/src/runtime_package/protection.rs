@@ -683,10 +683,33 @@ impl VerifiedPackage {
         }
     }
     pub fn authorize(self, accepted: &str, verify_weights: bool) -> Result<AuthorizedPackage> {
+        self.authorize_with_progress(accepted, verify_weights, None)
+    }
+
+    /// Authorize the package while reporting mandatory and requested stored-data verification.
+    pub fn authorize_with_progress(
+        self,
+        accepted: &str,
+        verify_weights: bool,
+        progress: Option<&crate::startup::StartupProgress>,
+    ) -> Result<AuthorizedPackage> {
         match self {
-            Self::Legacy(package) => package.authorize(accepted, verify_weights),
+            Self::Legacy(package) => {
+                let phase = progress
+                    .filter(|_| verify_weights)
+                    .map(|progress| progress.phase("Verify stored data", None));
+                let authorized = package.authorize(accepted, verify_weights)?;
+                if let Some(phase) = phase {
+                    phase.finish("stored-data contents");
+                }
+                Ok(authorized)
+            }
             Self::Payload(package) => Ok(AuthorizedPackage {
-                kind: AuthorizedKind::Payload(package.authorize(accepted, verify_weights)?),
+                kind: AuthorizedKind::Payload(package.authorize_with_progress(
+                    accepted,
+                    verify_weights,
+                    progress,
+                )?),
             }),
         }
     }
@@ -1384,7 +1407,7 @@ impl PayloadSource {
         }
         Ok(())
     }
-    fn plaintext_ids(&self) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    fn supporting_payload_ids(&self) -> Result<std::collections::BTreeSet<Vec<u8>>> {
         let mut ids = std::collections::BTreeSet::new();
         for rank in self.authorized.verified().ranks() {
             for module in &rank.modules {
@@ -1408,62 +1431,61 @@ impl PayloadSource {
             }
             ids.insert(slice.payload_id.clone());
         }
-        if let Some(engram) = self
-            .authorized
-            .verified()
-            .deployment()
-            .and_then(|deployment| deployment.engram.as_ref())
-        {
-            for table in &engram.tables {
-                for plane in [&table.weights, &table.scales] {
-                    if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+        Ok(ids)
+    }
+    /// Supporting resources and optional weight checks share one distinct payload set.
+    fn verification_payloads(&self, verify_weights: bool) -> Result<payload_reader::PayloadFiles> {
+        let mut ids = self.supporting_payload_ids()?;
+        if verify_weights {
+            for rank in self.authorized.verified().ranks() {
+                for initializer in &rank.initializers {
+                    if let Some(slice) = initializer
+                        .source
+                        .as_ref()
+                        .and_then(|use_| use_.slice.as_ref())
+                    {
                         ids.insert(slice.payload_id.clone());
                     }
                 }
-                // Only planes the verified ranks own are part of this host's closure; a
-                // rank-selective copy does not hold its siblings' partitions.
-                let verified_ranks = self.authorized.verified().ranks();
-                for shard in table
-                    .shards
-                    .iter()
-                    .filter(|shard| verified_ranks.iter().any(|rank| rank.rank == shard.rank))
-                {
-                    for plane in [&shard.weights, &shard.scales] {
+            }
+            if let Some(engram) = self
+                .authorized
+                .verified()
+                .deployment()
+                .and_then(|deployment| deployment.engram.as_ref())
+            {
+                for table in &engram.tables {
+                    for plane in [&table.weights, &table.scales] {
                         if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
                             ids.insert(slice.payload_id.clone());
+                        }
+                    }
+                    // Only planes the verified ranks own are part of this host's closure; a
+                    // rank-selective copy does not hold its siblings' partitions.
+                    let verified_ranks = self.authorized.verified().ranks();
+                    for shard in table
+                        .shards
+                        .iter()
+                        .filter(|shard| verified_ranks.iter().any(|rank| rank.rank == shard.rank))
+                    {
+                        for plane in [&shard.weights, &shard.scales] {
+                            if let Some(slice) = plane.as_ref().and_then(|use_| use_.slice.as_ref()) {
+                                ids.insert(slice.payload_id.clone());
+                            }
                         }
                     }
                 }
             }
         }
-        Ok(ids)
-    }
-    /// Mandatory: module globals, frontend assets, and offloaded table planes are plaintext
-    /// payloads, so their bytes are hashed against signed descriptors before anything is served.
-    fn verify_plaintext(&self) -> Result<()> {
-        for id in self.plaintext_ids()? {
-            self.hash_payload(&id)?;
-        }
-        Ok(())
-    }
-    /// Optional full stored-data scan over distinct payloads the verified ranks initialize from.
-    fn verify_weights(&self) -> Result<()> {
-        let mut ids = std::collections::BTreeSet::new();
-        for rank in self.authorized.verified().ranks() {
-            for initializer in &rank.initializers {
-                if let Some(slice) = initializer
-                    .source
-                    .as_ref()
-                    .and_then(|use_| use_.slice.as_ref())
-                {
-                    ids.insert(slice.payload_id.clone());
-                }
-            }
-        }
+        let mut slices = BTreeMap::new();
         for id in ids {
-            self.hash_payload(&id)?;
+            let (file, nbytes) = self.payload_file(&id)?;
+            slices.insert(
+                id,
+                crate::package::container::Slice::new(file.file.clone(), file.start, nbytes)?,
+            );
         }
-        Ok(())
+        Ok(payload_reader::PayloadFiles::from_slices(slices))
     }
     fn executable_reader<'a>(
         &'a self,
@@ -2239,12 +2261,21 @@ impl PayloadVerifiedPackage {
         Ok(document)
     }
 
-    /// Record acceptance and perform the mandatory plaintext checks, plus the optional full
-    /// weight scan.
+    /// Record acceptance and check supporting resources, plus stored weights and tables when
+    /// full verification is requested.
     pub fn authorize(
         self,
         accepted: &str,
         verify_weights: bool,
+    ) -> Result<PayloadAuthorizedPackage> {
+        self.authorize_with_progress(accepted, verify_weights, None)
+    }
+
+    fn authorize_with_progress(
+        self,
+        accepted: &str,
+        verify_weights: bool,
+        progress: Option<&crate::startup::StartupProgress>,
     ) -> Result<PayloadAuthorizedPackage> {
         let Self {
             metadata,
@@ -2274,9 +2305,20 @@ impl PayloadVerifiedPackage {
             executables,
             authorized,
         };
-        source.verify_plaintext()?;
-        if verify_weights {
-            source.verify_weights()?;
+        let payloads = source.verification_payloads(verify_weights)?;
+        let total = payloads.iter().try_fold(0u64, |total, (_, slice)| {
+            total
+                .checked_add(slice.len())
+                .ok_or_else(|| invalid("verification byte count overflow"))
+        })?;
+        let phase = progress.map(|progress| progress.phase("Verify stored data", Some(total)));
+        payloads.verify_with_progress(&|bytes| {
+            if let Some(phase) = &phase {
+                phase.advance_bytes(bytes);
+            }
+        })?;
+        if let Some(phase) = phase {
+            phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
         }
         Ok(PayloadAuthorizedPackage { source, packages })
     }
@@ -3531,6 +3573,49 @@ mod payload_package_tests {
         let rank_one =
             VerifiedPackage::open_tensor_parallel(&root, &publishers, 2, Some(1)).unwrap();
         rank_one.verify_stored_data().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authorization_checks_supporting_resources_and_optional_weight_and_table_bytes() {
+        for (name, optional) in [
+            ("frontend.tokenizer", false),
+            ("globals/rank-1", false),
+            ("engram/shared-weights", true),
+            ("engram/shared-scales", true),
+            ("engram/shard-1-weights", true),
+            ("engram/shard-1-scales", true),
+            ("weights/rank-1", true),
+        ] {
+            for verify_weights in [false, true] {
+                let (root, publishers) = engram_package();
+                let metadata = payload_reader::Metadata::open(&root).unwrap();
+                let location = metadata.locations.locations.iter().find(|location| {
+                    location.file.contains(name) || location.tensor == name
+                }).unwrap();
+                if location.file.is_empty() {
+                    corrupt_primary_tensor(&root, &location.tensor);
+                } else {
+                    corrupt_payload_companion(&root.join(&location.file));
+                }
+                let package = VerifiedPackage::open_tensor_parallel(&root, &publishers, 2, Some(1)).unwrap();
+                let result = package.authorize_with_progress("example", verify_weights, Some(&crate::startup::StartupProgress::silent()));
+                assert_eq!(result.is_err(), !optional || verify_weights, "{name}, verify_weights={verify_weights}");
+                drop(result);
+                drop(metadata);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+
+        let (root, publishers) = engram_package();
+        for name in ["globals/rank-0", "engram/shard-0-weights", "weights/rank-0"] {
+            let metadata = payload_reader::Metadata::open(&root).unwrap();
+            let location = metadata.locations.locations.iter().find(|location| location.file.contains(name)).unwrap();
+            corrupt_payload_companion(&root.join(&location.file));
+        }
+        let package = VerifiedPackage::open_tensor_parallel(&root, &publishers, 2, Some(1)).unwrap();
+        let authorized = package.authorize("example", true).unwrap();
+        drop(authorized);
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -222,6 +222,10 @@ pub struct PayloadFiles {
 }
 
 impl PayloadFiles {
+    pub(crate) fn from_slices(payloads: BTreeMap<Vec<u8>, Slice>) -> Self {
+        Self { payloads }
+    }
+
     pub fn get(&self, id: &[u8]) -> Result<&Slice> {
         self.payloads
             .get(id)
@@ -251,10 +255,23 @@ impl PayloadFiles {
     }
 
     pub fn verify(&self) -> Result<()> {
-        self.verify_with_workers(verification_workers(self.payloads.len()))
+        self.verify_with_progress(&|_| {})
     }
 
+    pub(crate) fn verify_with_progress(&self, progress: &(dyn Fn(u64) + Sync)) -> Result<()> {
+        self.verify_with_workers_and_progress(verification_workers(self.payloads.len()), progress)
+    }
+
+    #[cfg(test)]
     fn verify_with_workers(&self, workers: usize) -> Result<()> {
+        self.verify_with_workers_and_progress(workers, &|_| {})
+    }
+
+    fn verify_with_workers_and_progress(
+        &self,
+        workers: usize,
+        progress: &(dyn Fn(u64) + Sync),
+    ) -> Result<()> {
         let ids: Vec<&[u8]> = self.payloads.keys().map(Vec::as_slice).collect();
         if ids.is_empty() {
             return Ok(());
@@ -263,7 +280,7 @@ impl PayloadFiles {
         if workers == 1 {
             let mut buffer = vec![0u8; container::IO_CHUNK];
             for id in ids {
-                verify_payload(self.payloads.get(id).expect("payload id from map"), id, &mut buffer)?;
+                verify_payload(self.payloads.get(id).expect("payload id from map"), id, &mut buffer, progress)?;
             }
             return Ok(());
         }
@@ -290,7 +307,7 @@ impl PayloadFiles {
                             break;
                         };
                         let source = self.payloads.get(*id).expect("payload id from map");
-                        let result = verify_payload(source, id, &mut buffer);
+                        let result = verify_payload(source, id, &mut buffer, progress);
                         results.lock().expect("verification result mutex")[index] = Some(result);
                     }
                 });
@@ -320,7 +337,12 @@ fn verification_workers(payloads: usize) -> usize {
         .min(payloads)
 }
 
-fn verify_payload(source: &Slice, id: &[u8], buffer: &mut [u8]) -> Result<()> {
+fn verify_payload(
+    source: &Slice,
+    id: &[u8],
+    buffer: &mut [u8],
+    progress: &(dyn Fn(u64) + Sync),
+) -> Result<()> {
     let mut context = digest::Context::new(&digest::SHA256);
     let mut offset = 0u64;
     while offset < source.len() {
@@ -328,6 +350,7 @@ fn verify_payload(source: &Slice, id: &[u8], buffer: &mut [u8]) -> Result<()> {
         source.read_at(offset, &mut buffer[..count])?;
         context.update(&buffer[..count]);
         offset += count as u64;
+        progress(count as u64);
     }
     if context.finish().as_ref() != id {
         return Err(invalid(
@@ -471,6 +494,24 @@ mod tests {
             .collect();
         entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
         entries
+    }
+
+    #[test]
+    fn verification_reports_exact_bytes_with_bounded_chunks() {
+        let directory = Directory::new();
+        let entries: Vec<_> = (0..4u8).map(|byte| {
+            let bytes = vec![byte; container::IO_CHUNK + 17];
+            (PayloadId::of(&bytes), bytes, false)
+        }).collect();
+        let files = payload_files(&directory, &entries);
+        for workers in [1, 4] {
+            let completed = AtomicU64::new(0);
+            files.verify_with_workers_and_progress(workers, &|bytes| {
+                assert!(bytes > 0 && bytes <= container::IO_CHUNK as u64);
+                completed.fetch_add(bytes, Ordering::Relaxed);
+            }).unwrap();
+            assert_eq!(completed.load(Ordering::Relaxed), 4 * (container::IO_CHUNK as u64 + 17));
+        }
     }
 
     #[test]

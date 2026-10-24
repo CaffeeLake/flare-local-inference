@@ -1015,9 +1015,14 @@ Terminal bars use cyan completed segments, dark gray remaining segments, and
 half-cell boundaries. Stages without a known total animate a cyan-to-gray
 gradient across all ten cells.
 The `Verify package` stage times signed metadata authentication before model
-loading. `--verify-weights` adds a timed `Verify stored data` stage after publisher
-acceptance. Executable resources are verified as part of kernel and graph
-preparation.
+loading. After publisher acceptance, payload packages show `Verify stored data`
+for the mandatory frontend and module-global checks. `--verify-weights` includes
+allocation initializer payloads and shared or rank-sharded embedding-table planes
+in that scan. Ordinary loading validates signed table descriptors and file
+bounds without scanning table contents.
+Distinct payloads are hashed by up to eight workers with bounded buffers and
+byte progress. Executable resources are verified as part of kernel and graph
+preparation. Legacy packages show the stored-data stage with `--verify-weights`.
 Memory loading advances by bytes; kernel and execution preparation
 advance by resource counts. Stages with no known total show a cycling bar.
 Completed stages show `[    OK    ]`; a failed stage shows `[  FAILED  ]`.

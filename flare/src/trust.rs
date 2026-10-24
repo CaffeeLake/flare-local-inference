@@ -512,14 +512,8 @@ fn authorize(
             response
         }
     };
-    let phase = args
-        .verify_weights
-        .then(|| progress.phase("Verify stored data", None));
     let publisher = package.publisher().clone();
-    let authorized = package.authorize(&accepted, args.verify_weights)?;
-    if let Some(phase) = phase {
-        phase.finish("stored-data contents");
-    }
+    let authorized = package.authorize_with_progress(&accepted, args.verify_weights, Some(progress))?;
     let entry = Entry {
         fingerprint: fingerprint.clone(),
         namespace: accepted,
