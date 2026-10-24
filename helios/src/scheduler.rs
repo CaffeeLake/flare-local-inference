@@ -83,6 +83,40 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
+fn checkpoint_boundaries(
+    mut boundaries: Vec<usize>,
+    consumed: usize,
+    prompt: usize,
+    budget: usize,
+) -> Vec<usize> {
+    boundaries.retain(|&position| consumed < position && position < prompt);
+    if budget == 0 {
+        return Vec::new();
+    }
+    if boundaries.len() <= budget {
+        return boundaries;
+    }
+    let mut selected = Vec::with_capacity(budget);
+    for index in 1..=budget {
+        let target = consumed
+            + ((prompt - consumed) as u128 * index as u128 / (budget as u128 + 1)) as usize;
+        let right = boundaries.partition_point(|&position| position < target);
+        let position = if right == 0 {
+            boundaries[0]
+        } else if right == boundaries.len()
+            || target - boundaries[right - 1] <= boundaries[right] - target
+        {
+            boundaries[right - 1]
+        } else {
+            boundaries[right]
+        };
+        if selected.last() != Some(&position) {
+            selected.push(position);
+        }
+    }
+    selected
+}
+
 #[derive(Clone, Debug)]
 pub struct SchedulerCapabilities {
     pub vocabulary: usize,
@@ -213,6 +247,7 @@ pub struct LiveRequest {
     prefix_tokens: u64,
     admission_reused_tokens: u64,
     message_boundaries: Vec<usize>,
+    checkpoint_budget: usize,
     message_snapshot: Option<SnapshotId>,
     prompt_snapshot: Option<SnapshotId>,
     boundary_capture: Option<BoundaryCapture>,
@@ -1485,6 +1520,18 @@ impl RequestScheduler {
         } else {
             (RequestPhase::Initialize, None, None, Vec::new())
         };
+        let checkpoint_budget = if self.limits.snapshots == 0 {
+            0
+        } else {
+            (self.limits.snapshots as usize / self.limits.max_active).max(1)
+        };
+        let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
+        let message_boundaries = checkpoint_boundaries(
+            spec.message_boundaries,
+            consumed as usize,
+            spec.prompt.len(),
+            checkpoint_budget.saturating_sub(endpoints),
+        );
         self.slots[slot].generation = generation;
         self.slots[slot].request = Some(LiveRequest {
             image_slot: None,
@@ -1516,7 +1563,8 @@ impl RequestScheduler {
             prefix,
             prefix_tokens: consumed,
             admission_reused_tokens: consumed,
-            message_boundaries: spec.message_boundaries,
+            message_boundaries,
+            checkpoint_budget,
             message_snapshot: None,
             prompt_snapshot: None,
             boundary_capture: None,
@@ -2475,7 +2523,7 @@ impl RequestScheduler {
                 .or_else(|| {
                     (endpoint == request.prompt_tokens as u64
                         && endpoint > request.prefix_tokens
-                        && request.message_boundaries.last() != Some(&request.prompt_tokens)
+                        && request.checkpoint_budget >= 2
                         && request.max_new_tokens > 1)
                         .then_some(BoundaryKind::Prompt)
                 });

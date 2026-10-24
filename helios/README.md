@@ -282,7 +282,11 @@ The plan retains its scheduler identity and each participating request's state
 epoch. Admissions of unrelated requests and timing observations preserve its
 validity; mutation or retirement of a selected request invalidates it.
 Prefill selects among loaded capacities up to `prefill_chunk_size`, using graph
-duration, request age, and useful-progress deficit. Logical lengths pad to the
+duration, request age, and useful-progress deficit. Admission budgets cache
+captures from snapshot capacity divided by configured maximum concurrency,
+reserves prompt and terminal endpoints, and selects remaining message checkpoints
+at approximately equal token distances through the uncached suffix. Only selected
+boundaries interrupt prefill. Logical lengths pad to the
 smallest loaded capacity that covers them. The limit must be 64-aligned, at least 64, and within the context capacity. Decode batches use
 power-of-two capacities through the selected concurrency.
 Prefill, decode cohorts, speculative widths, and mandatory stages compete in

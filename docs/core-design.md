@@ -1368,8 +1368,24 @@ them into the prepared token stream without splitting atomic image spans. Cache
 reuse depends on the actual prepared prefix identity; context-dependent changes
 to earlier tokens cannot reuse a checkpoint for different tokens.
 
+At admission, the scheduler budgets newly captured cache snapshots from the
+loaded snapshot capacity divided by configured maximum concurrency, rounded
+down. A nonempty pool permits at least one capture per request; an empty pool
+permits none. The budget reserves a terminal capture and, when generation can
+continue beyond the prompt and the budget permits, a prompt capture. A single
+output token shares the prompt and terminal endpoint.
+
+The remaining budget selects message checkpoints within the uncached prompt
+suffix. If all eligible boundaries fit, retain them all. Otherwise, place token
+targets at equal intervals between the reused prefix and the prompt end, choose
+the nearest eligible message boundary to each target, and deduplicate the
+results. Equal-distance ties choose the earlier boundary. Only selected boundaries
+interrupt prefill; unselected messages can share a full captured prefill chunk.
+The budget limits new captures, not existing reusable checkpoints or mandatory
+state transfers between conditioned-input windows.
+
 Endpoints are not rounded to token groups or KV pages. The scheduler obtains a
-snapshot destination when it reaches an endpoint, using normal cache eviction.
+snapshot destination when it reaches a selected endpoint, using normal cache eviction.
 If all snapshot slots are pinned, inference continues without publishing that
 checkpoint. The number of messages does not enlarge the prepared snapshot pool.
 
@@ -1432,14 +1448,24 @@ request publishes additional shared ancestors.
 Track logical references separately from outstanding GPU use. A page or slot
 becomes reusable only after both have ended.
 
-Under snapshot pressure, evict unpinned leaves first. If every leaf is pinned,
-remove an ancestor checkpoint with exactly one child and no direct request pin:
+Under snapshot-only pressure, thin checkpoint chains before evicting their
+endpoints. A removable checkpoint has exactly one child and no direct request
+pin. Prefer interior checkpoints over chain roots, and remove the checkpoint
+whose surviving parent and child delimit the shortest token interval. Break
+equal-distance ties by least recent access. This retains sparse history coverage
+while preserving conversation endpoints during long prefills, including endpoints
+of idle conversations. If no chain can be thinned, evict the least recently
+used unpinned leaf, regardless of its age. Endpoint retention is a preference,
+not a reservation that can prevent progress when only endpoints remain.
+Under KV-page pressure, select the least recently used eligible
+leaf or removable ancestor and recheck physical backing after each retirement.
+
+Removing an ancestor transfers its storage without invalidating descendants:
 transfer its ordered page segment and last-use fence to that child, bypass the
 ancestor in the parent chain, and retire only the ancestor snapshot. Descendant
 checkpoint IDs, snapshots, and complete page chains remain valid. The removed
-prefix no longer matches lookups. This bounds snapshot consumption during long
-appended conversations without discarding the longest reusable prefix. Branching
-ancestors and directly pinned checkpoints retain their snapshots.
+prefix no longer matches lookups. Branching ancestors and directly pinned
+checkpoints retain their snapshots.
 
 Maintain resource-specific padding sentinels in the prepared metadata contract.
 Padding must never address another request's writable state.

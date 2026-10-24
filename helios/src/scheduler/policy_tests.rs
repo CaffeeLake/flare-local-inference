@@ -1131,6 +1131,42 @@ fn set_cost(s: &mut RequestScheduler, kind: GraphKind, batch: usize, capacity: u
 }
 
 #[test]
+fn long_conversations_budget_checkpoints_and_cross_unselected_messages() {
+    let mut s = interactive_engine(32, false);
+    let mut handles = Vec::new();
+    for id in 1..=4 {
+        handles.push(s.admit(RequestSpec {
+            prompt: vec![id; 32768],
+            message_boundaries: (32..32768).step_by(32).collect(),
+            conditioning: vec![],
+            max_new_tokens: 2,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        }).unwrap());
+    }
+    let mut full_chunks = 0;
+    let mut prefill_calls = 0;
+    for _ in 0..10000 {
+        if handles.iter().all(|&h| s.request(h).is_err()) {
+            break;
+        }
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            prefill_calls += 1;
+            full_chunks += usize::from(plan.lanes[0].tokens == 4096);
+        }
+    }
+    assert!(handles.iter().all(|&h| s.request(h).is_err()));
+    assert!(s.stats().snapshot_publications <= 4 * 8);
+    assert_eq!(s.stats().message_checkpoints, 4 * 6);
+    assert!(full_chunks >= 4 * 6);
+    assert!(prefill_calls <= 4 * 24, "{prefill_calls} prefill calls, {full_chunks} full chunks");
+    assert_eq!(s.stats().snapshot_evictions, 0);
+}
+
+#[test]
 fn one_two_and_sixteen_long_prefills_use_full_efficient_chunks() {
     for count in [1, 2, 16] {
         let mut s = interactive_engine(count, true);
