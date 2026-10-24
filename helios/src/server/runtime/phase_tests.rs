@@ -2326,6 +2326,60 @@ async fn http_disconnect_while_waiting_cancels_queued_generation() {
 }
 
 #[tokio::test]
+async fn ollama_discovery_uses_bearer_auth_without_generation_admission() {
+    use std::io::{Read, Write};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, Some("serving-key".into()));
+    let permits = state
+        .ingress_slots
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state, &["discovery-model".into()], 1024);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let result = tokio::task::spawn_blocking(move || {
+        for (method, path, body) in [
+            ("GET", "/api/tags", ""),
+            ("POST", "/api/show", r#"{"model":"discovery-model"}"#),
+        ] {
+            for (auth, expected) in [
+                ("", 401),
+                ("Authorization: Bearer wrong-key\r\n", 401),
+                ("x-api-key: serving-key\r\n", 401),
+                ("Authorization: Bearer serving-key\r\n", 200),
+            ] {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                write!(stream,
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let (head, body) = response.split_once("\r\n\r\n").unwrap();
+                let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+                assert_eq!(status, expected, "{path}: {body}");
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                if status == 200 {
+                    if path == "/api/tags" {
+                        assert_eq!(value["models"][0]["model"], "discovery-model");
+                    } else {
+                        assert_eq!(value["model_info"]["general.name"], "discovery-model");
+                    }
+                }
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+    }).await;
+    server.abort();
+    drop(permits);
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
