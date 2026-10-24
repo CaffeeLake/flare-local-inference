@@ -181,6 +181,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "medium"
+    native_dense_activations: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -295,6 +296,7 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
+            "native_dense_activations": self.native_dense_activations,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,

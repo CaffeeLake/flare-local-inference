@@ -76,6 +76,7 @@ def chat_template_asset(hidden_size: int):
 class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     tuning_replica: TuningReplica | None = None
     device: int = 0
     devices: tuple[int, ...] | None = None
@@ -273,7 +274,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers,
+            compile_workers=config.compile_workers, native_dense_activations=config.native_dense_activations,
             tuning_replica=config.tuning_replica,
             device=device,
             checkpoint=identity,

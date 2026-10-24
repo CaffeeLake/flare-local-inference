@@ -177,6 +177,9 @@ def _preparation_arguments(running):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--native-dense-activations", action="store_true",
+                          help="use quantized activations instead of auto precision for dense projections:"
+                               " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4",),
                           help="prepare a separate NVFP4 vocabulary head for learned draft proposals;"
                                " target verification retains its precision (DeepSeek V4/V4.1)")

@@ -50,6 +50,7 @@ from .mtp import PreparedFeedback, PreparedRound
 class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     device: int = 0
@@ -153,6 +154,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "contract": "qwen38-dense.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device, checkpoint=identity,
             workload_schema="qwen38-dense", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)

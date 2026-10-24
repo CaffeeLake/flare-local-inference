@@ -22,6 +22,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity)
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        native_dense_activations=plan.native_dense_activations,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.context,
         stream_overlap=plan.stream_overlap,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,

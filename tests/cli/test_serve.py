@@ -588,3 +588,12 @@ def test_autotune_effort_reaches_plan_and_startup_line(host, capsys, monkeypatch
     assert host["plan"].autotune_effort == effort
     assert host["plan"].to_dict()["autotune_effort"] == effort
     assert f"autotune effort {effort}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_native_dense_activations_reach_plan(host, monkeypatch, native):
+    monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
+    flags = ["--native-dense-activations"] if native else []
+    assert main(["serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
+    assert host["plan"].native_dense_activations is native
+    assert host["plan"].to_dict()["native_dense_activations"] is native

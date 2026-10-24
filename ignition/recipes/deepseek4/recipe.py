@@ -30,6 +30,7 @@ def prepare(
     )
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        native_dense_activations=plan.native_dense_activations,
         devices=tuple(range(plan.world_size)),
         compile_decoder=compile_forwards,
         retain_graphs=retain_graphs,

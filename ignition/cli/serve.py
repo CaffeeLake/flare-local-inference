@@ -196,7 +196,8 @@ def _export_hosts(args, *, export_path, form='directory'):
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
+                   native_dense_activations=args.native_dense_activations)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -261,6 +262,7 @@ def _prepare(args, *, export_path, form='directory'):
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      native_dense_activations=args.native_dense_activations,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -289,7 +291,8 @@ def _prepare(args, *, export_path, form='directory'):
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
-                     f" · autotune effort {plan.autotune_effort}")
+                     f" · autotune effort {plan.autotune_effort}"
+                     f"{' · native dense activations' if plan.native_dense_activations else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -444,7 +447,8 @@ def serve(args) -> int:
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
+                   native_dense_activations=args.native_dense_activations)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus

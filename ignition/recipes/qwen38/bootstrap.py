@@ -69,6 +69,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     device: int = 0
@@ -286,6 +287,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
         compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        native_dense_activations=config.native_dense_activations,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size},
         headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)

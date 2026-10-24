@@ -59,6 +59,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(16))
@@ -226,6 +227,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "world_size": shard.world_size, "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)

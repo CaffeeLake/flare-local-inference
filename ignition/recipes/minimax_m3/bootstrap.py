@@ -52,6 +52,7 @@ def _target_decoder(weights, tables, scratch, metadata, pool, **kwargs):
 class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
@@ -224,7 +225,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "draft": None if weights.config.draft is None else weights.config.draft.text,
             "vision": weights.config.vision if config.vision else None,
             "contract": "minimax-m3.paged-text.v1"}, sort_keys=True).encode()).hexdigest()
-        session = RecordedPreparationSession(compile_workers=config.compile_workers,
+        session = RecordedPreparationSession(compile_workers=config.compile_workers, native_dense_activations=config.native_dense_activations,
             tuning_replica=config.tuning_replica, device=device, checkpoint=identity,
             workload_schema="minimax-m3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage,

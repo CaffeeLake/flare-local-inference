@@ -278,3 +278,10 @@ def test_fabric_transfers_follow_the_chain_shape():
 
     args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--roce-chain"])
     assert _checkpoint_fabric(args) == dict(ring=False, chain=True, streams=8)
+
+
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_native_dense_activations_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).native_dense_activations
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--native-dense-activations"]).native_dense_activations

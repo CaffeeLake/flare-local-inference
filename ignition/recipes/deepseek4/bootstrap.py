@@ -62,6 +62,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
@@ -214,6 +215,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device,
             checkpoint=identity,
             workload_schema="deepseek4-vision",
