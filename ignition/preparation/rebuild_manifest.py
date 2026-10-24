@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from types import MappingProxyType
 import math
+import re
 
 from . import runtime_package_pb2 as proto
 
@@ -93,14 +94,15 @@ def _storage(group, declaration):
 
 
 def declared_views(declaration):
-    """Enumerate declared views with their semantic group and storage class."""
+    """Enumerate declared weight views into layer or misc groups, retaining storage class."""
     import torch
 
     disabled = (-1,)
 
     def walk(value, name, owner, group, storage, ancestors):
         if isinstance(value, torch.Tensor):
-            yield name, owner, value, group, storage
+            payload_group = group if re.fullmatch(r"layer-[0-9]+", group) else "misc"
+            yield name, owner, value, payload_group, storage
             return
         if value is None or id(value) in ancestors:
             return
@@ -183,10 +185,8 @@ def declared_views(declaration):
                 continue
             if not isinstance(layers, (tuple, list, torch.nn.ModuleList)):
                 continue
-            field = declared.rsplit('.', 1)[-1]
-            prefix = field[:-1] if field.endswith('s') else field
             for index, layer in enumerate(layers):
-                group = f'{prefix}-{index:03d}'
+                group = f'layer-{index:03d}'
                 yield from walk(layer, f'{root}.{declared}[{index}]', '', group,
                                 _storage(group, declaration), frozenset())
 

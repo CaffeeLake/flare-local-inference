@@ -48,11 +48,11 @@ COMPONENTS = ('embedding', 'head', 'vision', 'draft')
 def test_layers_and_components_group_by_declaration():
     views = list(declared_views(declare_weights(build(), components=COMPONENTS)))
     groups = {name: group for name, _owner, _tensor, group, _storage in views}
-    assert groups['weights.embedding'] == 'embedding'
+    assert groups['weights.embedding'] == 'misc'
     assert groups['weights.layers[0].attention[\'q\']'] == 'layer-000'
     assert groups['weights.layers[1].mlp'] == 'layer-001'
-    assert groups['weights.vision[\'patch\']'] == 'vision'
-    assert groups['weights.draft'] == 'draft'
+    assert groups['weights.vision[\'patch\']'] == 'misc'
+    assert groups['weights.draft'] == 'misc'
     assert all(storage == STABLE for _n, _o, _t, _g, storage in views)
 
 
@@ -147,7 +147,7 @@ def test_weight_payload_request_is_only_for_declarations():
     assert weight_payload_request(None) is None
     request = weight_payload_request(declare_weights(build(), components=COMPONENTS))
     assert request['version'] == 1
-    assert {view['group'] for view in request['views']} >= {'embedding', 'layer-000'}
+    assert {view['group'] for view in request['views']} >= {'misc', 'layer-000'}
     assert 'weight_payload' not in rebuild_weights_metadata({'weights': build()})
 
 
@@ -182,7 +182,7 @@ def test_dotted_layers_group_attention_norms_and_skip_module_buffers():
         components={'tree.embed_tokens': 'embedding'},
         layers=('tree.layers',))))
     groups = {name: group for name, _owner, _tensor, group, _storage in views}
-    assert groups['weights.tree.embed_tokens'] == 'embedding'
+    assert groups['weights.tree.embed_tokens'] == 'misc'
     assert groups['weights.tree.layers[0].self_attn.q_proj'] == 'layer-000'
     assert groups['weights.tree.layers[0].self_attn.q_norm'] == 'layer-000'
     assert groups['weights.tree.layers[1].input_layernorm'] == 'layer-001'
@@ -195,7 +195,7 @@ def test_mapping_component_is_walked_whole():
     views = list(declared_views(declare_weights(weights,
         components={'projections': 'projections'}, layers=())))
     groups = {name: group for name, _owner, _tensor, group, _storage in views}
-    assert groups["weights.projections['layers.0.q_proj']"] == 'projections'
+    assert groups["weights.projections['layers.0.q_proj']"] == 'misc'
 
 
 def test_unresolved_component_path_fails_loudly():
@@ -533,7 +533,7 @@ def test_qwen_dense_layer_projections_are_grouped_per_layer():
     for _name, _owner, tensor, group, _storage in declared_views(
             declare_weights(roots, components=components, layers=())):
         groups.setdefault(group, []).append(tensor.detach().clone())
-    assert set(groups) == {'embedding', 'norm', 'head', 'layer-000', 'layer-001'}
+    assert set(groups) == {'misc', 'layer-000', 'layer-001'}
     assert 'projections' not in groups
     def contains(group, value):
         return any(tensor.shape == value.shape and torch.equal(tensor, value)
@@ -547,7 +547,7 @@ def test_qwen_dense_layer_projections_are_grouped_per_layer():
 def test_qwen_dense_single_layer_change_keeps_other_layer_payloads():
     before = declared_group_bytes(qwen_dense_weights(first_layer_seed=1.0))
     after = declared_group_bytes(qwen_dense_weights(first_layer_seed=9.0))
-    assert torch.equal(before['embedding'], after['embedding'])
+    assert torch.equal(before['misc'], after['misc'])
     assert torch.equal(before['layer-001'], after['layer-001'])
     assert before['layer-000'].shape == after['layer-000'].shape
     assert not torch.equal(before['layer-000'], after['layer-000'])
@@ -622,3 +622,22 @@ def test_nvfp4_linear_padding_is_not_claimed_to_be_covered():
     assert view["sources"][0]["ranges"] == ((0, 64), (0, 1016))
     assert view["shape"] == [64, 1024]
     assert "padding" not in view
+
+
+def test_nonstandard_layer_field_uses_layer_files_and_other_weights_use_misc():
+    @dataclass
+    class Network:
+        blocks: tuple
+        output: torch.Tensor
+
+    weights = Network((Layer({'q': torch.ones(4)}, torch.ones(4)),), torch.ones(8))
+    views = list(declared_views(declare_weights(weights, components=('output',), layers=('blocks',))))
+    assert {group for _, _, _, group, _ in views} == {'misc', 'layer-000'}
+    assert {name for name, _, _, group, _ in views if group == 'misc'} == {'weights.output'}
+
+
+def test_misc_preserves_stable_and_tuned_storage_classes():
+    declaration = weight_payload_declaration(declare_weights(build(), components=COMPONENTS, tuned=('draft',)))
+    misc = {view['name']: view['storage'] for view in declaration['views'] if view['group'] == 'misc'}
+    assert misc == {'weights.embedding': STABLE, 'weights.head': STABLE,
+                    "weights.vision['patch']": STABLE, 'weights.draft': TUNED}

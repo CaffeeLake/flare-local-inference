@@ -1827,7 +1827,7 @@ fn package_engram(
             for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
                 installed.push(helios_core::package::export::PublishPayload {
                     role: pwire::PayloadRole::Weights,
-                    relative: format!("deployments/{deployment}/engram-{index}-{plane}.safetensors"),
+                    relative: format!("weights/engram-{index}-{plane}.safetensors"),
                     source: helios_core::package::export::pin_file(&materialized.2, materialized.1)?,
                     id: materialized.0,
                     tensor: None,
@@ -4006,6 +4006,13 @@ mod payload_export_tests {
             stored.read_at(slice.offset, &mut bytes).unwrap();
             bytes
         };
+        for (plane, use_) in [("weights", shared.weights.as_ref().unwrap()), ("scales", shared.scales.as_ref().unwrap())] {
+            let id = &use_.slice.as_ref().unwrap().payload_id;
+            let locations: Vec<_> = metadata.locations.locations.iter()
+                .filter(|location| &location.payload_id == id).collect();
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].file, format!("weights/engram-0-{plane}.safetensors"));
+        }
         assert_eq!(read_use(shared.weights.as_ref().unwrap()), shared_weights);
         assert_eq!(read_use(shared.scales.as_ref().unwrap()), shared_scales);
         assert_eq!(

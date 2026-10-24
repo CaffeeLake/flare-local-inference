@@ -293,7 +293,8 @@ rank. Four image slots therefore reserve 320 MiB even with 32 active request slo
 
 N-gram tables use indirect delivery exclusively: every graph consumes compact
 GPU row buffers filled by Helios. Qwen PLE tables are stored once in the package.
-Helios reads the 26.8 GiB table from disk by default on every GPU;
+Helios reads the 26.8 GiB table from disk by default, sharing the reader and
+row cache across local GPUs;
 `flare run --embedding-table-storage ram` keeps it in resident host memory.
 The graph publishes GPU-produced lookup IDs before layer
 0 and waits for row delivery at the layer-1 consumer. Disk and RAM delivery
@@ -330,8 +331,10 @@ without padding. Attention partitions whole output groups: padding eight groups
 to nine gives each rank three groups and 24 heads. The last rank's extra group
 has zero query and output weights; all checkpoint weights and scales remain
 unchanged. Vocabulary shards contain 43136 rows each; the 128 extra gathered
-logits are excluded before sampling. Engram's 24 heads divide evenly across
-three ranks.
+logits are excluded before sampling. Engram's projection input columns divide its 24 heads evenly across three
+ranks. Every host stores full Engram tables in checkpoint row order; local ranks
+share table reads and bounded host caching. Graphs request canonical table rows,
+and each rank selects its head columns for the partial projection before reduction.
 Exports use the native DeepSeek V4.1 prompt encoder and include only the tokenizer
 asset. Vision exports bind the atomic `<｜deepseek_image｜>` token as ID 129264,
 which must agree with checkpoint `image_token_id`. Packages without explicit

@@ -125,7 +125,7 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
     ], cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     if fixture == "runtime_package_fixture.py":
-        assert (original / "package/weights/weight.safetensors").is_file()
+        assert (original / "package/weights/misc.safetensors").is_file()
 
     packed = tmp_path / "packed"
     restored = tmp_path / "restored"
@@ -141,6 +141,20 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
             assert tensors.metadata()["format"] == "flare-payload"
             manifests.append(tensors.get_tensor("flare.manifest").tobytes())
     assert manifests[0] == manifests[1] == manifests[2]
+    if fixture == "fixed_package_fixture.py":
+        from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+        descriptor = tmp_path / 'package-schema.pb'
+        subprocess.run(['protoc', '-I', str(root / 'helios/proto'), '--include_imports',
+                        f'--descriptor_set_out={descriptor}', 'package.proto'], check=True)
+        pool = descriptor_pool.DescriptorPool()
+        for file in descriptor_pb2.FileDescriptorSet.FromString(descriptor.read_bytes()).file:
+            pool.Add(file)
+        envelope_type = message_factory.GetMessageClass(pool.FindMessageTypeByName('flare.package.ProtectedPackage'))
+        rank_type = message_factory.GetMessageClass(pool.FindMessageTypeByName('flare.package.RankBody'))
+        envelope = envelope_type.FromString(manifests[0])
+        rank = rank_type.FromString(envelope.ranks[0].body)
+        assert 'transform' in {function.symbol for function in rank.functions}
+        assert 'assertFile_0' in {symbol.symbol for module in rank.modules for symbol in module.globals}
     companions = sorted(path for path in (original / "package").rglob("*.safetensors")
                         if path.name != "model.safetensors")
     assert companions
@@ -277,14 +291,13 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
         assert b".py\0" not in contents(module.file)
         for symbol in module.globals:
             assert b"/preparation/internal/kernel.py" not in contents(symbol.file)
-    assert all(function.symbol.startswith("_f") for function in document.functions)
     if fixture == "fixed_package_fixture.py":
         assert any(contents(symbol.file).rstrip(b"\0") == b"kernel"
                    for module in document.modules for symbol in module.globals)
         for name in (b"numeric_argument", b"integer_pointer_argument", b"pointer_table_argument",
                      b"transform", b"no_arguments", b"assertFile_0"):
-            assert name not in document.SerializeToString()
-            assert all(name + b"\0" not in contents(module.file) for module in document.modules)
+            assert name in document.SerializeToString()
+            assert any(name + b"\0" in contents(module.file) for module in document.modules)
     if not exec_handover:
         result = subprocess.run([executable, str(tmp_path)],
                                 cwd=root, text=True, capture_output=True, timeout=60)

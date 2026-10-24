@@ -82,7 +82,7 @@ def _rank(rank, sockets, root):
             with session.capture(), torch.cuda.graph(graph):
                 compiled()
             tables = Tables(geometry, tuple(range(32)), {1: sources}, {1: inputs}, {1: mailbox}, sequence,
-                TensorParallelShard(0, 1), {},
+                TensorParallelShard(rank, 4),
                 torch.arange(6144, device=device))
             catalog = tables.resident_catalog()
             buffers = dict(tables.buffers(), output=output, live_count=count, frame_index=frame,

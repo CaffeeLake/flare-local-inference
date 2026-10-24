@@ -2771,18 +2771,10 @@ pub(crate) fn capture_rank(
     let mut downloader = Downloader::new(&cuda)?;
     for (index, (name, image)) in modules.into_iter().enumerate() {
         let file = format!("module-{index}.cubin");
-        let (exported, symbols) = cubin::redact_symbols(&cubin::strip_debug(&image)?)?;
+        let exported = cubin::strip_debug(&image)?;
         module_bytes += exported.len() as u64;
         module_phase.advance_bytes(exported.len() as u64);
         fs::write(stage.path.join(&file), exported)?;
-        for function in &mut output.index.ranks[0].functions {
-            if function.module == name {
-                function.symbol = symbols
-                    .get(&function.symbol)
-                    .unwrap_or(&function.symbol)
-                    .clone();
-            }
-        }
         let kernel = kernels
             .iter()
             .find(|k| k.module == name)
@@ -2852,7 +2844,7 @@ pub(crate) fn capture_rank(
             writer.flush()?;
             other_resources.push((data_file.clone(), file_source(path)?));
             globals.push(wire::Global {
-                symbol: symbols.get(&symbol).unwrap_or(&symbol).clone(),
+                symbol,
                 file: data_file,
                 nbytes: size as u64,
                 relocations: vec![],

@@ -560,8 +560,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "mla_compute_mode": config.mla_compute_mode,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
-        "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264
-                               for ordinal in range(len(tables.sources))),
+        "offloaded_bytes": sum(source.nbytes for pair in tables.sources.values() for source in pair),
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
         "preparation_state_bytes": int(pool.memory_capacity[0].item()) * layout.row_bytes,

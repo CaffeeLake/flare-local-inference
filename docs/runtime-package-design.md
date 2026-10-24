@@ -66,7 +66,7 @@ frontend metadata, and resource owners. File-backed embedding tables supply
 checkpoint ranges; generated tokenizer and template assets supply text.
 Heliopause owns CUPTI callbacks, graph introspection, pointer reachability,
 device-to-host transfers, graph and package serialization, asset materialization,
-cubin redaction, hashing, compression, signing, conversion, rank payload channels,
+cubin debug stripping, hashing, compression, signing, conversion, rank payload channels,
 and publication. Export retains graph templates, storage, contexts, and their
 Python owners until native CUDA work has drained. A failed drain retains those
 owners. Final assembly consumes rank indexes and open source file ranges

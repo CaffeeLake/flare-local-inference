@@ -39,11 +39,12 @@ payload locations is packed form.
 model/
   model.safetensors
   weights/
-    embedding.safetensors
+    misc.safetensors
     layer-000.safetensors
     layer-001.safetensors
     ...
-    output.safetensors
+    engram-0-weights.safetensors
+    engram-0-scales.safetensors
     tuned/
       gb202-tp1/rank-0/layer-000.safetensors
     tp2/
@@ -68,10 +69,21 @@ model/
 
 Names illustrate semantic roles; absent roles produce no empty file. A model
 whose smallest exported deployment is TP2 uses rank subdirectories for its
-canonical weights. Tied embedding and output storage is stored once. A layer
-file includes its attention, MLP or expert weights, norms, and stable scales.
+canonical weights. A layer file includes its attention, MLP or expert weights,
+norms, and stable scales. Other ordinary weights share `misc.safetensors`,
+including token embeddings, output projections, and components outside declared
+layers. Aliased storage is stored once within the captured ownership catalog.
 Tuning-dependent layouts occupy separate payloads. TP-specific files exist only
 for byte-distinct layouts required by selected deployments.
+
+Offloaded DeepSeek Engram and Qwen PLE tables remain separate from ordinary
+weight groups. Each full table uses `weights/engram-<index>-weights.safetensors`
+and `weights/engram-<index>-scales.safetensors`, with checkpoint row ordering
+independent of TP size. Every host receives the full table; local ranks share
+its reader and row cache. Disk backing requires only bounded staging and row
+cache memory. DeepSeek retains its TP-sharded projection and reduction, while
+its graph requests use canonical full-table row IDs on every rank. Existing
+packages with partition-local table rows retain their recorded execution layout.
 
 Hardware names in deployment IDs and cache-entry names use device identifiers
 such as `gb202` and `gb10`, producing names such as `gb202-tp1` and `gb10-tp2`.
@@ -313,7 +325,9 @@ bytes exactly. They validate their inputs and final closure. Identity promotion
 through `ignition sign` remains a signing operation and is not equivalent to
 container conversion.
 
-The exporter writes each executable resource as one zstd frame at level 3.
+The exporter preserves kernel and global symbol names in cubins and their
+execution bindings. Cubin debug sections and assertion source paths are stripped.
+Each executable resource is written as one zstd frame at level 3.
 `ExecutableResource.stored` addresses the frame and `decoded_nbytes` is its
 signed decoded length. `chunk_nbytes` is 4 MiB and `chunk_sha256` holds the
 SHA-256 of each compressed chunk, with count
@@ -356,8 +370,8 @@ capacity-dependent padding, and tuning-dependent layouts. Shard-local quantized
 weights may be stable within one TP deployment without being shareable across
 different TP sizes. The exporter never requantizes to force sharing.
 
-Owners are ordered deterministically within their semantic layer or top-level
-component. All stable families in a layer share its payload. Group sizes never
+Owners are ordered deterministically within their declared layer or the
+`misc` group for weights outside layers. All stable families in a layer share its payload. Group sizes never
 cause adjacent layers to merge. A change to one layer cannot shift another
 layer's payload boundaries. Tuning-dependent representations are grouped
 separately and name their deployment and rank when necessary.

@@ -97,12 +97,6 @@
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
 
-[ ] Immediately after completing payload-package implementation and validation,
-    use one shared DeepSeek Engram table and host reader/cache for single-node
-    TP, retaining per-GPU head ownership and partial projections. Keep partitioned
-    table storage for multi-node TP; package metadata and prepared row mappings
-    must match each layout. See package-format-design.md.
-
 [ ] Measure cross-host rank handoff polling and completion yielding: CPU time,
     request p99, and complete-round latency under active and idle workloads.
     See helios/src/execution/parallel.rs and performance-work.md.
