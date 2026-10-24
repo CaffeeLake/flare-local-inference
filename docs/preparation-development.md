@@ -18,6 +18,14 @@ Recipe and execution-component changes also require
   plans through `register_finalizer`. Scratch sizing and serving bindings must
   follow tuning.
 
+`RecordedPreparationSession` uses `PreparationSession(prime=False)`. Selected
+plans still materialize, construct prepare-call bindings, retain owners, and
+run restore/close hooks, but skip the call's reset, activation production, and
+execution. Factories must construct required resources without depending on
+those execution hooks. Tuning candidates and retained benchmark calls still
+prime. Complete-forward warmup in `capture_forwards` runs every selected variant
+before the session's capture guard forbids further kernel resolution.
+
 ## Startup progress
 
 - Show startup work through `ignition.progress.phase`. Weight loading and kernel

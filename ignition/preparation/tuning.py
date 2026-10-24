@@ -44,6 +44,9 @@ class RecordedPreparationSession(PreparationSession):
     All kernels prepare in one batch using b12x's declaration coalescing and
     compiler pool. Finalizers bind the selected plans after the shared scratch
     arena has its serving capacity.
+
+    Selected plans materialize without per-operation priming. Complete forwards
+    warm their execution paths before capture; tuning candidates still prime.
     """
 
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
@@ -64,7 +67,7 @@ class RecordedPreparationSession(PreparationSession):
         self.native_dense_activations = native_dense_activations
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
-                             namespace=identity, race_budget=race_budget,
+                             namespace=identity, race_budget=race_budget, prime=False,
                              collective_barrier=None if coordinator is None else coordinator.barrier)
         if type(headroom_bytes) is not int or headroom_bytes < 0:
             raise ValueError("headroom_bytes must be a nonnegative byte count")
