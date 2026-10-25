@@ -1,3 +1,7 @@
+[ ] Validate full-width INT64 expert IDs in b12x W4A16 route packing,
+    reductions, and MoE calibration. These paths narrow IDs before range
+    checks; add captured replay coverage for IDs outside the INT32 range.
+
 [ ] Exercise per-message checkpoint restore and prefill graph selection through
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
