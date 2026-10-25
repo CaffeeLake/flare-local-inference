@@ -23,6 +23,7 @@ def test_candidate_cohort_reuses_exact_operands_and_one_arena(monkeypatch, token
               ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
                "w1_alphas", "w2_alphas", "a1_gscale", "a2_gscale")}
     experts = SimpleNamespace(num_experts=512, has_csf_blocks=False,
+                              plan=SimpleNamespace(activation=SimpleNamespace(outer_scale="tensor")),
                               _impl=SimpleNamespace(**planes, representation=None, nvfp4_csf=None))
     arena = ScratchArena("cpu")
     arena.reserve(256)
