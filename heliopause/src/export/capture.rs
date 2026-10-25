@@ -1551,6 +1551,34 @@ fn with_allocation_commits<T>(
     })
 }
 
+fn allocation_scan_ranges(
+    allocation: &Allocation,
+    reused_numeric: &[(u64, u64)],
+) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    let retained = allocation
+        .snapshot_spans
+        .clone()
+        .unwrap_or_else(|| vec![(0, allocation.nbytes)]);
+    let mut read = Vec::new();
+    let mut reused = Vec::new();
+    for (offset, length) in retained {
+        let start = allocation.address + offset;
+        let end = start + length;
+        read.extend(
+            subtract_ranges(start, end, reused_numeric)
+                .into_iter()
+                .map(|(begin, stop)| (begin - allocation.address, stop - begin)),
+        );
+        for &(begin, stop) in reused_numeric {
+            let begin = begin.max(start);
+            let stop = stop.min(end);
+            if begin < stop {
+                reused.push((begin - allocation.address, stop - begin));
+            }
+        }
+    }
+    (read, reused)
+}
 fn write_allocation(
     downloader: &mut Downloader<'_>,
     allocation: &Allocation,
@@ -1560,22 +1588,20 @@ fn write_allocation(
     commits: Option<&std::sync::mpsc::SyncSender<AllocationCommit>>,
     required: bool,
     persist: bool,
+    reused_numeric: &[(u64, u64)],
     phase: &helios_core::startup::Phase,
     scanned: &mut u64,
 ) -> ExportResult<(Option<FileSource>, Vec<(u64, u64)>)> {
     if allocation.initialize == "zero" {
         return Ok((None, vec![]));
     }
-    let mut stored: Vec<(u64, u64)> = Vec::new();
+    let (spans, mut stored) = allocation_scan_ranges(allocation, reused_numeric);
+    phase.advance_bytes(stored.iter().map(|&(_, length)| length).sum());
     let mut file = if !persist || store.is_some() {
         None
     } else {
         Some(BufWriter::new(File::create(path)?))
     };
-    let spans = allocation
-        .snapshot_spans
-        .clone()
-        .unwrap_or_else(|| vec![(0, allocation.nbytes)]);
     let mut written_since_flush = 0usize;
     downloader.for_each(allocation, &spans, |offset, data| {
         reach.contents(allocation, offset, data)?;
@@ -1604,6 +1630,8 @@ fn write_allocation(
         }
         Ok(())
     })?;
+    let stored: Vec<_> = merge_ranges(stored.into_iter().map(|(start, length)| (start, start + length)).collect())
+        .into_iter().map(|(start, end)| (start, end - start)).collect();
     let size = stored.iter().map(|&(_, n)| n).sum();
     if let Some(file) = &mut file {
         flush_payload(file)?;
@@ -1813,6 +1841,13 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
     }
 }
 
+#[cfg(test)]
+pub(super) fn resolve_staged_weight_payload(
+    request: &CaptureRequest,
+    output: &mut RankOutput,
+) -> ExportResult<Option<WeightPayloadSources>> {
+    resolve_weight_payload(request, output, None)
+}
 fn resolve_weight_payload(
     request: &CaptureRequest,
     output: &mut RankOutput,
@@ -1848,10 +1883,6 @@ fn resolve_weight_payload(
         Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
         None => None,
     };
-    let root = match request.options.cache.as_ref() {
-        Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
-        None => None,
-    };
     let retained = match device {
         Some(_) => HashMap::new(),
         None => retained_sources(&output.index.ranks[0])?,
@@ -1866,10 +1897,14 @@ fn resolve_weight_payload(
         None => (None, &[][..]),
     };
     let mut reader = RetainedReader::new(&retained, &parts);
+    let reused = request.options.reuse_weights.as_ref().map(|source| source.groups(
+        request, output, &catalog, &WeightPayloadSources { views: views.clone(), ..Default::default() },
+    )).transpose()?;
     let mut payloads: Vec<(bool, String, weight_payload::StorageClass, &[weight_payload::PayloadSpan])> =
         catalog
             .groups
             .iter()
+            .filter(|_| reused.is_none())
             .map(|group| (true, group.name.clone(), group.storage, group.spans.as_slice()))
             .chain(std::iter::once((
                 false,
@@ -2053,8 +2088,11 @@ fn resolve_weight_payload(
         spans: Vec::new(),
         payload_id: Vec::new(),
     });
+    let cached = reused.as_ref().map(|groups| groups.iter().map(|group|
+        helios_core::package::schema::wire::PayloadDescriptor { id: group.payload_id.clone(), nbytes: group.nbytes }).collect()).unwrap_or_default();
     let sources = WeightPayloadSources {
-        groups,
+        cached, engram: output.weight_payload.as_ref().and_then(|sources| sources.engram.clone()),
+        groups: reused.unwrap_or(groups),
         initial_state,
         views,
     };
@@ -2466,7 +2504,7 @@ pub(crate) fn capture_rank(
     if request.sources && request.publisher.is_some() {
         return Err(invalid("a signed package cannot reference staged sources"));
     }
-    if request.options.no_weights && request.options.cache.is_none() {
+    if (request.options.no_weights || request.options.reuse_weights.is_some()) && request.options.cache.is_none() {
         return Err(invalid(
             "export without weight writes requires a package cache",
         ));
@@ -2956,6 +2994,7 @@ pub(crate) fn capture_rank(
     // validates reachability and records sparse spans, and owner bytes are read
     // through the live downloader later.
     let cache_scan = request.weight_payload.is_some() && request.options.cache.is_some();
+    let reused_numeric = super::weight_reuse::numeric_ranges(request, &allocations)?;
     let budget = super::io::IoBudget::for_capture(local_ranks)?;
     let store = if cache_scan {
         None
@@ -2991,6 +3030,7 @@ pub(crate) fn capture_rank(
                     commits,
                     request.options.no_weights,
                     !cache_scan,
+                    &reused_numeric,
                     &storage_phase,
                     &mut scanned,
                 )?;
@@ -3063,21 +3103,23 @@ pub(crate) fn capture_rank(
     downloader.drain()?;
     cuda.synchronize()?;
     storage_phase.finish(format!("{scanned} bytes scanned, {} bytes downloaded, {stored_bytes} bytes stored; {} allocations omitted", downloader.downloaded - storage_download_start + committed_downloads, allocations.len() - output.allocations.len()));
-    let weight_phase = progress.phase("Materialize weight payloads", None);
+    let weight_phase = progress.phase(if request.options.reuse_weights.is_some() {
+        "Reuse cached weight payloads"
+    } else { "Materialize weight payloads" }, None);
     let device_allocations = output.allocations.clone();
-    output.weight_payload = resolve_weight_payload(
-        &request,
-        &mut output,
-        if cache_scan {
-            Some((&mut downloader, device_allocations.as_slice()))
-        } else {
-            None
-        },
-    )?;
-    weight_phase.finish("");
+    if request.options.reuse_weights.is_none() {
+        output.weight_payload = resolve_weight_payload(
+            &request,
+            &mut output,
+            if cache_scan {
+                Some((&mut downloader, device_allocations.as_slice()))
+            } else {
+                None
+            },
+        )?;
+    }
     output.hardware = current_platform(&cuda)?;
     drop(store);
-    drop(downloader);
     let granule = request.granularity.max(1 << 30);
     let reservations = if request.reservations.is_empty() {
         merge_ranges(
@@ -3118,6 +3160,12 @@ pub(crate) fn capture_rank(
         append_resource(&mut output, name, source)?;
     }
     super::binding::finish_rank(request, &mut output)?;
+    if request.options.reuse_weights.is_some() {
+        output.weight_payload = resolve_weight_payload(request, &mut output,
+            Some((&mut downloader, device_allocations.as_slice())))?;
+    }
+    weight_phase.finish("");
+    drop(downloader);
     if let Some(recorder) = recorder {
         recorder.check_error()?;
     }
@@ -3165,6 +3213,18 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         }
+    }
+
+    #[test]
+    fn allocation_scan_preserves_state_and_skips_only_reused_numeric_weights() {
+        let mut allocation = allocation("weights-and-state", 0x1000, 512);
+        allocation.snapshot_spans = Some(vec![(0, 128), (256, 256)]);
+        let (read, reused) = allocation_scan_ranges(&allocation, &[(0x1020, 0x1040), (0x1100, 0x1180)]);
+        assert_eq!(read, vec![(0, 32), (64, 64), (384, 128)]);
+        assert_eq!(reused, vec![(32, 32), (256, 128)]);
+        let (read, reused) = allocation_scan_ranges(&allocation, &[]);
+        assert_eq!(read, vec![(0, 128), (256, 256)]);
+        assert!(reused.is_empty());
     }
     #[test]
     fn weight_allocations_use_live_addresses_for_relocatable_storage() {
@@ -3693,6 +3753,7 @@ mod tests {
                                 commits,
                                 false,
                                 true,
+                                &[],
                                 &phase,
                                 &mut scanned,
                             )?;
@@ -3727,6 +3788,7 @@ mod tests {
                         commits,
                         false,
                         true,
+                        &[],
                         &phase,
                         &mut scanned,
                     )?;

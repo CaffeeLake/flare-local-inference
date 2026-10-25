@@ -457,8 +457,8 @@ class HostRankGroup:
             roots = [Path(native_stage.rank_path(rank))
                      for rank in range(self.rendezvous.world)]
             for control in self.controls:
-                send_object(control, ("export", options))
-            with export_options(settings.cache, no_weights=settings.no_weights):
+                send_object(control, ("export", options, settings))
+            with export_options(settings.cache, no_weights=settings.no_weights, reuse_weights=settings.reuse_weights):
                 package = export_model(self.model, images, storage, roots[0], options=options,
                                        progress=progress, sources=True)
                 channels = [[self.checkpoint_fabric.readers[rank, stream].channel
@@ -662,14 +662,15 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
             from .runtime_package import export_model
             from .package_snapshot import export_options
 
-            _, options = command
+            _, options, settings = command
             native_stage = flare_heliopause.NativeExportStage(
                 None, export_staging, package_cache)
             try:
                 path = Path(native_stage.rank_path(rank))
                 if progress is not None:
                     progress(f"exporting rank {rank}")
-                context = export_options(package_cache) if package_cache is not None else contextlib.nullcontext()
+                context = export_options(package_cache, no_weights=settings.no_weights,
+                    reuse_weights=settings.reuse_weights) if package_cache is not None else contextlib.nullcontext()
                 with context:
                     package = export_model(model, recorder, storage, path, options=options,
                                            bundle_only=True, sources=True)

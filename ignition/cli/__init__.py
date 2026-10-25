@@ -30,8 +30,13 @@ def _parser() -> argparse.ArgumentParser:
         return subparser
 
     exporting = command("export", serve.export, "prepare a native model package in the shared cache")
-    exporting.add_argument("--no-weights", action="store_true",
+    weights = exporting.add_mutually_exclusive_group()
+    weights.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
+    weights.add_argument("--reuse-weights", action="store_true",
+                        help="reuse the cached default version's weight hashes and layouts without hashing live weights")
+    exporting.add_argument("--publisher-key", dest="publisher_keys", action="append", type=Path, default=[],
+                           help="public publisher profile authenticating the cached weight source")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
     _preparation_arguments(exporting)

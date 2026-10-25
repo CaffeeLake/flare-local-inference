@@ -84,7 +84,7 @@ struct PublicProfile {
     development: bool,
 }
 
-fn payload_publishers(profiles: &str) -> Result<Vec<helios_core::runtime_package::Publisher>> {
+pub(crate) fn payload_publishers(profiles: &str) -> Result<Vec<helios_core::runtime_package::Publisher>> {
     let profiles: Vec<PublicProfile> = serde_json::from_str(profiles)?;
     profiles
         .into_iter()

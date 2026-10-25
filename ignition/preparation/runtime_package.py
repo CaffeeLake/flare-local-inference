@@ -144,8 +144,12 @@ def _graphs(graphs):
             for name, graph in graphs.items()]
 
 
-def _cache_options(cache):
-    return dict(cache=None if cache is None else str(cache.cache), no_weights=False if cache is None else cache.no_weights)
+def _cache_options(cache, options=None):
+    reuse = None if cache is None else cache.reuse_weights
+    if reuse is not None:
+        reuse = dict(reuse, rebuild_manifest=None if options is None else options.get('rebuild_manifest'))
+    return dict(cache=None if cache is None else str(cache.cache), no_weights=False if cache is None else cache.no_weights,
+                reuse_weights=reuse)
 
 
 def _cupti_path():
@@ -223,7 +227,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
         weight_payload=weight_payload_request(getattr(prepared, "rebuild_weights", None)),
-        options=_cache_options(cache), sources=sources)
+        options=_cache_options(cache, options), sources=sources)
     package = RuntimePackage(allocations=allocations, modules={}, kernels=(), owners=(prepared, storage, images))
     package.source_path = Path(path)
     package._capture(request, package.owners, images.native)

@@ -13,11 +13,12 @@ _OPTIONS = ContextVar('package_snapshot_options', default=None)
 class ExportOptions:
     cache: Path
     no_weights: bool = False
+    reuse_weights: dict | None = None
 
 
 @contextmanager
-def export_options(cache, *, no_weights=False):
-    token = _OPTIONS.set(ExportOptions(Path(cache), no_weights))
+def export_options(cache, *, no_weights=False, reuse_weights=None):
+    token = _OPTIONS.set(ExportOptions(Path(cache), no_weights, reuse_weights))
     try:
         yield
     finally:

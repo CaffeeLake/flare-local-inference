@@ -270,6 +270,12 @@ pub(crate) fn source_payload_ids(path: &Path) -> Result<Vec<helios_core::package
     let record: Sources = serde_json::from_reader(BufReader::new(File::open(path)?))?;
     let mut ids = Vec::new();
     if let Some(sources) = record.weight_payload.as_ref() {
+        if let Some(engram) = &sources.engram {
+            for source in super::weight_reuse::engram_uses(engram) {
+                let slice = source.slice.as_ref().ok_or_else(|| invalid("cached Engram plane has no slice"))?;
+                ids.push(helios_core::package::PayloadId::from_bytes(slice.payload_id.as_slice().try_into()?));
+            }
+        }
         for group in sources
             .groups
             .iter()
@@ -793,8 +799,17 @@ pub(crate) fn publish_payload(
             assets,
             deployments: vec![],
         };
+        let cache_root = match cache.as_deref() {
+            Some(path) => Some(helios_core::package::cache::Root::open(path)?),
+            None => None,
+        };
+        let mut leases = Vec::new();
         let mut engram_payloads = Vec::new();
-        let engram = index
+        let reused_engram = ranks[0].weight_payload.as_ref().and_then(|sources| sources.engram.as_ref());
+        let engram = if let Some(engram) = reused_engram {
+            Some(cached_engram(engram, cache_root.as_ref().ok_or_else(|| invalid("Engram reuse requires the package cache"))?,
+                &deployment_id, &mut engram_payloads, &mut leases)?)
+        } else { index
             .engram
             .as_ref()
             .map(|engram| {
@@ -806,7 +821,7 @@ pub(crate) fn publish_payload(
                     &mut engram_payloads,
                 )
             })
-            .transpose()?;
+            .transpose()? };
         let needs_cache = ranks.iter().any(|rank| {
             rank.weight_payload.as_ref().is_some_and(|sources| {
                 sources
@@ -816,10 +831,6 @@ pub(crate) fn publish_payload(
                     .any(|group| !group.payload_id.is_empty())
             })
         });
-        let cache_root = match cache.as_deref() {
-            Some(path) => Some(helios_core::package::cache::Root::open(path)?),
-            None => None,
-        };
         if needs_cache && cache_root.is_none() {
             return Err(invalid(
                 "declared capture payloads require the package cache; use --model-cache",
@@ -827,7 +838,6 @@ pub(crate) fn publish_payload(
         }
         // Cache object leases stay alive until publication completes, so GC cannot unlink a declared
         // payload between lookup and its slice reaching the publisher.
-        let mut leases = Vec::new();
         let mut rank_plans = Vec::with_capacity(ranks.len());
         for (position, rank) in ranks.iter().enumerate() {
             assembly.detail(format!("rank {position}"));
@@ -870,6 +880,28 @@ pub(crate) fn publish_payload(
             no_weights,
         };
         assembly.finish(format!("{rank_count} ranks"));
+        let reuse = ranks.iter().any(|rank| rank.weight_payload.as_ref()
+            .is_some_and(|sources| !sources.cached.is_empty() || sources.engram.is_some()));
+        let cached_weights: Vec<_> = if reuse {
+            let mut ids = BTreeSet::new();
+            for rank in ranks {
+                if let Some(sources) = &rank.weight_payload {
+                    for descriptor in &sources.cached {
+                        ids.insert(helios_core::package::PayloadId::from_bytes(descriptor.id.as_slice().try_into()?));
+                    }
+                    if let Some(engram) = &sources.engram {
+                        for source in super::weight_reuse::engram_uses(engram) {
+                            let slice = source.slice.as_ref().ok_or_else(|| invalid("cached Engram plane has no slice"))?;
+                            ids.insert(helios_core::package::PayloadId::from_bytes(slice.payload_id.as_slice().try_into()?));
+                        }
+                    }
+                }
+            }
+            leases.iter().filter(|object| ids.contains(&object.id())).cloned().collect()
+        } else { Vec::new() };
+        let cached_sources: Vec<_> = cached_weights.iter().map(|object|
+            super::io::Source::from_file(object.file().clone(), object.slice().offset(), object.length()))
+            .collect::<Result<_>>()?;
         if let Some(cache) = &cache {
             let root = helios_core::package::cache::Root::open(cache)?;
             // The cache owns model-key encoding: an unusable identity is an
@@ -882,11 +914,19 @@ pub(crate) fn publish_payload(
             )
             .ok_or_else(|| invalid("export naming requires a supported platform"))?;
             let mut staging_entry = root.stage_named(&model, &candidate)?;
-            let published = payload_export::publish(
+            let published = if reuse { payload_export::publish_reusing_cached_weights(
+                &request, publisher.signing_key(),
+                payload_export::Destination::Cache(&root, &mut staging_entry), &cached_weights,
+            )? } else { payload_export::publish(
                 &request,
                 publisher.signing_key(),
                 payload_export::Destination::Cache(&root, &mut staging_entry),
-            )?;
+            )? };
+            for source in &cached_sources {
+                if !source.identity().same_content(&super::io::Identity::of(&source.file)?) {
+                    return Err(invalid("cached weight source changed during publication"));
+                }
+            }
             let commit = progress.phase("Commit package", None);
             let payload_ids: Vec<String> = published
                 .payloads
@@ -1239,6 +1279,58 @@ fn safe_group(name: &str) -> Result<String> {
     }
 }
 
+fn cached_engram(
+    engram: &helios_core::package::schema::wire::Engram,
+    root: &helios_core::package::cache::Root,
+    deployment: &str,
+    installed: &mut Vec<helios_core::package::export::PublishPayload>,
+    leases: &mut Vec<helios_core::package::cache::PayloadObject>,
+) -> Result<helios_core::package::schema::wire::Engram> {
+    use helios_core::package::{PayloadId, export::PublishPayload, schema::wire as pwire};
+    for (index, table) in engram.tables.iter().enumerate() {
+        let mut planes = vec![
+            (
+                format!("weights/engram-{index}-weights.safetensors"),
+                &table.weights,
+            ),
+            (
+                format!("weights/engram-{index}-scales.safetensors"),
+                &table.scales,
+            ),
+        ];
+        for (position, shard) in table.shards.iter().enumerate() {
+            planes.extend([(format!("deployments/{deployment}/engram-{index}-shard-{position}-weights.safetensors"), &shard.weights),
+                (format!("deployments/{deployment}/engram-{index}-shard-{position}-scales.safetensors"), &shard.scales)]);
+        }
+        for (relative, source) in planes {
+            let Some(source) = source else { continue };
+            let slice = source
+                .slice
+                .as_ref()
+                .ok_or_else(|| invalid("cached Engram plane has no slice"))?;
+            let id = PayloadId::from_bytes(slice.payload_id.as_slice().try_into()?);
+            let object = root
+                .payload(id)?
+                .ok_or_else(|| invalid(format!("missing cached Engram payload {id}")))?;
+            if slice
+                .offset
+                .checked_add(slice.nbytes)
+                .is_none_or(|end| end > object.length())
+            {
+                return Err(invalid("cached Engram plane exceeds its payload object"));
+            }
+            installed.push(PublishPayload {
+                role: pwire::PayloadRole::Weights,
+                relative,
+                source: object.slice().clone(),
+                id,
+                tensor: None,
+            });
+            leases.push(object);
+        }
+    }
+    Ok(engram.clone())
+}
 fn package_engram(
     engram: &wire::Engram,
     payload: &[FilePart],
@@ -1915,7 +2007,7 @@ fn materialize_span(
     Ok(path)
 }
 
-fn convert_prepared(
+pub(crate) fn convert_prepared(
     catalog: &wire::RebuildWeights,
     bundle: &wire::BundleIndex,
     groups: Option<&super::WeightPayloadSources>,
@@ -2667,6 +2759,277 @@ mod payload_export_tests {
     }
 
     #[test]
+    fn reuse_weights_publishes_cached_payloads_without_live_weight_sources() -> Result<()> {
+        use crate::export::{
+            CaptureRequest, WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources,
+        };
+        use helios_core::package::{PayloadId, cache::Root};
+        let directory = tempfile::tempdir()?;
+        let root = Root::open(directory.path().join("cache"))?;
+        assert!(super::super::weight_reuse::open_source(root.path(), "model", "[]").is_err());
+        let stages = directory.path().join("stages");
+        fs::create_dir_all(&stages)?;
+        let mut rank = staged_rank(&stages);
+        let rebuild = wire::RebuildManifest {
+            version: 1,
+            recipe: "fixture".into(),
+            checkpoint_repository: "fixture/model".into(),
+            checkpoint_revision: "revision-a".into(),
+            tensor_parallel: 1,
+            ..Default::default()
+        };
+        rank.index.rebuild = Some(rebuild.clone());
+        rank.index.ranks[0].rebuild_weights = Some(wire::RebuildWeights {
+            version: 1,
+            tensors: (0..4)
+                .map(|index| wire::RebuildTensor {
+                    name: format!("weight-{index}"),
+                    dtype: "uint8".into(),
+                    element_bytes: 1,
+                    shape: vec![16],
+                    stride: vec![1],
+                    storage: Some(wire::Reference {
+                        allocation: "device-0".into(),
+                        offset: index * 16,
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            unavailable: vec![],
+        });
+        let mut groups = Vec::new();
+        let mut views = Vec::new();
+        for index in 0..2u64 {
+            let group_name = ["embedding", "layer-000"][index as usize];
+            let bytes = vec![index as u8 + 1; 32];
+            let id = PayloadId::of(&bytes);
+            root.insert_payload(id, 32, std::io::Cursor::new(bytes))?;
+            groups.push(WeightPayloadGroup {
+                name: group_name.into(),
+                storage: if index == 0 { "stable" } else { "tuned" }.into(),
+                nbytes: 32,
+                payload_id: id.as_bytes().to_vec(),
+                spans: (0..2)
+                    .map(|part| WeightPayloadSourceSpan {
+                        allocation: "device-0".into(),
+                        destination_offset: index * 32 + part * 16,
+                        source_offset: part * 16,
+                        nbytes: 16,
+                    })
+                    .collect(),
+            });
+            for part in 0..2 {
+                views.push(serde_json::json!({
+                    "name":format!("weight-{}",index * 2 + part),"group":group_name,
+                    "storage":if index == 0 {"stable"} else {"tuned"},
+                    "element_bytes":1,"shape":[16],"stride":[1],"address":0x1000 + index * 32 + part * 16,
+                }));
+            }
+        }
+        rank.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
+            groups: groups.clone(),
+            views: views
+                .iter()
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<_, _>>()?,
+            initial_state: WeightPayloadGroup {
+                name: "initial-state".into(),
+                storage: "state".into(),
+                ..Default::default()
+            },
+        });
+        let first = publish_payload(
+            Path::new(""),
+            &[rank.clone()],
+            vec![],
+            None,
+            &publisher(),
+            Some(root.path().to_path_buf()),
+            false,
+            "directory",
+        )?;
+        let signer = publisher();
+        let profiles = serde_json::json!([{"namespace":signer.namespace,"name":"fixture",
+            "public_key":signer.public_key(),"development":false}])
+        .to_string();
+        let source = super::super::weight_reuse::open_source(root.path(), "model", &profiles)?;
+        let mut metadata = serde_json::to_value(&source.source)?;
+        metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
+            "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":1});
+        // Live sources contain only fresh state; the weight bytes cannot be read here.
+        fs::write(stages.join("storage-0.bin"), vec![0x77u8; 32])?;
+        let bundle = &mut rank.index.ranks[0];
+        bundle.allocations[0].name = "moved".into();
+        bundle.allocations[0].nbytes = 512;
+        bundle.allocations[0].address = Some(0x2000);
+        bundle.allocations[0].data_spans = vec![wire::Span {
+            offset: 320,
+            nbytes: 32,
+            ..Default::default()
+        }];
+        bundle.resources.get_mut("storage-0.bin").unwrap().nbytes = 32;
+        for tensor in &mut bundle.rebuild_weights.as_mut().unwrap().tensors {
+            let storage = tensor.storage.as_mut().unwrap();
+            storage.allocation = "moved".into();
+            storage.offset += 256;
+        }
+        rank.payload[0].source.nbytes = 32;
+        rank.allocations = vec![super::super::Allocation {
+            name: "moved".into(),
+            address: 0x2000,
+            nbytes: 512,
+            alignment: 256,
+            initialize: "snapshot".into(),
+            relocations: vec![],
+            preserve_address: true,
+            memory: "device".into(),
+            snapshot_spans: Some(vec![(256, 96)]),
+            sizing: None,
+        }];
+        rank.staging = Some(stages.clone());
+        for (index, view) in views.iter_mut().enumerate() {
+            view["address"] = (0x2100 + index * 16).into();
+        }
+        let mut request: CaptureRequest = serde_json::from_value(serde_json::json!({
+            "path":stages.join("rank.json"),"context":0,"graphs":[],"allocations":[],
+            "numeric":[[0x2100,0x2140]],
+            "weight_payload":{"version":1,"views":views},
+            "options":{"cache":root.path(),"no_weights":true,"reuse_weights":metadata},
+        }))?;
+        let reused =
+            super::super::capture::resolve_staged_weight_payload(&request, &mut rank)?.unwrap();
+        assert_eq!(reused.groups.len(), 2);
+        for (group, previous) in reused.groups.iter().zip(&groups) {
+            assert_eq!(group.payload_id, previous.payload_id);
+            assert_eq!(
+                group.spans[0].destination_offset,
+                previous.spans[0].destination_offset + 256
+            );
+            assert_eq!(group.spans[0].allocation, "moved");
+            assert_eq!(group.spans[0].nbytes, 32);
+        }
+        let declaration: super::super::weight_payload::WeightPayloadDeclaration =
+            serde_json::from_value(request.weight_payload.clone().unwrap())?;
+        let catalog = super::super::weight_payload::extract(&declaration.into_request(
+            super::super::capture::weight_allocations(&rank.allocations),
+            Vec::new(),
+        ))?;
+        for fault in ["gap", "group", "allocation", "storage"] {
+            let mut invalid_catalog = catalog.clone();
+            match fault {
+                "gap" => invalid_catalog.groups[0].spans[0].nbytes -= 1,
+                "group" => {
+                    let span = invalid_catalog.groups[0].spans.pop().unwrap();
+                    invalid_catalog
+                        .groups
+                        .push(super::super::weight_payload::WeightGroupPayload {
+                            name: "other".into(),
+                            storage: super::super::weight_payload::StorageClass::Stable,
+                            nbytes: span.nbytes,
+                            spans: vec![span],
+                        });
+                }
+                "allocation" => invalid_catalog.groups[0].spans[0].allocation = "other".into(),
+                "storage" => {
+                    invalid_catalog.groups[0].storage =
+                        super::super::weight_payload::StorageClass::Tuned
+                }
+                _ => unreachable!(),
+            }
+            let error = request
+                .options
+                .reuse_weights
+                .as_ref()
+                .unwrap()
+                .groups(&request, &rank, &invalid_catalog, &reused)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not covered by one declared weight group"),
+                "{fault}: {error}"
+            );
+        }
+        assert!(!reused.initial_state.payload_id.is_empty());
+        assert_eq!(
+            super::super::weight_reuse::numeric_ranges(&request, &rank.allocations)?,
+            vec![(0x2100, 0x2140)]
+        );
+        rank.weight_payload = Some(reused);
+        let watched: Vec<_> = groups.iter().map(|group| {
+            root.payload(PayloadId::from_bytes(group.payload_id.as_slice().try_into().unwrap()))
+                .unwrap().unwrap().path().to_path_buf()
+        }).collect();
+        let publish = || publish_payload(
+            Path::new(""),
+            &[rank.clone()],
+            vec![],
+            None,
+            &signer,
+            Some(root.path().to_path_buf()),
+            true,
+            "directory",
+        );
+        #[cfg(unix)]
+        let (second, bytes_read) = helios_core::package::container::count_payload_reads(&watched, publish);
+        #[cfg(not(unix))]
+        let second = publish();
+        let second = second?;
+        #[cfg(unix)]
+        assert_eq!(bytes_read, 0, "cached weights must not be read during publication");
+        let first_entry = root.entry(
+            first["model"].as_str().unwrap(),
+            first["entry"].as_str().unwrap(),
+        )?;
+        let second_entry = root.entry(
+            second["model"].as_str().unwrap(),
+            second["entry"].as_str().unwrap(),
+        )?;
+        let first_meta = Metadata::open(first_entry.directory())?;
+        let second_meta = Metadata::open(second_entry.directory())?;
+        for group in &groups {
+            let locate = |metadata: &Metadata| {
+                metadata
+                    .locations
+                    .locations
+                    .iter()
+                    .find(|location| location.payload_id == group.payload_id)
+                    .unwrap()
+                    .file
+                    .clone()
+            };
+            let left = first_entry.directory().join(locate(&first_meta));
+            let right = second_entry.directory().join(locate(&second_meta));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(fs::metadata(left)?.ino(), fs::metadata(right)?.ino());
+            }
+            #[cfg(not(unix))]
+            {
+                assert_eq!(fs::read(left)?, fs::read(right)?);
+            }
+        }
+        // Reuse rejects a changed checkpoint or a changed tuned layout.
+        let original = request.options.reuse_weights.clone();
+        let mut changed = metadata.clone();
+        changed["rebuild_manifest"]["checkpoint_revision"] = "revision-b".into();
+        request.options.reuse_weights = Some(serde_json::from_value(changed)?);
+        assert!(super::super::capture::resolve_staged_weight_payload(&request, &mut rank).is_err());
+        request.options.reuse_weights = original;
+        rank.index.ranks[0]
+            .rebuild_weights
+            .as_mut()
+            .unwrap()
+            .tensors[3]
+            .stride[0] = 2;
+        assert!(super::super::capture::resolve_staged_weight_payload(&request, &mut rank).is_err());
+        Ok(())
+    }
+    #[test]
     fn cache_only_export_commits_an_entry_and_no_weights_reuses_payloads() {
         use helios_core::package::cache::Root;
         let base = std::env::temp_dir().join(format!("flare-adapter-cache-{}", std::process::id()));
@@ -2796,6 +3159,8 @@ mod payload_export_tests {
         let mut rank = staged_rank(&sources);
         rank.index.ranks[0].allocations[0].nbytes = 4096;
         rank.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![group],
             initial_state: WeightPayloadGroup {
                 name: "initial-state".into(),
@@ -2881,6 +3246,8 @@ mod payload_export_tests {
         let _ = empty;
         let mut missing = staged_rank(&sources);
         missing.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![WeightPayloadGroup {
                 name: "layer-0".into(),
                 storage: "stable".into(),
@@ -3082,6 +3449,8 @@ mod payload_export_tests {
             unavailable: vec![],
         });
         rank.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![],
             initial_state: WeightPayloadGroup {
                 name: "initial-state".into(),
@@ -3122,6 +3491,213 @@ mod payload_export_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn reuse_engram_hardlinks_shared_and_partitioned_embedding_planes() -> Result<()> {
+        use crate::export::{CaptureRequest, WeightPayloadGroup, WeightPayloadSources};
+        use helios_core::package::cache::Root;
+        for partitioned in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let stages = directory.path().join("stages");
+            fs::create_dir_all(&stages)?;
+            let root = Root::open(directory.path().join("cache"))?;
+            let mut rank = staged_rank(&stages);
+            let world = if partitioned { 2 } else { 1 };
+            rank.index.rebuild = Some(wire::RebuildManifest {
+                version: 1,
+                recipe: "fixture".into(),
+                checkpoint_repository: "fixture/model".into(),
+                checkpoint_revision: "revision-a".into(),
+                tensor_parallel: world,
+                ..Default::default()
+            });
+            let mut table = wire::EngramTable {
+                layer: 1,
+                rows: world as u64,
+                embedding_width: 160,
+                scale_block: 16,
+                hash: Some(wire::EngramHash {
+                    method: wire::engram_hash::Method::EosXorModulo as i32,
+                    ..Default::default()
+                }),
+                weight_buffer: "weights".into(),
+                scale_buffer: "scales".into(),
+                hash_buffer: "hashes".into(),
+                request_buffer: "requests".into(),
+                ready_event: "ready".into(),
+                encoding: wire::engram_table::Encoding::Nvfp4E4m3Global as i32,
+                global_scale: 1.0,
+                ..Default::default()
+            };
+            let mut cursor = 12288;
+            for shard in 0..world {
+                let mut planes = Vec::new();
+                for (plane, length) in [("weights", 80), ("scales", 10)] {
+                    let path = stages.join(format!("engram-{shard}-{plane}.bin"));
+                    fs::write(&path, vec![shard as u8 + 1; length])?;
+                    rank.payload.push(FilePart {
+                        offset: cursor,
+                        source: FileSource {
+                            path,
+                            offset: 0,
+                            nbytes: length as u64,
+                        },
+                    });
+                    planes.push(wire::Span {
+                        offset: cursor,
+                        nbytes: length as u64,
+                        ..Default::default()
+                    });
+                    cursor += length as u64;
+                }
+                if partitioned {
+                    table.shards.push(wire::EngramTableShard {
+                        rank: shard,
+                        first_row: u64::from(shard),
+                        rows: 1,
+                        weights: Some(planes[0].clone()),
+                        scales: Some(planes[1].clone()),
+                    });
+                } else {
+                    table.weights = Some(planes[0].clone());
+                    table.scales = Some(planes[1].clone());
+                }
+            }
+            rank.index.engram = Some(wire::Engram {
+                token_map: vec![],
+                pad_token_id: 1,
+                compressed_vocabulary: 100,
+                tables: vec![table],
+            });
+            let mut ranks = vec![rank.clone()];
+            if partitioned {
+                let peer = stages.join("peer");
+                fs::create_dir(&peer)?;
+                ranks.push(staged_rank(&peer));
+            }
+            let signer = publisher();
+            let first = publish_payload(
+                Path::new(""),
+                &ranks,
+                vec![],
+                None,
+                &signer,
+                Some(root.path().to_path_buf()),
+                false,
+                "directory",
+            )?;
+            let profiles = serde_json::json!([{"namespace":signer.namespace,"name":"fixture",
+                "public_key":signer.public_key(),"development":false}])
+            .to_string();
+            let source = super::super::weight_reuse::open_source(root.path(), "model", &profiles)?;
+            let mut source_metadata = serde_json::to_value(&source.source)?;
+            source_metadata["rebuild_manifest"] = serde_json::json!({"version":1,"recipe":"fixture",
+                "checkpoint_repository":"fixture/model","checkpoint_revision":"revision-a","tensor_parallel":world});
+            let request: CaptureRequest = serde_json::from_value(serde_json::json!({
+                "path":stages.join("rank.json"),"context":0,"world_size":world,"graphs":[],"allocations":[],
+                "options":{"cache":root.path(),"reuse_weights":source_metadata},
+            }))?;
+            let mut data = serde_json::to_value(rank.index.engram.as_ref().unwrap())?;
+            data["tables"][0]["weight_buffer"] = "rebound_weights".into();
+            let set_planes = |value: &mut serde_json::Value| {
+                for (plane, nbytes) in [("weights", 80), ("scales", 10)] {
+                    value[plane] = serde_json::json!([{"path":stages.join("absent-checkpoint"),"offset":0,"nbytes":nbytes}]);
+                }
+            };
+            if partitioned {
+                for shard in data["tables"][0]["shards"].as_array_mut().unwrap() {
+                    set_planes(shard);
+                }
+            } else {
+                set_planes(&mut data["tables"][0]);
+            }
+            let reused = request
+                .options
+                .reuse_weights
+                .as_ref()
+                .unwrap()
+                .engram(&request, &rank, &data)?;
+            assert_eq!(reused.tables[0].weight_buffer, "rebound_weights");
+            rank.index.engram = None;
+            for part in rank.payload.drain(3..) {
+                fs::remove_file(part.source.path)?;
+            }
+            rank.weight_payload = Some(WeightPayloadSources {
+                engram: Some(reused.clone()),
+                initial_state: WeightPayloadGroup {
+                    name: "initial-state".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            ranks[0] = rank.clone();
+            let watched: Vec<_> = super::super::weight_reuse::engram_uses(&reused).iter().map(|source| {
+                let id = helios_core::package::PayloadId::from_bytes(source.slice.as_ref().unwrap().payload_id.as_slice().try_into().unwrap());
+                root.payload(id).unwrap().unwrap().path().to_path_buf()
+            }).collect();
+            let publish = || publish_payload(
+                Path::new(""),
+                &ranks,
+                vec![],
+                None,
+                &signer,
+                Some(root.path().to_path_buf()),
+                true,
+                "directory",
+            );
+            #[cfg(unix)]
+            let (second, bytes_read) = helios_core::package::container::count_payload_reads(&watched, publish);
+            #[cfg(not(unix))]
+            let second = publish();
+            let second = second?;
+            #[cfg(unix)]
+            assert_eq!(bytes_read, 0, "cached Engram planes must not be read during publication");
+            let first_entry = root.entry(
+                first["model"].as_str().unwrap(),
+                first["entry"].as_str().unwrap(),
+            )?;
+            let second_entry = root.entry(
+                second["model"].as_str().unwrap(),
+                second["entry"].as_str().unwrap(),
+            )?;
+            let first_meta = Metadata::open(first_entry.directory())?;
+            let second_meta = Metadata::open(second_entry.directory())?;
+            for source in super::super::weight_reuse::engram_uses(&reused) {
+                let id = &source.slice.as_ref().unwrap().payload_id;
+                let locate = |metadata: &Metadata| {
+                    metadata
+                        .locations
+                        .locations
+                        .iter()
+                        .find(|location| &location.payload_id == id)
+                        .unwrap()
+                        .file
+                        .clone()
+                };
+                let left = first_entry.directory().join(locate(&first_meta));
+                let right = second_entry.directory().join(locate(&second_meta));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    assert_eq!(fs::metadata(left)?.ino(), fs::metadata(right)?.ino());
+                }
+                #[cfg(not(unix))]
+                {
+                    assert_eq!(fs::read(left)?, fs::read(right)?);
+                }
+            }
+            data["tables"][0]["global_scale"] = 2.0.into();
+            assert!(
+                request
+                    .options
+                    .reuse_weights
+                    .as_ref()
+                    .unwrap()
+                    .engram(&request, &rank, &data)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn published_engram_uses_weight_roles_for_empty_token_map() {
         let base = std::env::temp_dir().join(format!("flare-engram-roles-{}", std::process::id()));
@@ -3667,6 +4243,8 @@ mod payload_export_tests {
             },
         });
         rank.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![WeightPayloadGroup {
                 name: "layer-0".into(),
                 storage: "stable".into(),
@@ -3783,6 +4361,8 @@ mod payload_export_tests {
             let mut rank = staged_rank_seeded(&sources, 0x11);
             rank.index.ranks[0].allocations[0].nbytes = 128;
             rank.weight_payload = Some(WeightPayloadSources {
+                cached: Vec::new(),
+                engram: None,
                 groups: vec![WeightPayloadGroup {
                     name: "layer-0".into(),
                     storage: "stable".into(),
@@ -3850,6 +4430,8 @@ mod payload_export_tests {
         let mut rank = staged_rank_seeded(&sources, 0x11);
         rank.index.ranks[0].allocations[0].nbytes = 128;
         rank.weight_payload = Some(WeightPayloadSources {
+            cached: Vec::new(),
+            engram: None,
             groups: vec![WeightPayloadGroup {
                 name: "layer-0".into(),
                 storage: "stable".into(),
@@ -3915,6 +4497,8 @@ mod payload_export_tests {
             std::fs::write(sources.join("storage-0.bin"), vec![byte; 64]).unwrap();
             rank.payload[0].source.path = sources.join("storage-0.bin");
             rank.weight_payload = Some(WeightPayloadSources {
+                cached: Vec::new(),
+                engram: None,
                 groups: vec![WeightPayloadGroup {
                     name: "layer-0".into(),
                     storage: "stable".into(),

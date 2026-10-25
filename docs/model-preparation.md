@@ -30,6 +30,21 @@ uses the shared Flare cache. Multi-host export publishes the complete entry
 in the coordinator's cache. See [package snapshots](cli-design.md#package-snapshots) for cache
 management, conversion, and upload.
 
+`ignition export --reuse-weights` uses the model's cached default package as
+the weight source. It reuses that version's signed weight hashes and initializer
+mappings, skips reading declared numeric weight storage during export, and
+hardlinks the cached payloads into the resulting package without rehashing their
+contents. Checkpoint loading
+and model preparation still run. The checkpoint revision, TP size, architecture,
+and declared weight layouts must match; missing or incompatible weights fail
+export. Cached weight bytes are authoritative and are not compared with live
+tensor values. Use ordinary export after changing weight values or packing.
+Reuse includes Engram's file-backed embedding weights and scale planes, in
+both shared and row-partitioned table layouts. Their geometry, quantization,
+vocabulary map, and hashing parameters must match the cached version.
+Graphs and initial state are always exported from the prepared model. See
+[export flags](cli-design.md#31-ignition-command-line-flags) for the metadata requirements.
+
 Each tensor-parallel deployment contains independently prepared rank metadata,
 graphs, and kernels. Combining exported deployments can share or reconstruct
 byte-identical weights; it cannot create an unexported TP size. Ignition creates

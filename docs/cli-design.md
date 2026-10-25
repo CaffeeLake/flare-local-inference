@@ -204,9 +204,31 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
 | `--no-weights` | Export only when exact stored-data blobs are cached | Off |
+| `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts | Off |
+| `--publisher-key PATH` | Public publisher profile authenticating the cached weight source | Embedded profiles and the local development profile |
 | `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
 | `--staging PATH` | Export workspace | `paths.export_staging` |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
+
+Normal export reuses matching cached weight payloads automatically after hashing
+the live prepared weights. `--no-weights` retains that hashing and rejects cache
+misses. `--reuse-weights` instead takes the prepared weight bytes from the model's
+cached default version. The two flags are mutually exclusive. Weight loading,
+tuning, compilation, and capture still run; graphs and initial state are exported
+from that preparation.
+
+Weight reuse requires signed metadata for the same recipe, checkpoint revision,
+GPU architecture, and tensor-parallel size, with matching named weight views,
+shapes, strides, packing, and checkpoint mappings. Allocations may move or be
+renamed, but the relative placement of views sharing an allocation must match.
+Missing payloads or incompatible metadata fail export. Live weight values are
+not compared: the cached version supplies the authoritative weight bytes. Cached
+payload contents are not rehashed; preexisting byte corruption is not detected
+by this mode.
+Engram embedding-table weights and scales are also reused, including TP row
+partitions. Their vocabulary map, hash parameters, table geometry, encoding,
+global scale, and shard partitions must match; buffer and event names follow
+the prepared graphs.
 
 Preparation flags are grouped by capacity/compression, speculative decoding,
 and advanced options in `--help`. Recipe values apply when flags are omitted;

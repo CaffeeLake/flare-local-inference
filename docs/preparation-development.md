@@ -74,6 +74,17 @@ correctness and cache checks remain required. See
 [runtime package transfers](runtime-package-design.md#native-export-transfers-and-progress)
 for the transfer budget and progress contract.
 
+`--reuse-weights` pins the cached default package and its weight objects through
+publication. Native export authenticates its metadata, checks preparation inputs
+and named weight layouts, and rebinds the stored weight initializers to compatible
+allocation placements. Only declared numeric weight ranges may bypass live
+storage reads; pointer-bearing storage and undeclared initial state retain their
+normal capture and export path. Cached weight objects are linked without reading
+or hashing their payload bytes; export checks their container lengths and pinned
+file identities against the authenticated metadata. This mode trusts the cached
+weight contents and does not detect preexisting payload corruption. Missing or
+incompatible metadata is an error, with no live-weight fallback.
+
 ## Scratch storage and concurrent lifetimes
 
 - Supply caller-owned scratch through the kernel planning interfaces. Reuse

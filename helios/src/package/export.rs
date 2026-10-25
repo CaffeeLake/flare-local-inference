@@ -322,7 +322,35 @@ pub struct Published {
 pub fn publish(
     request: &PublishRequest,
     key: &ring::signature::Ed25519KeyPair,
+    destination: Destination<'_>,
+) -> Result<Published, crate::Error> {
+    publish_inner(request, key, destination, None)
+}
+
+/// Publish using immutable cached weight objects selected from a previous package.
+///
+/// The caller authenticates the previous package and checks weight-layout compatibility.
+/// Weight sources must be the exact pinned slices of the supplied objects. Publication
+/// links those objects without hashing their bytes; fresh data retains full verification.
+pub fn publish_reusing_cached_weights(
+    request: &PublishRequest,
+    key: &ring::signature::Ed25519KeyPair,
+    destination: Destination<'_>,
+    weights: &[crate::package::cache::PayloadObject],
+) -> Result<Published, crate::Error> {
+    if !matches!(destination, Destination::Cache(_, _)) {
+        return Err(invalid(
+            "weight reuse requires publication into the package cache",
+        ));
+    }
+    publish_inner(request, key, destination, Some(weights))
+}
+
+fn publish_inner(
+    request: &PublishRequest,
+    key: &ring::signature::Ed25519KeyPair,
     mut destination: Destination<'_>,
+    weights: Option<&[crate::package::cache::PayloadObject]>,
 ) -> Result<Published, crate::Error> {
     if request.deployments.is_empty() {
         return Err(invalid(
@@ -544,13 +572,17 @@ pub fn publish(
             executable_phase.finish(format!("{executable_bytes} plaintext bytes"));
             let payload_bytes = rank.payloads.iter().map(|payload| payload.nbytes()).sum();
             let data_phase = progress.phase(
-                &format!("Verify and publish rank {} data", rank.body.rank),
+                &format!("{} rank {} data", if weights.is_some() { "Publish" } else { "Verify and publish" }, rank.body.rank),
                 Some(payload_bytes),
             );
+            let mut reused_bytes = 0;
             for payload in &rank.payloads {
                 data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
                 let id = payload.id;
-                if located.contains_key(&id) {
+                if reuse_weight(payload, weights, &mut destination, &mut locations, located.contains_key(&id))? {
+                    reused_bytes += payload.nbytes();
+                    located.insert(id, ());
+                } else if located.contains_key(&id) {
                     verify_payload_source(payload)?;
                 } else {
                     install_payload(
@@ -577,7 +609,7 @@ pub fn publish(
                     tensor: None,
                 });
             }
-            data_phase.finish(format!("{payload_bytes} source bytes verified"));
+            data_phase.finish(data_result(payload_bytes, reused_bytes));
             let ranks_count =
                 u32::try_from(deployment.ranks.len()).map_err(|_| invalid("too many ranks"))?;
             schema::validate_rank(&rank_body, ranks_count, &mut catalog, &mut resource_ids)?;
@@ -590,11 +622,15 @@ pub fn publish(
             ranks.push((index as u32, rank_body.rank, encoded));
         }
         let payload_bytes = deployment.payloads.iter().map(|payload| payload.nbytes()).sum();
-        let data_phase = progress.phase("Verify and publish shared data", Some(payload_bytes));
+        let data_phase = progress.phase(if weights.is_some() { "Publish shared data" } else { "Verify and publish shared data" }, Some(payload_bytes));
+        let mut reused_bytes = 0;
         for payload in &deployment.payloads {
             data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
             let id = payload.id;
-            if located.contains_key(&id) {
+            if reuse_weight(payload, weights, &mut destination, &mut locations, located.contains_key(&id))? {
+                reused_bytes += payload.nbytes();
+                located.insert(id, ());
+            } else if located.contains_key(&id) {
                 verify_payload_source(payload)?;
             } else {
                 install_payload(
@@ -620,7 +656,7 @@ pub fn publish(
                 tensor: None,
             });
         }
-        data_phase.finish(format!("{payload_bytes} source bytes verified"));
+        data_phase.finish(data_result(payload_bytes, reused_bytes));
         let encoded = wire::DeploymentBody::encode_to_vec(&body);
         schema::validate_deployment(&body, &mut catalog)?;
         package.deployments.push(wire::DeploymentCommitment {
@@ -1006,6 +1042,63 @@ impl Read for SliceReader<'_> {
         self.position += length as u64;
         Ok(length)
     }
+}
+
+fn data_result(total: u64, reused: u64) -> String {
+    if reused == 0 {
+        format!("{total} source bytes verified")
+    } else {
+        format!(
+            "{reused} cached weight bytes reused, {} fresh bytes verified",
+            total - reused
+        )
+    }
+}
+
+fn reuse_weight(
+    payload: &PublishPayload,
+    weights: Option<&[crate::package::cache::PayloadObject]>,
+    destination: &mut Destination<'_>,
+    locations: &mut Vec<wire::PayloadLocation>,
+    located: bool,
+) -> Result<bool, crate::Error> {
+    let Some(weights) = weights.filter(|_| {
+        matches!(
+            payload.role,
+            wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
+        )
+    }) else {
+        return Ok(false);
+    };
+    if !weights.iter().any(|object| object.id() == payload.id) {
+        return Ok(false);
+    }
+    let object = weights
+        .iter()
+        .find(|object| {
+            object.id() == payload.id
+                && std::sync::Arc::ptr_eq(object.file(), payload.source.file())
+                && object.slice().offset() == payload.source.offset()
+                && object.length() == payload.nbytes()
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "reused weight {} does not reference its leased cache object",
+                payload.relative
+            ))
+        })?;
+    if !located {
+        let Destination::Cache(_, staging) = destination else {
+            return Err(invalid("weight reuse requires the package cache"));
+        };
+        staging.link(object, &payload.relative)?;
+        locations.push(wire::PayloadLocation {
+            payload_id: payload.id.as_bytes().to_vec(),
+            file: payload.relative.clone(),
+            tensor: container::COMPANION_TENSOR.to_string(),
+        });
+    }
+    Ok(true)
 }
 
 fn install_payload(
@@ -1943,6 +2036,27 @@ mod tests {
             }
             Err(error) => panic!("fresh state/executable payloads must not require cache: {error}"),
         }
+        let object = root.payload(weight_id).unwrap().unwrap();
+        let mut request = request;
+        let weight = request.deployments[0].ranks[0].payloads.iter_mut()
+            .find(|payload| payload.role == wire::PayloadRole::Weights).unwrap();
+        let live_source = weight.source.clone();
+        weight.source = object.slice().clone();
+        let mut fast = root.stage("model", "reuse").unwrap();
+        publish_reusing_cached_weights(&request, &key, Destination::Cache(&root, &mut fast), &[object.clone()]).unwrap();
+
+        request.deployments[0].ranks[0].payloads.iter_mut()
+            .find(|payload| payload.role == wire::PayloadRole::Weights).unwrap().source = live_source;
+        let mut unpinned = root.stage("model", "unpinned").unwrap();
+        let error = publish_reusing_cached_weights(&request, &key, Destination::Cache(&root, &mut unpinned), &[object.clone()]).unwrap_err();
+        assert!(error.to_string().contains("leased cache object"), "{error}");
+
+        request.deployments[0].ranks[0].payloads.iter_mut()
+            .find(|payload| payload.role == wire::PayloadRole::Weights).unwrap().source = object.slice().clone();
+        std::fs::write(&state_path, vec![0xff; state_bytes.len()]).unwrap();
+        let mut changed_state = root.stage("model", "changed-state").unwrap();
+        let error = publish_reusing_cached_weights(&request, &key, Destination::Cache(&root, &mut changed_state), &[object]).unwrap_err();
+        assert!(error.to_string().contains("bytes do not match"), "{error}");
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 

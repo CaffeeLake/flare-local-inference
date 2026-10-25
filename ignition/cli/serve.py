@@ -131,7 +131,19 @@ def export(args) -> int:
     cache = configuration.directory('package_cache')
     if getattr(args, 'no_weights', False) and not (cache / 'blobs').is_dir():
         raise UsageError('--no-weights requires an existing blob cache; export or convert a package first')
-    with export_options(cache, no_weights=getattr(args, 'no_weights', False)):
+    weight_source = reuse_weights = None
+    if getattr(args, 'reuse_weights', False):
+        import flare_heliopause
+        from .publishing import _public_profiles
+
+        try:
+            weight_source = flare_heliopause.export_reuse_weights(
+                str(cache), model.model_id, json.dumps(_public_profiles(args, configuration)))
+            reuse_weights = json.loads(weight_source.metadata())
+        except (ValueError, OSError) as error:
+            raise UsageError(str(error)) from error
+    with export_options(cache, no_weights=getattr(args, 'no_weights', False) or reuse_weights is not None,
+                        reuse_weights=reuse_weights):
         if args.ranks > 1:
             code, result = _export_hosts(args)
         else:

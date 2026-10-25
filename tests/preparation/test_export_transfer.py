@@ -179,7 +179,7 @@ def description(path):
         data = Path(name).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         files[name] = dict(size=len(data), sha256=digest, blob=Path(name).name == digest + '.safetensors')
-    return dict(version=1, output=output, files=files, inventory={})
+    return dict(version=2, output=output, files=files, inventory={})
 
 
 def assert_contents(path, contents):
@@ -189,6 +189,19 @@ def assert_contents(path, contents):
         with Path(location).open('rb') as source:
             source.seek(offset)
             assert source.read(size) == contents[name]
+
+
+def test_export_rejects_unsupported_transfer_protocol(tmp_path):
+    path, _ = manifest(tmp_path / 'peer', 1)
+    document = description(path)
+    document['version'] = 1
+    with ExitStack() as stack:
+        control, peer = sockets(stack)
+        roots, _ = channels(stack, 1)
+        control_send(peer, document)
+        with pytest.raises(RuntimeError, match='incompatible native rank export protocol version'):
+            receive(control, roots, tmp_path / 'received.json', tmp_path / 'cache')
+    assert not (tmp_path / 'received.json').exists()
 
 
 @pytest.mark.parametrize('streams', [1, 4, 8])
@@ -386,7 +399,7 @@ def test_export_rejects_sources_changed_after_metadata_scan(tmp_path, change):
         else:
             with target.open('r+b') as source:
                 source.write(b'changed')
-        control_send(control, dict(version=1, files=[name]))
+        control_send(control, dict(version=2, files=[name]))
         with pytest.raises(ConnectionError):
             roots[0].receive()
         thread.join(5)

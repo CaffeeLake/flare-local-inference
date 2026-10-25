@@ -13,6 +13,7 @@ pub(crate) mod reachability;
 pub(crate) mod recorder;
 pub(crate) mod source_identity;
 pub(crate) mod weight_payload;
+pub(crate) mod weight_reuse;
 #[cfg(unix)]
 pub(crate) mod transfer;
 
@@ -122,6 +123,8 @@ pub(crate) struct ExportOptions {
     pub cache: Option<PathBuf>,
     #[serde(default)]
     pub no_weights: bool,
+    #[serde(default)]
+    pub reuse_weights: Option<weight_reuse::Source>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -274,6 +277,12 @@ pub(crate) struct WeightPayloadSources {
     /// Semantic group of every declared view, independent of retained coverage.
     #[serde(default)]
     pub views: Vec<WeightPayloadView>,
+    /// Payloads that the receiving coordinator already holds; no sender file is required.
+    #[serde(default)]
+    pub cached: Vec<helios_core::package::schema::wire::PayloadDescriptor>,
+    /// File-backed embedding table metadata rebound to this preparation's buffers.
+    #[serde(default)]
+    pub engram: Option<helios_core::package::schema::wire::Engram>,
 }
 
 /// Leases for captured cache objects, held from capture through publication and

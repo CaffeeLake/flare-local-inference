@@ -82,6 +82,7 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "flare_heliopause", types.SimpleNamespace(
         CliSignals=CliSignals, Server=object,
         export_source_identity=flare_heliopause.export_source_identity,
+        export_reuse_weights=flare_heliopause.export_reuse_weights,
         export_development_publisher=flare_heliopause.export_development_publisher))
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
         cuda=types.SimpleNamespace(set_device=lambda _: None), OutOfMemoryError=OutOfMemoryError))
@@ -598,6 +599,40 @@ def test_no_weights_requires_cache_before_preparation(host, tmp_path, capsys):
     assert 'existing blob cache' in capsys.readouterr().err
     assert main(['export', 'qwen3.8-flash', '--repo-id', '../escape']) == 2
     assert host['exports'] == 0
+
+
+def test_reuse_weights_requires_cached_version_before_preparation(host, capsys):
+    assert main(['export', 'qwen3.8-flash', '--reuse-weights']) == 2
+    assert '--reuse-weights requires a cached default model version' in capsys.readouterr().err
+    assert 'prepared' not in host
+
+
+def test_reuse_weights_passes_cached_metadata_through_export(host, monkeypatch, tmp_path):
+    import flare_heliopause
+    from ignition.preparation.package_snapshot import _OPTIONS
+
+    source = {'envelope': [1, 2, 3], 'publishers': []}
+    requests = []
+
+    def reuse(cache, model, profiles):
+        requests.append((cache, model, json.loads(profiles)))
+        return types.SimpleNamespace(metadata=lambda: json.dumps(source))
+
+    def prepare(args):
+        settings = _OPTIONS.get()
+        assert settings.no_weights and settings.reuse_weights == source
+        return 0, types.SimpleNamespace(entry_path=tmp_path / 'entry')
+
+    monkeypatch.setattr(flare_heliopause, 'export_reuse_weights', reuse)
+    monkeypatch.setattr(serve, '_prepare', prepare)
+    assert main(['export', 'qwen3.8-flash', '--reuse-weights']) == 0
+    assert requests[0][1] == resolve('qwen3.8-flash').model_id
+    assert _OPTIONS.get() is None
+
+
+def test_export_weight_reuse_and_cache_only_flags_are_exclusive(host):
+    with pytest.raises(SystemExit, match='2'):
+        main(['export', 'qwen3.8-flash', '--reuse-weights', '--no-weights'])
 
 
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])

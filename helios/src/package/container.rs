@@ -62,6 +62,45 @@ pub struct Slice {
     length: u64,
 }
 
+#[cfg(all(unix, any(test, feature = "test-tools")))]
+static READ_COUNTER: std::sync::Mutex<BTreeMap<(u64, u64), u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Count payload bytes read from selected files, including reads on worker threads.
+#[cfg(all(unix, any(test, feature = "test-tools")))]
+pub fn count_payload_reads<T>(paths: &[PathBuf], operation: impl FnOnce() -> T) -> (T, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let files: BTreeSet<_> = paths
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        })
+        .collect();
+    struct Reset(BTreeSet<(u64, u64)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let mut counter = READ_COUNTER.lock().unwrap();
+            for file in &self.0 {
+                counter.remove(file);
+            }
+        }
+    }
+    {
+        let mut counter = READ_COUNTER.lock().unwrap();
+        for file in &files {
+            assert!(counter.insert(*file, 0).is_none());
+        }
+    }
+    let reset = Reset(files);
+    let result = operation();
+    let bytes = {
+        let counter = READ_COUNTER.lock().unwrap();
+        reset.0.iter().map(|file| counter[file]).sum()
+    };
+    (result, bytes)
+}
+
 impl Slice {
     pub fn new(file: Arc<File>, offset: u64, length: u64) -> Result<Self> {
         let end = offset
@@ -104,6 +143,17 @@ impl Slice {
                 output.len(),
                 self.length
             )));
+        }
+        #[cfg(all(unix, any(test, feature = "test-tools")))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut counter = READ_COUNTER.lock().unwrap();
+            if !counter.is_empty() {
+                let metadata = self.file.metadata().unwrap();
+                if let Some(bytes) = counter.get_mut(&(metadata.dev(), metadata.ino())) {
+                    *bytes += output.len() as u64;
+                }
+            }
         }
         self.file
             .read_exact_at(output, self.offset + offset)

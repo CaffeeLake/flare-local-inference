@@ -105,6 +105,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     super::recorder::register(module)?;
     super::package::register(module)?;
     super::conversion::register(module)?;
+    super::weight_reuse::register(module)?;
     #[cfg(unix)]
     super::transfer::register(module)?;
     module.add_function(wrap_pyfunction!(export_source_identity, module)?)?;
@@ -247,18 +248,23 @@ pub(crate) fn finish_rank(
         phase.finish("");
     }
     if let Some(data) = request.package_data.as_ref() {
-        let mut data = data.clone();
-        if let Some(tables) = data.get_mut("tables").and_then(|v| v.as_array_mut()) {
-            for table in tables {
-                append_planes(table, &mut cursor, &mut output.payload)?;
-                if let Some(shards) = table.get_mut("shards").and_then(|v| v.as_array_mut()) {
-                    for shard in shards {
-                        append_planes(shard, &mut cursor, &mut output.payload)?;
+        if let Some(source) = request.options.reuse_weights.as_ref() {
+            let engram = source.engram(request, output, data)?;
+            output.weight_payload.get_or_insert_with(Default::default).engram = Some(engram);
+        } else {
+            let mut data = data.clone();
+            if let Some(tables) = data.get_mut("tables").and_then(|v| v.as_array_mut()) {
+                for table in tables {
+                    append_planes(table, &mut cursor, &mut output.payload)?;
+                    if let Some(shards) = table.get_mut("shards").and_then(|v| v.as_array_mut()) {
+                        for shard in shards {
+                            append_planes(shard, &mut cursor, &mut output.payload)?;
+                        }
                     }
                 }
             }
+            output.index.engram = Some(message("Engram", &data)?);
         }
-        output.index.engram = Some(message("Engram", &data)?);
     }
     if let Some(weights) = request.rebuild_weights.as_ref() {
         let mut weights = weights.clone();
