@@ -51,7 +51,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     device: int = 0
     context: int = 262144

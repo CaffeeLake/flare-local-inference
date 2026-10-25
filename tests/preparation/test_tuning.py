@@ -1348,15 +1348,15 @@ def test_bootstrap_effort_scope_captures_real_contract_and_restores():
             raise RuntimeError("bootstrap failed")
         return query
 
-    config = SimpleNamespace(autotune_effort="high")
-    with autotune_effort("low"):
+    config = SimpleNamespace(autotune_effort="audit")
+    with autotune_effort("off"):
         query = prepare("snapshot", config)
-        assert query.autotune_effort == "high"
-        assert capture_autotune_effort() == "low"
+        assert query.autotune_effort == "audit"
+        assert capture_autotune_effort() == "off"
         with pytest.raises(RuntimeError, match="bootstrap failed"):
             prepare("snapshot", config, fail=True)
-        assert capture_autotune_effort() == "low"
-    assert query.autotune_effort == "high"
+        assert capture_autotune_effort() == "off"
+    assert query.autotune_effort == "audit"
 
 
 

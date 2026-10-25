@@ -29,7 +29,7 @@ def _worker(rank, directory, head_major):
     for repetition in range(2):
         session = RecordedPreparationSession(device=device, checkpoint='collective-operator-test',
             workload_schema='pcie-collectives', numerical_policy='declared-dtypes', coordinator=coordinator,
-            compile_workers=4, autotune_effort='medium')
+            compile_workers=4, autotune_effort='default')
         session.cache_dir = Path(directory) / 'cache'
         operations = []
         for index, rows in enumerate((1, 1, 8, 128)):

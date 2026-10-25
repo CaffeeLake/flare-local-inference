@@ -66,7 +66,7 @@ class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.

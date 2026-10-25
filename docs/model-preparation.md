@@ -115,20 +115,22 @@ GLM TP4 have been exercised end to end; Qwen TP4 still requires model validation
 
 ## Preparation resources
 
-`--autotune-effort off|low|medium|high|max` controls b12x candidate filtering.
+`--autotune-effort off|default|audit` controls b12x candidate filtering.
 `off` prepares heuristic choices without tuning races or tuned-selection cache
-lookups. `low` applies the broadest performance exclusions; `medium` is the
-default search policy; `high` keeps only conservative performance exclusions;
-`max` enumerates every declared candidate satisfying correctness, resource,
-and explicit configuration constraints. Each searched level includes the
-lower levels' candidates. Kernel families retain their declared tuning axes.
+lookups. `default` races the candidates that pass each kernel family's
+performance exclusions. `audit` lifts those exclusions and races every
+candidate satisfying correctness, resource, dominance, and explicit
+configuration constraints; it exists to check that the default search prunes
+no winners and is meant for occasional sampled runs, not routine tuning. The
+audit search includes every default candidate. Kernel families retain their
+declared tuning axes.
 
 Without extra tuning replicas, tensor-parallel ranks on identical GPUs divide
 each kernel race's candidates and adopt the fastest measured configuration.
 This applies within one host as well as across hosts. Fixed collective kernels
 still prepare on every participating rank.
 
-Set `[preparation] autotune_effort = "high"` for a persistent default; an
+Set `[preparation] autotune_effort = "audit"` for a persistent setting; an
 explicit flag wins. The plan carries the setting to every preparation rank
 and tuning replica. Effort separates cached selections and prepared packages;
 identical kernel programs share compilation artifacts across efforts.

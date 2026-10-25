@@ -600,7 +600,7 @@ def test_no_weights_requires_cache_before_preparation(host, tmp_path, capsys):
     assert host['exports'] == 0
 
 
-@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
 def test_autotune_effort_reaches_plan_and_startup_line(host, capsys, monkeypatch, effort):
     monkeypatch.setenv("COLUMNS", "400")
     assert export("qwen3.8-flash", "--autotune-effort", effort) == 0

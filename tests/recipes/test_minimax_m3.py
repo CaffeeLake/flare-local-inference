@@ -198,7 +198,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
     import ignition.preparation.rank_group as rank_group
 
     rendezvous = SimpleNamespace(hosts=("rank0", "rank1", "rank2", "rank3"))
-    plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="high", tuning_replica=None,
+    plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="audit", tuning_replica=None,
         native_dense_activations=True,
         image_concurrency=4, language_model_only=False, world_size=4, roce_ring=False,
         context=1048576, concurrency=4, prefill_chunk=4096, snapshots=4,
@@ -219,7 +219,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
     assert result["config"].vision and result["config"].dspark
     assert result["config"].prefill_chunk_size == 4096
     assert result["config"].speculative_token_capacity == 32
-    assert result["config"].autotune_effort == "high"
+    assert result["config"].autotune_effort == "audit"
     assert result["config"].native_dense_activations
     assert result["config"].packed_verification
     assert result["config"].draft_prefix_selection == "gpu"

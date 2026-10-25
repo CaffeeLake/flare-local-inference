@@ -30,7 +30,7 @@ class Forward:
 
 
 @pytest.mark.parametrize("compile_decoder", [False, True])
-@pytest.mark.parametrize("autotune_effort", ["off", "medium"])
+@pytest.mark.parametrize("autotune_effort", ["off", "default"])
 @torch.no_grad()
 def test_forward_warmup_captures_unprimed_plans_and_cached_restart(tmp_path, compile_decoder, autotune_effort):
     device = torch.device("cuda:0")

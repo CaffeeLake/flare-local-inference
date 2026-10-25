@@ -70,7 +70,7 @@ class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     device: int = 0
     devices: tuple[int, ...] | None = None

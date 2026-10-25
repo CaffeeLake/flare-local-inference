@@ -4,7 +4,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 
 
 def preparation_session(*, device, checkpoint, namespace=None, coordinator=None, headroom_bytes=0,
-                        benchmark_storage=None, compile_workers=None, tuning_replica=None, autotune_effort="medium",
+                        benchmark_storage=None, compile_workers=None, tuning_replica=None, autotune_effort="default",
                         native_dense_activations=False):
     return RecordedPreparationSession(
         device=device, checkpoint=checkpoint, compile_workers=compile_workers, tuning_replica=tuning_replica,

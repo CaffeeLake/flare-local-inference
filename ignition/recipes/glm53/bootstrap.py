@@ -69,7 +69,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1)
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.

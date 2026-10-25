@@ -75,7 +75,7 @@ class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576

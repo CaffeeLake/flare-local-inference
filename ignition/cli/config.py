@@ -31,7 +31,7 @@ _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
-    "preparation.autotune_effort": "medium",
+    "preparation.autotune_effort": "default",
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.disk_transport": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
@@ -40,7 +40,7 @@ _BUILT_IN = {
     "paths.prefix_cache": "",
     "paths.cuda": "",
 }
-AUTOTUNE_EFFORTS = ("off", "low", "medium", "high", "max")
+AUTOTUNE_EFFORTS = ("off", "default", "audit")
 _TRANSPORTS = ("staged", "direct")
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMGT])(?:iB|B)?)?", re.IGNORECASE)
 
@@ -162,7 +162,7 @@ class Configuration:
             '# speculative_graph_budget = 64  # packed round graphs; excludes width-one and ordinary graphs',
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
-            '# autotune_effort = "medium"     # off, low, medium, high, max',
+            '# autotune_effort = "default"    # off, default, audit',
             "", "[memory]",
             f'# reserve = "{self.get("memory.reserve").value}"'
             "                   # GPU memory left untouched for processes that start later",

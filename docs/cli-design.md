@@ -224,7 +224,7 @@ explicit flags take precedence.
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
-| `--autotune-effort off\|low\|medium\|high\|max` | Kernel search effort. Off uses heuristics; low applies broad exclusions; medium balances search cost; high retains only conservative exclusions; max enumerates every declared legal candidate. Overrides `[preparation] autotune_effort`. | Medium |
+| `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
@@ -921,7 +921,7 @@ max_concurrency = 4
 
 [preparation]
 # compile_workers = 24           # Optional CPU process budget per host.
-# autotune_effort = "medium"      # off, low, medium, high, max.
+# autotune_effort = "default"     # off, default, audit.
 
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
@@ -1004,7 +1004,7 @@ Configuration assigns each decision to one owner:
 | Weight format, KV precision, page geometry, kernel plans | Checkpoint metadata and recipe preparation |
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
-| Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `medium` |
+| Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
 | Served names | Recipe alias and repository ID, exposed through `/v1/models` |

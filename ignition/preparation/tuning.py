@@ -52,7 +52,7 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="medium", native_dense_activations=False):
+                 tuning_replica=None, autotune_effort="default", native_dense_activations=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):

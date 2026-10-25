@@ -213,10 +213,11 @@ def test_mistyped_alias_suggests_step5():
 
 
 @pytest.mark.parametrize("command", ["export", "serve"])
-@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
 def test_autotune_effort_flag(command, effort):
     args = [command, "deepseek-v4.1-flash"]
     assert _parser().parse_args(args).autotune_effort is None
     assert _parser().parse_args([*args, "--autotune-effort", effort]).autotune_effort == effort
-    with pytest.raises(SystemExit):
-        _parser().parse_args([*args, "--autotune-effort", "exhaustive"])
+    for legacy in ("exhaustive", "medium"):
+        with pytest.raises(SystemExit):
+            _parser().parse_args([*args, "--autotune-effort", legacy])

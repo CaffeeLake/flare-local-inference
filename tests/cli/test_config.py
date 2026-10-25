@@ -147,14 +147,15 @@ def test_shard_size_is_not_a_publishing_setting(tmp_path):
         load(tmp_path, '[publishing]\nshard_size = "2G"\n')
 
 
-@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
 def test_autotune_effort_configuration_and_flag_precedence(tmp_path, effort):
     from ignition.cli.preparation import tuning_effort
 
-    assert tuning_effort(load(tmp_path, "")) == "medium"
+    assert tuning_effort(load(tmp_path, "")) == "default"
     config = load(tmp_path, f'[preparation]\nautotune_effort = "{effort}"\n')
     assert tuning_effort(config) == effort
     assert tuning_effort(config, "off") == "off"
-    assert tuning_effort(config, "max") == "max"
-    with pytest.raises(UsageError, match="autotune_effort"):
-        load(tmp_path, '[preparation]\nautotune_effort = "exhaustive"\n')
+    assert tuning_effort(config, "audit") == "audit"
+    for legacy in ("exhaustive", "medium", "max"):
+        with pytest.raises(UsageError, match="autotune_effort"):
+            load(tmp_path, f'[preparation]\nautotune_effort = "{legacy}"\n')

@@ -180,7 +180,7 @@ class Plan:
     roce_ring: bool = False
     roce_chain: bool = False
     compile_workers: int | None = None
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     native_dense_activations: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
