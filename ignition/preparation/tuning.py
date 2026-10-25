@@ -261,7 +261,6 @@ class RecordedPreparationSession(PreparationSession):
         self._tune_status = "tuning"
         results = []
         try:
-            allocated_before = self._allocated()
             if self._stop.is_set():
                 raise RuntimeError("full serving preparation requires enabled, uncancelled b12x tuning")
             requests = tuple(self._recorded_requests.values())
@@ -382,8 +381,6 @@ class RecordedPreparationSession(PreparationSession):
                 "allocated_shared_benchmark_bytes": sum(int(getattr(value, "allocated_nbytes",
                     getattr(value, "nbytes", 0))) for value in self._benchmark_resources.values()),
                 "search_limits": dict(self._search_limits),
-                "allocated_before_tuning": allocated_before,
-                "allocated_before_trial_release": self._allocated(),
             }
             self._tune_status = "releasing"
             return self.tuning_report
@@ -422,9 +419,6 @@ class RecordedPreparationSession(PreparationSession):
                     raise
             if self._tune_status == "releasing":
                 try:
-                    self.tuning_report["allocated_after_trial_release"] = self._allocated()
-                    self.tuning_report["released_preparation_bytes"] = (
-                        self.tuning_report["allocated_before_trial_release"] - self._allocated())
                     with torch.cuda.device(self.device.ordinal):
                         torch.cuda.empty_cache()
                     self._tune_status = "ready"

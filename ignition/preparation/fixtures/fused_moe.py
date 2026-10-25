@@ -45,13 +45,21 @@ class ExpertBenchmarkInputs:
                 if enabled:
                     value = tokens if name == "num_valid_tokens" else 0
                     self.route_inputs[name] = torch.full(shape, value, device=source.device, dtype=dtype)
+        self.route_scores, self.long_routes = None, ()
+        if self.route_inputs:
+            # Router-logit scores and int64 routes are constant per workload.
+            top_k = self.router.ids.shape[1]
+            self.route_scores = (torch.arange(top_k, device=source.device,
+                dtype=self.route_inputs["router_logits"].dtype).neg().add_(top_k + 1)
+                .expand_as(self.router.ids).contiguous())
+            self.long_routes = tuple(route.long() for route in self.routes)
         self.producers = tuple(partial(self._synthetic_routes, index) for index in range(len(self.routes)))
 
     @property
     def nbytes(self):
         tensors = (self.fixture, self.source, self.output, self.routes,
             *(getattr(self.router, field) for field in self.router.__dataclass_fields__),
-            self.route_weights, *self.route_inputs.values())
+            self.route_weights, *self.route_inputs.values(), self.route_scores, *self.long_routes)
         storage = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes()
                    for value in tensors if value is not None}
         return sum(storage.values())
@@ -63,9 +71,7 @@ class ExpertBenchmarkInputs:
         if self.route_inputs:
             logits = self.route_inputs["router_logits"]
             logits.fill_(-8)
-            scores = torch.arange(self.router.ids.shape[1], device=logits.device,
-                dtype=logits.dtype).neg().add_(self.router.ids.shape[1] + 1).expand_as(self.router.ids)
-            logits.scatter_(1, self.routes[index].long(), scores)
+            logits.scatter_(1, self.long_routes[index], self.route_scores)
 
 
 def benchmark_call(state, *, source, experts, top_k, session, name, workspace,

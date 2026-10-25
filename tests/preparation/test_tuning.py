@@ -130,9 +130,6 @@ def backend(monkeypatch):
     monkeypatch.setattr("ignition.preparation.host_memory.available_bytes", lambda: 128 << 30)
     monkeypatch.setattr(PreparationSession, "_check_thread", lambda self: None)
     monkeypatch.setattr(PreparationSession, "_synchronize", lambda self: events.append(("drain",)))
-    monkeypatch.setattr(PreparationSession, "_allocated", lambda self: 4096 + sum(
-        getattr(value, "allocated_nbytes", value.nbytes)
-        for value in getattr(self, "_benchmark_resources", {}).values()))
     monkeypatch.setattr(PreparationSession, "capture", capture)
     monkeypatch.setattr(PreparationSession, "freeze", lambda self: events.append(("freeze",)))
     def close_session(self):
@@ -325,8 +322,6 @@ def test_benchmark_resource_shared_across_requests_and_released_before_capture(b
     assert len(references) == 1 and observed[0] == observed[1]
     assert references[0]() is None
     assert report["shared_benchmark_bytes"] == 512
-    assert report["released_preparation_bytes"] == 512
-    assert report["allocated_after_trial_release"] == report["allocated_before_tuning"] == 4096
     with pytest.raises(RuntimeError, match="only during"):
         benchmark_resource(session, "late", create)
 
@@ -335,7 +330,6 @@ def test_indexed_normalization_releases_private_priming_operands(backend, monkey
     from ignition.components import rms_norm
 
     session = make_session(device=0, checkpoint="indexed-normalization")
-    monkeypatch.setattr(PreparationSession, "_allocated", lambda self: 0)
     plan = declaration("indexed").plan
     plan.request = lambda **kwargs: Request(plan=plan, **kwargs)
     monkeypatch.setattr(rms_norm.hyperconnection, "Caps", lambda **kwargs: None)
@@ -577,7 +571,6 @@ def test_borrowed_state_restores_after_result_close_and_owner_release(backend, m
     assert calls == ["restore"] and not storage.count_nonzero()
     assert events.index(("result_close", True)) < len(events) - 1
     assert report["shared_benchmark_bytes"] == report["borrowed_benchmark_bytes"] == 32
-    assert report["allocated_shared_benchmark_bytes"] == report["released_preparation_bytes"] == 0
     assert not session._benchmark_restorers
     with session.capture():
         assert events[-2][0] == "empty_cache"
@@ -869,8 +862,6 @@ def test_default_storage_released_after_alias_rebind_and_trial_cleanup_before_re
     session.register_scratch(arena)
     session.declare((declaration("op", size=513, selected_size=120, prepare=lambda state, saved=original: None),))
     session.register_finalizer(lambda saved=original: setattr(owner, "binding", arena.tensor))
-    monkeypatch.setattr(session, "_allocated", lambda: 4096 + arena.nbytes +
-        (256 if reference() is not None and reference() is not arena.tensor else 0))
     del original
 
     def empty_cache():
@@ -878,10 +869,8 @@ def test_default_storage_released_after_alias_rebind_and_trial_cleanup_before_re
         assert owner.binding is arena.tensor and arena.nbytes == 256
 
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
-    report = session.tune()
+    session.tune()
     assert reference() is None
-    assert report["released_preparation_bytes"] == 256
-    assert report["allocated_after_trial_release"] == 4096 + 256
 
 
 @pytest.mark.parametrize("source", ["cached", "tuned"])
@@ -926,7 +915,6 @@ def test_selected_arena_retained_after_trials_restoration_and_capture(backend, m
 
     if borrowed_state:
         session.register_benchmark_resource("state", SimpleNamespace(nbytes=0), restore=restore)
-    monkeypatch.setattr(session, "_allocated", lambda: 4096 + arena.nbytes)
 
     def empty_cache():
         assert references["trial"]() is None
@@ -939,8 +927,6 @@ def test_selected_arena_retained_after_trials_restoration_and_capture(backend, m
         "parallel_candidate_scratch_bytes": 0, "parallel_selected_scratch_bytes": 0,
         "candidate_reserved_bytes": 256, "selected_scratch_bytes": 256,
         "reserved_bytes": 256, "pending_persistent_bytes": 0}
-    assert report["released_preparation_bytes"] == 0
-    assert report["allocated_after_trial_release"] == 4096 + 256
     with session.capture():
         assert references["tensor"]() is arena.tensor
     session.freeze()
@@ -1086,9 +1072,6 @@ def test_candidate_storage_survives_trial_close_then_dies_before_selected_memory
         order.append("finalize")
 
     register_finalizer(session, finalize, workspace=arena)
-    monkeypatch.setattr(session, "_allocated", lambda: 4096 + arena.nbytes +
-        (1024 if references.get("candidate", lambda: None)() is not None
-         and references["candidate"]() is not arena.tensor else 0))
 
     def empty_cache():
         assert references["candidate"]() is None
@@ -1098,8 +1081,6 @@ def test_candidate_storage_survives_trial_close_then_dies_before_selected_memory
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     report = session.tune()
     assert order == ["finalize", "close_trial", "empty_cache"]
-    assert report["released_preparation_bytes"] == 1024
-    assert report["allocated_after_trial_release"] == 4096 + 512
     assert report["scratch_arena"]["candidate_reserved_bytes"] == 1024
     assert report["scratch_arena"]["selected_scratch_bytes"] == report["scratch_arena"]["reserved_bytes"] == 512
 
@@ -1154,10 +1135,7 @@ def test_published_priming_owners_can_release_candidate_storage_only_when_arena_
             owner.binding = SimpleNamespace(scratch=arena.tensor, source=source, output=output)
         register_finalizer(session, finalize, workspace=arena)
     del finalize
-    monkeypatch.setattr(session, "_allocated", lambda: 4096 + arena.nbytes +
-        (1024 if references.get("tuned", lambda: None)() is not None
-         and references["tuned"]() is not arena.tensor else 0))
-    report = session.tune()
+    session.tune()
     assert arena.nbytes == 512 and arena.frozen
     assert "default" not in references
     assert all(owner.binding.scratch is arena.tensor for owner in owners)
@@ -1165,11 +1143,9 @@ def test_published_priming_owners_can_release_candidate_storage_only_when_arena_
     if retain_arena_owner:
         assert session._published_owners["operator"] == (arena,)
         assert references["tuned"]() is None
-        assert report["allocated_after_trial_release"] == 4096 + 512
     else:
         assert references["tuned"]() is not None
         assert session._published_owners["operator"][0] is references["tuned"]()
-        assert report["allocated_after_trial_release"] == 4096 + 512 + 1024
     session.close()
     assert not session._published_owners
     assert references["tuned"]() is None

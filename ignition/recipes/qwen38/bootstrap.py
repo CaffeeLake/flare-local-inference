@@ -482,8 +482,6 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         with phase(progress, "Prepare and tune kernels") as stage, transient:
             tuning = session.tune(show_progress=progress is not None, console=stage.console)
         report(f"selected prepared kernels: {tuning['selection_counts']}")
-        report(f"preparation allocated bytes: before tuning={tuning['allocated_before_tuning']}, "
-               f"after trial release={tuning['allocated_after_trial_release']}")
         stream = torch.cuda.Stream(device=device)
         graph_pool = torch.cuda.graph_pool_handle() if package_storage is None else package_storage.graph_pool.id
         compiled_functions = {}
