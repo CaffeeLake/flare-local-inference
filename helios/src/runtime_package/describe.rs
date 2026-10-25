@@ -616,6 +616,7 @@ mod tests {
                 input_frame_bytes: 0,
                 buffers: vec![],
                 graphs: vec![wire::ExecutionGraph {
+                    confidence_width: 0,
                     name: "decode_b32".into(),
                     kind: "decode".into(),
                     sampling_mode: "sample".into(),

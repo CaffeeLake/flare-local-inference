@@ -275,9 +275,9 @@ impl Package {
         if self
             .execution
             .as_ref()
-            .is_some_and(|execution| !matches!(execution.abi_version, 2 | 3))
+            .is_some_and(|execution| execution.abi_version != crate::execution::ABI_VERSION)
         {
-            return Err(invalid("unsupported execution contract version"));
+            return Err(invalid("unsupported execution contract version; re-export the model package"));
         }
         if self.context.limits.iter().any(|limit| limit[0] > 6)
             || !(0..=3).contains(&self.context.cache)

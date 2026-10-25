@@ -178,9 +178,9 @@ and `--mtp-draft-tokens N` select supported reductions at load time;
 verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
-record no history preference. Existing packages retain their recorded defaults
-unless explicitly overridden, including copy-only packages whose prepared
-graphs remain loadable. Omitted capacity flags use package defaults. Only selected
+record no history preference. Package defaults fill omitted settings; explicit
+startup settings win. Serving requires execution ABI 4 and prepared model
+contract 2; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
@@ -218,10 +218,10 @@ explicit flags take precedence.
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing packages retain their captured catalog. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
-| `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Retained and packed proposal producers execute the full configured block; verification adapts using measured cost and historical acceptance or native proposal confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
+| `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for DeepSeek V4.1 |
-| `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. Positive-depth DeepSeek V4.1 DSpark requires adaptive verification. | Adaptive |
+| `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|low\|medium\|high\|max` | Kernel search effort. Off uses heuristics; low applies broad exclusions; medium balances search cost; high retains only conservative exclusions; max enumerates every declared legal candidate. Overrides `[preparation] autotune_effort`. | Medium |
@@ -296,10 +296,12 @@ batches 1, 2, and 4 at eight rows each; batches
 captured combined capacity at or below eight instead. At least one combined
 round must remain, and an uncaptured exact capacity fails selection.
 
-Catalogs containing separate proposal and verification graphs require the
-budget to cover the selected padded batch capacity. A maximum budget must cover
-the captured per-request verification width for either catalog. Missing required
-graphs fail before GPU initialization.
+Every speculative catalog contains complete generation programs identified by
+B/D/W/P: request capacity, actual proposal draws, per-request target capacity,
+and explicit aggregate target rows. No standalone proposal or verification
+operation is loadable. Exact host lengths support fixed ragged selection; GPU
+confidence allocation requires adaptive selection. Missing required capacities
+fail before GPU initialization.
 
 DeepSeek V4.1 defaults to BF16 MLA arithmetic. `--mla-compute-mode auto`
 lets b12x choose arithmetic. Packed KV storage remains unchanged, and compatible
@@ -479,8 +481,8 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
-| `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; existing packages retain recorded defaults unless overridden |
-| `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on split-proposal prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
+| `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; package defaults apply unless overridden |
+| `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on completed prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
@@ -488,7 +490,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Disabled |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
-probability `p` as `sqrt(p)` when choosing split-proposal verification widths
+probability `p` as `sqrt(p)` when choosing complete speculative programs
 and packed budgets. `1.0` uses the probabilities directly; values above `1.0`
 favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses existing package graphs and does not enable
@@ -539,10 +541,11 @@ the package or change its identity. `flare run` accepts numeric IPv4 and IPv6 ad
 The combined `--bind` flag has been removed.
 
 Selected concurrency and draft depth cannot exceed prepared capacity.
-Concurrency three requires the batch-four bucket. Fixed verification loads
-width `N+1` where the token envelope permits it, plus width-one execution at every
-batch; adaptive verification loads the permitted
-widths. Missing variants fail before GPU allocation. Continuation rows and
+Concurrency three requires the batch-four bucket. Fixed host allocation selects
+a supported captured width and retains width-one execution at every bucket.
+Adaptive selection retains the permitted complete B/D/W/P programs. Actual D
+cannot be inferred from W; an uncaptured draft-depth reduction fails explicitly.
+GPU confidence allocation requires adaptive selection. Missing variants fail before GPU allocation. Continuation rows and
 KV pages receive physical backing after graph upload, within fixed virtual
 extents. Reducing execution state can leave more memory for KV pages.
 
@@ -737,8 +740,7 @@ the same metadata, payloads, signatures, and location records. Converting betwee
 needs no signing key or GPU. `--output` refuses an existing destination. A
 destination on another filesystem is assembled by copying bytes, so those files
 share no storage with the cache; a destination on the cache's filesystem shares
-inodes where it can. Legacy blob publication retains its fixed 64 GiB file limit.
-Payload-format packages keep the semantic payload boundaries their export declared. No
+inodes where it can. Payload-format packages keep the semantic payload boundaries their export declared. No
 command or configuration setting selects a size-sharding threshold.
 
 Weight payloads are declared per semantic layer and stored as their own payload
@@ -754,8 +756,7 @@ fails export before publishing the primary. Declared direct capture records no
 allocation payload objects, so it needs no captured-allocation cache. Initial-state
 payloads (residual state, module globals) and executable resources are not
 weights: a graph or capacity change may produce new state and compressed executable
-frames, which such an export writes normally. Legacy blob packages retain
-their existing all-stored-data requirement, including captured-allocation data.
+frames, which such an export writes normally.
 The flag avoids temporary allocation files and duplicate weight writes. It still
 loads and prepares the checkpoint and reads captured storage to establish exact
 content identity. Changed graph captures and compressed executable resources may
@@ -778,8 +779,11 @@ Conversion accepts payload-format packages and preserves their exact signed
 bodies and payload bytes. Supply the public publisher profile for a production
 package; the local development profile is loaded automatically. `--output`
 selects a destination and `--form` selects packed or directory form. Conversion
-leaves its source intact. Legacy packages remain loadable and servable, but
-conversion and signing require a payload-format package exported by Ignition.
+leaves its source intact. Conversion rejects logical-resource containers;
+export them again with Ignition to obtain a payload package. Serving accepts
+payload format 2 and signed format-6 logical-resource containers, both requiring
+execution ABI 4 and prepared model contract 2. Other execution ABI or prepared
+contract versions require re-export.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's
 repository with the Hugging Face upload client as either canonical form. Export
@@ -1076,7 +1080,7 @@ in that scan. Ordinary loading validates signed table descriptors and file
 bounds without scanning table contents.
 Distinct payloads are hashed by up to eight workers with bounded buffers and
 byte progress. Executable resources are verified as part of kernel and graph
-preparation. Legacy packages show the stored-data stage with `--verify-weights`.
+preparation.
 Memory loading advances by bytes; kernel and execution preparation
 advance by resource counts. Stages with no known total show a cycling bar.
 Completed stages show `[    OK    ]`; a failed stage shows `[  FAILED  ]`.
@@ -1111,8 +1115,7 @@ A payload package may contain several tensor-parallel deployments.
 selector, a single-deployment package remains the default and a package with
 several deployments fails with the available sizes. An absent size lists the
 available sizes; a duplicated size fails rather than choosing one. `--rank`
-selects a rank within the chosen deployment. Legacy packages have one prepared
-rank count and reject an explicit tensor-parallel selector.
+selects a rank within the chosen deployment.
 
 Detail flags are additive:
 

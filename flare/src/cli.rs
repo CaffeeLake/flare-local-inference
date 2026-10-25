@@ -864,7 +864,7 @@ pub struct ServingOptions {
     )]
     pub no_mtp_adaptive_verification: bool,
 
-    /// Exponent on split-proposal prefix-survival scores; below 1 favors longer verification [default: 1.0].
+    /// Exponent on completed prefix-survival scores; below 1 favors longer prefixes [default: 1.0].
     #[arg(long, value_name = "ALPHA", value_parser = verification_alpha,
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,

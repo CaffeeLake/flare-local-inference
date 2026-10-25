@@ -94,6 +94,6 @@ def convert(source, destination, *, profiles=(), cache=None,
     if Path(destination).exists():
         raise FileExistsError(destination)
     if payload_form(source) == 'legacy':
-        raise ValueError('legacy packages remain loadable but cannot be converted; re-export the model')
+        raise ValueError('legacy package format is unsupported; re-export the model with Ignition')
     value = flare_heliopause.export_payload_convert(str(source), str(destination), form)
     return SimpleNamespace(**json.loads(value))

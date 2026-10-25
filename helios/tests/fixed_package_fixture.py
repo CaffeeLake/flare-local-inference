@@ -112,8 +112,13 @@ def prepare(root, shard_size=64 << 30, legacy=False):
             ready.record()
             buffers = {"frame_index": torch.zeros(1, device="cuda", dtype=torch.int32),
                        "submission_sequence": torch.zeros(1, device="cuda", dtype=torch.int64),
-                       "completion_records": torch.zeros((2, 1, 8), device="cuda", dtype=torch.int64),
+                       "completion_records": torch.zeros((2, 1, 24), device="cuda", dtype=torch.int64),
                        "source": source, "output": output}
+            records = buffers["completion_records"]
+            records[..., 4] = -1
+            records[..., 12:14] = -1
+            records[..., 15] = 1
+            records[..., 16:] = -1
             def run():
                 ready.wait()
                 scratch = transient[:source.nbytes].view(source.dtype)

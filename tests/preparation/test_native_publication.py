@@ -1,4 +1,4 @@
-"""Native payload publication, authentication, and retirement of legacy writers."""
+"""Native payload publication, authentication, and rejection of unsupported formats."""
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -32,12 +32,12 @@ def test_metadata_only_sources_cannot_select_a_legacy_publisher(tmp_path):
 
 
 @pytest.mark.parametrize('form', ['directory', 'packed'])
-def test_legacy_packages_remain_readable_but_cannot_be_converted(tmp_path, form):
+def test_unsupported_legacy_conversion_preserves_input_and_requires_reexport(tmp_path, form):
     source = tmp_path / 'legacy.safetensors'
     index = proto.ModelIndex(version=4, ranks=[proto.BundleIndex()])
     publish_legacy(source, index, [], publisher=publisher())
     assert read_index(source)[0].version == 4
-    with pytest.raises(ValueError, match='legacy packages remain loadable but cannot be converted'):
+    with pytest.raises(ValueError, match='legacy package format is unsupported; re-export'):
         convert(source, tmp_path / 'converted', form=form)
     assert not (tmp_path / 'converted').exists()
 
@@ -98,7 +98,7 @@ def test_cli_rejects_legacy_publication_without_creating_output(tmp_path, operat
     config.write_text('')
     output = tmp_path / 'output'
     args = SimpleNamespace(package=source, output=output, form='directory', config=config)
-    with pytest.raises(UsageError, match='legacy packages remain loadable'):
+    with pytest.raises(UsageError, match='legacy package format is unsupported; re-export'):
         getattr(publishing, operation)(args)
     assert not output.exists()
     assert read_index(source)[0].version == 4

@@ -80,7 +80,7 @@ pub(super) struct Candidate {
     pub duration_ns: u64,
     pub rate: ValueRate,
     pub feedback: bool,
-    pub verification_budget: Option<usize>,
+    pub host_lengths: Option<[u8; REQUEST_LANES]>,
 }
 
 impl Candidate {
@@ -107,14 +107,26 @@ impl RequestScheduler {
             }
         };
         let physical = |candidate: Candidate| [candidate.batch, candidate.capacity,
-            candidate.prefill_capacity, rows(candidate)];
+            candidate.prefill_capacity, rows(candidate), candidate.draft_tokens];
         let left = physical(smaller);
         let right = physical(larger);
-        if smaller.kind == GraphKind::PackedSpeculative || smaller.kind != larger.kind || smaller.mask != larger.mask
+        if smaller.kind != larger.kind || smaller.mask != larger.mask
             || smaller.prefill_slot != larger.prefill_slot
-            || smaller.verification_budget != larger.verification_budget
             || left == right || left.iter().zip(right).any(|(a, b)| *a > b) {
             return false;
+        }
+        if smaller.kind == GraphKind::Speculative {
+            let short = smaller.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+                self.round_lengths(smaller.mask, smaller.batch, smaller.draft_tokens,
+                    smaller.capacity, smaller.packed_token_capacity));
+            let long = larger.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+                self.round_lengths(larger.mask, larger.batch, larger.draft_tokens,
+                    larger.capacity, larger.packed_token_capacity));
+            let gpu = self.gpu_prefix_allocation(smaller.batch, smaller.draft_tokens, smaller.capacity,
+                smaller.packed_token_capacity);
+            if gpu && smaller.packed_token_capacity != larger.packed_token_capacity
+                && short.iter().sum::<usize>() > smaller.packed_token_capacity { return false; }
+            return short == long;
         }
         if smaller.kind == GraphKind::Prefill {
             return smaller.work == larger.work;
@@ -237,13 +249,6 @@ impl RequestScheduler {
             RequestPhase::Prefill => request.prefill_kind(),
             RequestPhase::Resume => GraphKind::Resume,
             RequestPhase::Decode if self.speculative_widths.is_empty() => GraphKind::Decode,
-            RequestPhase::Decode if self.split.is_some() => {
-                if self.retained_proposal(request).is_some() {
-                    GraphKind::Verification
-                } else {
-                    GraphKind::Proposal
-                }
-            }
             RequestPhase::Decode => GraphKind::Speculative,
             RequestPhase::Snapshot => GraphKind::Snapshot,
             _ => return None,
@@ -259,8 +264,6 @@ impl RequestScheduler {
         }
         if request.pending > 0
             && !(request.phase == RequestPhase::Decode
-                && self.speculative_widths.is_empty()
-                && self.capabilities.completion_inputs.is_empty()
                 && request.pending < 2
                 && !request.grammar_constrained
                 && !request.host_stops)
@@ -269,7 +272,7 @@ impl RequestScheduler {
         }
         if request.phase == RequestPhase::Decode {
             request.scheduled_consumed < self.limits.max_sequence_tokens as u64
-                && request.generated_tokens as usize + request.pending
+                && request.generated_tokens as usize + self.pending_token_ceiling(request.handle)
                     < request.max_new_tokens as usize
                 && self.fits_next_rounds(request)
         } else {
@@ -383,22 +386,13 @@ impl RequestScheduler {
                     .log_price(self.policy.delivery_fairness);
                 values[slot].reference_delivery_ms = reference;
                 values[slot].age_price = self.policy.decode_age_price;
-                let pending_delivery = self.submissions.values().any(|s| {
-                    matches!(
-                        s.kind,
-                        GraphKind::Decode | GraphKind::Speculative | GraphKind::Resume
-                    ) && s.lanes.iter().any(|l| l.request == r.handle)
-                });
-                values[slot].age_ms = if pending_delivery {
-                    0.0
-                } else {
-                    self.now_ns.saturating_add(window_ns).saturating_sub(
-                        r.accounting
-                            .last_output_ns
-                            .unwrap_or(r.accounting.last_progress_ns),
-                    ) as f64
-                        / 1e6
-                };
+                let last_delivery = self.submissions.values().filter(|submission|
+                    matches!(submission.kind, GraphKind::Decode | GraphKind::Speculative)
+                    && submission.lanes.iter().any(|lane| lane.request == r.handle))
+                    .map(|submission| submission.expected_finish_ns).max()
+                    .unwrap_or_else(|| r.accounting.last_output_ns.unwrap_or(r.accounting.last_progress_ns));
+                values[slot].age_ms = self.now_ns.saturating_add(window_ns)
+                    .saturating_sub(last_delivery) as f64 / 1e6;
             }
             scale = scale.max(token_log[slot]).max(delivery_log[slot]);
         }
@@ -608,7 +602,7 @@ impl RequestScheduler {
         let mut best: Option<(u64, ValueRate)> = None;
         let mut consider = |following, batch, width, prefill| {
             let ns = if following == GraphKind::Speculative {
-                self.proposal_round_duration(batch, width)
+                self.costs.duration(GraphKind::Speculative, batch, width).into_iter().chain(self.costs.packed_round_duration(batch, width)).min()
             } else { self.costs.shape_duration(following, batch, width, prefill) };
             let Some(ns) = ns else {
                 return;
@@ -647,8 +641,7 @@ impl RequestScheduler {
                 let ready_kind = self
                     .eligible(request)
                     .then(|| self.request_kind(request))
-                    .flatten()
-                    .map(|k| if k == GraphKind::Proposal { GraphKind::Speculative } else { k });
+                    .flatten();
                 let accepts = |k: GraphKind| {
                     if mixed {
                         k == GraphKind::Prefill || k == decode
@@ -767,9 +760,7 @@ impl RequestScheduler {
         match kind {
             GraphKind::Prefill | GraphKind::ScoredPrefill => self.prefill_work(r, capacity),
             GraphKind::Decode => 1,
-            GraphKind::Verification => self.retained_proposal(r)
-                .map_or_else(|| self.speculative_tokens(r, capacity), |p| p.width),
-            GraphKind::Speculative | GraphKind::Proposal => {
+            GraphKind::Speculative => {
                 self.speculative_tokens(r, capacity)
             }
             _ => 0,
@@ -790,10 +781,7 @@ impl RequestScheduler {
                 tokens,
                 r.consumed_tokens + tokens as u64 == r.prompt_tokens as u64,
             ),
-            GraphKind::Decode
-            | GraphKind::Speculative
-            | GraphKind::Proposal
-            | GraphKind::Verification => value.decode(
+            GraphKind::Decode | GraphKind::Speculative => value.decode(
                 self.expected_speculative_tokens(r, tokens),
                 duration_ns as f64 / 1e6,
             ),
@@ -834,11 +822,6 @@ impl RequestScheduler {
             if kind == GraphKind::Vision && capacity < r.vision_patches[0] {
                 continue;
             }
-            if kind == GraphKind::Verification
-                && self.retained_proposal(r).is_none_or(|p| p.width > capacity)
-            {
-                continue;
-            }
             offers[count] = (
                 slot,
                 self.lane_value(r, kind, capacity, duration_ns, values[slot]),
@@ -854,10 +837,12 @@ impl RequestScheduler {
             .filter(|(s, _)| selected & (1 << s) != 0)
             .map(|(_, v)| v)
             .sum();
-        let feedback = !self.costs.is_fresh(cost::Key { drafts: 0,
-            kind, batch, tokens: capacity, prefill: 0, packed: 0,
+        let drafts = if kind == GraphKind::Speculative { capacity - 1 } else { 0 };
+        let packed = if kind == GraphKind::Speculative { batch * capacity } else { 0 };
+        let feedback = !self.costs.is_fresh(cost::Key { drafts,
+            kind, batch, tokens: capacity, prefill: 0, packed,
         })
-            || !matches!(kind, GraphKind::Decode | GraphKind::Prefill)
+            || !matches!(kind, GraphKind::Decode | GraphKind::Speculative)
             || bits(selected).any(|slot| {
                 let r = self.slots[slot].request.as_ref().unwrap();
                 r.grammar_constrained
@@ -879,7 +864,7 @@ impl RequestScheduler {
                 age_price,
             )
             .unwrap_or_else(|| (selected, ValueRate::new(duration_ns, expected, age_price)));
-        output.push(Candidate { draft_tokens: 0, packed_token_capacity: 0, verification_budget: None,
+        output.push(Candidate { host_lengths: None, draft_tokens: drafts, packed_token_capacity: packed,
             kind,
             mask: selected,
             batch,
@@ -911,9 +896,7 @@ impl RequestScheduler {
     ) {
         output.clear();
         self.mixed_candidates(output, values, age_price, false);
-        if self.split.is_some() {
-            self.split_candidates(output, values, age_price, false);
-        }
+        self.packed_round_candidates(output, values, age_price, false);
         for kind in [
             GraphKind::Prefill,
             GraphKind::ScoredPrefill,
@@ -923,7 +906,6 @@ impl RequestScheduler {
             GraphKind::Snapshot,
             GraphKind::Resume,
             GraphKind::Decode,
-            GraphKind::Speculative,
         ] {
             let mask = self
                 .slots
@@ -933,9 +915,7 @@ impl RequestScheduler {
                     entry
                         .request
                         .as_ref()
-                        .filter(|r| self.eligible(r) && (self.request_kind(r) == Some(kind)
-                            || (kind == GraphKind::Speculative && r.phase == RequestPhase::Decode
-                                && !self.owns_proposal(r))))
+                        .filter(|r| self.eligible(r) && self.request_kind(r) == Some(kind))
                         .map(|_| 1u64 << slot)
                 })
                 .fold(0, |a, b| a | b);
@@ -995,9 +975,7 @@ impl RequestScheduler {
                 let Some(r) = entry.request.as_ref().filter(|r| self.eligible(r)) else {
                     continue;
                 };
-                let kind = self.request_kind(r).map(|kind| {
-                    if kind == GraphKind::Proposal && !self.owns_proposal(r) { decode } else { kind }
-                });
+                let kind = self.request_kind(r);
                 match kind {
                     Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
@@ -1052,7 +1030,7 @@ impl RequestScheduler {
                 if mask == 0 {
                     continue;
                 }
-                output.push(Candidate { draft_tokens: 0, packed_token_capacity: 0, verification_budget: None,
+                output.push(Candidate { host_lengths: None, draft_tokens: 0, packed_token_capacity: 0,
                     kind: GraphKind::Mixed,
                     mask,
                     batch,
@@ -1090,40 +1068,26 @@ impl RequestScheduler {
                 .then(b.batch.cmp(&a.batch))
                 .then(b.capacity.cmp(&a.capacity))
                 .then(b.draft_tokens.cmp(&a.draft_tokens))
-                .then_with(|| if a.kind == GraphKind::PackedSpeculative && b.kind == GraphKind::PackedSpeculative {
+                .then_with(|| if a.packed_token_capacity != 0 && b.packed_token_capacity != 0 {
                     b.packed_token_capacity.cmp(&a.packed_token_capacity)
                 } else { std::cmp::Ordering::Equal })
                 .then(b.prefill_capacity.cmp(&a.prefill_capacity))
                 .then(b.mask.cmp(&a.mask))
         };
         let ordinary = *candidates[..ordinary_count].iter().max_by(|a, b| compare(a, b))?;
-        if let Some(episode) = self.refresh_episode() {
-            let mut continuations = Vec::new();
-            self.refresh_verification_candidates(
-                &mut continuations, &values, age_price, episode.owned_mask(),
-                episode.target.filter(|target| target.kind == GraphKind::Verification),
-            );
-            let count = if episode.target.is_none() { self.prune_padding(&mut continuations) } else { continuations.len() };
-            let candidate = *continuations[..count].iter().max_by(|a, b| compare(a, b))?;
-            return self.available_plan(candidate, log_scale, episode.continuation());
-        }
         if ordinary.rate.duration_ns == 0 {
             return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
         }
-        if self.refresh_ready() && self.submissions.is_empty() {
+        if self.refresh_ready() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
                 .map(|key| (self.costs.refresh_order(key), key)).collect();
             targets.sort_by_key(|(order, _)| *order);
             let mut best: Option<(u64, cost::Key, Candidate)> = None;
             let mut choices = Vec::new();
-            let mut budget_cache = split::RefreshBudgetCache::default();
             for (order, target) in targets {
                 if best.is_some_and(|(best_order, _, _)| best_order < order) { break; }
                 choices.clear();
                 choices.extend(candidates.iter().copied().filter(|candidate| candidate.cost_key() == target));
-                if self.split.is_some() {
-                    self.split_refresh_candidates(&mut choices, target, &values, age_price, Some(&mut budget_cache));
-                }
                 if let Some(candidate) = choices.iter().copied().max_by(compare) {
                     if best.is_none_or(|(_, _, previous)| compare(&candidate, &previous).is_gt()) {
                         best = Some((order, target, candidate));
@@ -1134,7 +1098,7 @@ impl RequestScheduler {
                 return self.available_plan(candidate, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
-        if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() && self.submissions.is_empty() {
+        if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
                 return self.available_plan(candidate, log_scale, PlanOrigin::AcceptanceStart);
             }
@@ -1155,6 +1119,10 @@ impl RequestScheduler {
     }
 
     fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
+        let lengths = (candidate.packed_token_capacity != 0).then(||
+            candidate.host_lengths.map(|lengths| lengths.map(usize::from)).unwrap_or_else(||
+                self.round_lengths_optimistic(candidate.mask, candidate.batch, candidate.draft_tokens,
+                    candidate.capacity, candidate.packed_token_capacity, origin.is_acceptance())));
         let mut lanes = Vec::with_capacity(candidate.mask.count_ones() as usize);
         let mut epochs = Vec::with_capacity(lanes.capacity());
         for slot in bits(candidate.mask) {
@@ -1179,13 +1147,13 @@ impl RequestScheduler {
                         candidate.work
                     }
                 } else {
-                    if kind == GraphKind::PackedSpeculative {
-                        self.speculative_tokens(r, (candidate.draft_tokens + 1).min(candidate.capacity))
+                    if candidate.packed_token_capacity != 0 {
+                        lengths.as_ref().unwrap()[slot]
                     } else { self.lane_tokens(r, kind, candidate.capacity) }
                 },
             });
         }
-        ScheduledPlan {
+        let mut plan = ScheduledPlan {
             origin,
             selected_cost: self.selected_cost(candidate.cost_key()),
             owner: self.plan_owner.clone(),
@@ -1193,7 +1161,6 @@ impl RequestScheduler {
             estimated_duration_ns: candidate.duration_ns,
             selection_value_rate: candidate.rate.score,
             selection_log_scale: log_scale,
-            verification_budget: candidate.verification_budget,
             step: ScheduledStep { draft_tokens: candidate.draft_tokens, packed_token_capacity: candidate.packed_token_capacity,
                 kind: candidate.kind,
                 batch_capacity: candidate.batch,
@@ -1208,7 +1175,9 @@ impl RequestScheduler {
                 lanes,
                 requires_feedback: candidate.feedback,
             },
-        }
+        };
+        plan.step.requires_feedback = self.plan_requires_feedback(&plan);
+        plan
     }
 
     #[cfg(test)]

@@ -330,7 +330,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             table.sequence = sequence
             from ignition.components.readiness import ReadinessTimings
             table.timings = ReadinessTimings.allocate(frame, 1)
-            completion = CompletionOutputs.allocate((2, slots, 24 if config.mtp or config.mixed_shapes else 8), device=device)
+            completion = CompletionOutputs.allocate((2, slots, 24), device=device)
             features = VisionFeatureState.allocate(device, capacity=slots, image_slots=config.image_concurrency,
                 feature_slot=inputs.vision_feature_slot)
             vision_inputs = VisionInputs.allocate(device)

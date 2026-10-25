@@ -430,6 +430,17 @@ impl NativeModel {
                     .checked_add(plane.resident_bytes()? as u64)
                     .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
             })?;
+        let engram_tokens = engram.iter().map(|(_, ranks)| {
+            ranks.iter().flat_map(|rank| packages[*rank].execution.as_ref().unwrap().graphs.iter())
+                .filter(|graph| crate::execution::GraphKind::try_from(graph.kind.as_str())
+                    .is_ok_and(crate::engram::consumes))
+                .map(|graph| super::protobuf::size(graph.packed_tokens()))
+                .collect::<Result<Vec<_>>>()?.into_iter().max()
+                .ok_or_else(|| invalid("embedding tables lack a consuming graph"))
+        }).collect::<Result<Vec<_>>>()?;
+        let staging_bytes = engram.iter().zip(&engram_tokens).try_fold(0u64,
+            |total, ((index, _), tokens)| total.checked_add(crate::engram::staging_bytes(index, *tokens)?)
+                .ok_or_else(|| invalid("embedding staging exceeds the memory budget")))?;
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
@@ -619,9 +630,10 @@ impl NativeModel {
                 model.ranks.iter().any(|rank| rank.integrated),
             );
             let embedding_host_bytes = resident_bytes
-                .checked_add(embedding_table_cache_bytes)
+                .checked_add(staging_bytes)
+                .and_then(|bytes| bytes.checked_add(embedding_table_cache_bytes))
                 .ok_or_else(|| {
-                    invalid("embedding tables and row cache exceed the memory budget")
+                    invalid("embedding tables, staging, and row cache exceed the memory budget")
                 })?;
             let initial = match before_contexts {
                 Some(initial) => initial,
@@ -688,20 +700,8 @@ impl NativeModel {
                 let group_budget = embedding_table_cache_bytes / engram.len() as u64;
                 let files = files.direct_files().collect::<Result<Vec<_>>>()?;
                 let mut bindings = Vec::new();
-                for (index, ranks) in engram {
+                for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
                     let first = ranks[0];
-                    let tokens = ranks
-                        .iter()
-                        .flat_map(|rank| packages[*rank].execution.as_ref().unwrap().graphs.iter())
-                        .filter(|g| {
-                            matches!(
-                                g.kind.as_str(),
-                                "prefill" | "decode" | "speculative" | "mixed"
-                            )
-                        })
-                        .map(|g| g.packed_tokens() as usize)
-                        .max()
-                        .unwrap();
                     let shared = crate::engram::Shared::new(
                         index,
                         &files,

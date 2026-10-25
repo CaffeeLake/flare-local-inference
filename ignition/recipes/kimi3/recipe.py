@@ -17,7 +17,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     drafting = {}
     if plan.speculation is not None:
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
-                        speculative_token_capacity=plan.speculative_token_capacity)
+                        speculative_token_capacity=plan.speculative_token_capacity,
+                        speculative_graph_budget=plan.speculation.graph_budget or 64)
         if (Path(snapshot) / DRAFT_DIRECTORY).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / DRAFT_DIRECTORY)
         else:
@@ -63,7 +64,7 @@ RECIPE = Recipe(
         architecture="KimiK3ForConditionalGeneration", stored_bytes=1_500_516_228_062,
         device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000)),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.

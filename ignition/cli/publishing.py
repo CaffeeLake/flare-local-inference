@@ -23,7 +23,7 @@ def convert(args):
     try:
         kind = payload_form(args.package)
         if kind == 'legacy':
-            raise UsageError('legacy packages remain loadable but cannot be converted; re-export the model')
+            raise UsageError('legacy package format is unsupported; re-export the model with Ignition')
         embedded = Path(__file__).parents[2] / 'helios/src/runtime_package/publishers.json'
         profiles = json.loads(embedded.read_text()) if embedded.is_file() else []
         paths = list(args.publisher_keys)
@@ -163,7 +163,7 @@ def sign(args):
         if args.output.exists():
             raise FileExistsError(args.output)
         if payload_form(args.package) == 'legacy':
-            raise UsageError('legacy packages remain loadable but cannot be signed; re-export the model')
+            raise UsageError('legacy package format is unsupported; re-export the model with Ignition')
         publisher = _publisher(args, configuration)
         source_profile = _source_profile(args, configuration)
         target = {

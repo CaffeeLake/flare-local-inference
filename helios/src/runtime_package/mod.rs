@@ -148,7 +148,7 @@ impl ModelPackage {
 /// On-disk prepared-package formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageFormat {
-    /// Signed logical-resource packages read through the compatibility archive.
+    /// Signed format-6 logical-resource packages read through the archive.
     Legacy,
     /// Payload-identity packages read through pinned payload containers.
     Payload,
@@ -206,10 +206,8 @@ impl NativeResources {
         }
     }
 
-    /// Which on-disk package format a path holds. Detection reads only the safetensors header's
-    /// declared format and applies neither parser: legacy framing (including unaligned metadata
-    /// tensors written by older exporters) must reach its own reader unchanged, and a payload
-    /// claim only selects the payload parser, which validates it strictly.
+    /// Detect the carrier from the safetensors header before applying its reader.
+    /// Logical-resource and payload readers validate their own framing and metadata.
     pub fn package_format(path: &Path) -> Result<PackageFormat> {
         let path = if path.is_dir() {
             path.join("model.safetensors")
@@ -226,8 +224,8 @@ impl NativeResources {
 
     /// Load one rank of the selected deployment from either format.
     ///
-    /// Payload packages authenticate the selected deployment and rank and read only their pinned
-    /// payloads; legacy packages keep their existing conversion and verification path.
+    /// Each carrier authenticates the selected rank and validates its prepared
+    /// execution contract before replay.
     ///
     /// # Safety
     /// The package must be trusted and the selected device must match its architecture.
@@ -351,16 +349,30 @@ impl NativeResources {
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
             };
-            for [limit, value] in &package.context.limits {
+            let configured = (|| -> Result<()> {
+                for [limit, value] in &package.context.limits {
+                    owner.driver.check(
+                        "cuCtxSetLimit",
+                        (owner.driver.context_limit)(*limit as i32, *value),
+                    )?;
+                }
                 owner.driver.check(
-                    "cuCtxSetLimit",
-                    (owner.driver.context_limit)(*limit as i32, *value),
-                )?;
+                    "cuCtxSetCacheConfig",
+                    (owner.driver.context_cache)(package.context.cache),
+                )
+            })();
+            // Creation pushes the context; later operations bind it without
+            // retaining creation-stack entries that could outlive the owner.
+            let mut popped = null_mut();
+            let restored = owner.driver.check(
+                "cuCtxPopCurrent_v2",
+                (owner.driver.context_pop)(&mut popped),
+            );
+            configured?;
+            restored?;
+            if popped != owner.context {
+                return Err(invalid("CUDA context creation stack differs from its owner"));
             }
-            owner.driver.check(
-                "cuCtxSetCacheConfig",
-                (owner.driver.context_cache)(package.context.cache),
-            )?;
             Ok(owner)
         }
     }

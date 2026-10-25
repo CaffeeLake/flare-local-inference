@@ -30,17 +30,11 @@ pub(super) fn size(value: u64) -> Result<usize> {
 }
 
 pub(super) fn serving_contract(
-    mut value: wire::ServingContract,
-    prepared_concurrency: u64,
+    value: wire::ServingContract,
+    _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if let Some(vision) = value
-        .model_contract
-        .as_mut()
-        .and_then(|model| model.vision.as_mut())
-    {
-        if vision.max_images > 0 && vision.feature_slots == 0 {
-            vision.feature_slots = prepared_concurrency;
-        }
+    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 2) {
+        return Err(invalid("unsupported prepared model contract version; re-export the model package"));
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
     value.as_object_mut().unwrap().retain(|_, v| !v.is_null());
@@ -345,50 +339,6 @@ mod tests {
             assert_eq!(actual.context.flags, expected.context.flags);
             assert_eq!(actual.allocations.len(), expected.allocations.len());
             assert_eq!(actual.graphs.len(), expected.graphs.len());
-        }
-    }
-
-    #[test]
-    fn packed_rows_preserve_absent_field_semantics_and_honor_explicit_bounds() {
-        // Serialized verification metadata predating the separate physical-row field.
-        let bytes = b"\x12\x0cverification\x20\x08\x28\x06";
-        let legacy = wire::ExecutionGraph::decode(bytes.as_slice()).unwrap();
-        assert_eq!(legacy.packed_token_capacity, 0);
-        assert_eq!(legacy.packed_tokens(), 48);
-        let mut encoded = bytes.to_vec();
-        encoded.extend_from_slice(b"\x68\x18");
-        let packed = wire::ExecutionGraph::decode(encoded.as_slice()).unwrap();
-        assert_eq!(packed.packed_tokens(), 24);
-        assert_eq!(packed.token_capacity, 6);
-        let mut json = serde_json::to_value(&legacy).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("packed_token_capacity");
-        let restored: wire::ExecutionGraph = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.packed_tokens(), 48);
-    }
-
-    #[test]
-    fn omitted_vision_slots_inherit_prepared_concurrency() {
-        for (prepared, slots, images, expected) in
-            [(16, 0, 4, 16), (3, 0, 4, 3), (16, 4, 4, 4), (16, 0, 0, 0)]
-        {
-            let value = wire::ServingContract {
-                max_active: Some(2),
-                model_contract: Some(wire::ModelContract {
-                    vision: Some(wire::VisionCapacity {
-                        feature_slots: slots,
-                        max_images: images,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let decoded = wire::ServingContract::decode(value.encode_to_vec().as_slice()).unwrap();
-            let json = serving_contract(decoded, prepared).unwrap();
-            assert_eq!(json["model_contract"]["vision"]["feature_slots"], expected);
-            assert_eq!(json["max_active"], 2);
         }
     }
 
@@ -709,42 +659,31 @@ mod tests {
     }
 
     #[test]
-    fn packed_combined_metadata_is_additive_and_unknown_operations_are_rejected() {
-        let legacy =
-            wire::ExecutionGraph::decode(b"\x12\x0cverification\x20\x08\x28\x06".as_slice())
-                .unwrap();
-        assert_eq!(legacy.draft_tokens, None);
-        assert_eq!(legacy.verify_tokens, None);
-        assert_eq!(legacy.packed_token_capacity, 0);
-        assert_eq!(
-            crate::model::contract::GraphOperation::try_from(11).unwrap(),
-            crate::model::contract::GraphOperation::Verification
-        );
-        assert_eq!(
-            crate::model::contract::ValueSource::try_from(5).unwrap(),
-            crate::model::contract::ValueSource::QueryLength
-        );
-        assert!(crate::model::contract::GraphOperation::try_from(99).is_err());
-        assert!(crate::model::contract::ValueSource::try_from(99).is_err());
+    fn unified_generation_rejects_removed_operations_and_preserves_geometry() {
+        for operation in [0, 10, 11, 13, 99] {
+            assert!(crate::model::contract::GraphOperation::try_from(operation).is_err());
+        }
+        for kind in ["proposal", "verification", "packed_speculative"] {
+            assert!(crate::execution::GraphKind::try_from(kind).is_err());
+        }
         let graph = wire::ExecutionGraph {
-            kind: "packed_speculative".into(),
-            batch_capacity: 32,
-            token_capacity: 6,
-            draft_tokens: Some(1),
-            verify_tokens: Some(6),
-            packed_token_capacity: 128,
-            draft_source: 1,
-            ..Default::default()
+            kind: "speculative".into(), batch_capacity: 32, token_capacity: 6,
+            draft_tokens: Some(7), verify_tokens: Some(6), packed_token_capacity: 128,
+            draft_source: 1, ..Default::default()
         };
         let restored = wire::ExecutionGraph::decode(graph.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(
-            (
-                restored.draft_tokens,
-                restored.verify_tokens,
-                restored.packed_token_capacity
-            ),
-            (Some(1), Some(6), 128)
-        );
+        assert_eq!((restored.draft_tokens, restored.verify_tokens, restored.packed_token_capacity),
+            (Some(7), Some(6), 128));
+    }
+
+    #[test]
+    fn prepared_contract_versions_require_reexport() {
+        for version in [0, 1, 3] {
+            let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
+                version, ..Default::default()
+            }), ..Default::default() };
+            assert!(serving_contract(value, 4).unwrap_err().to_string().contains("re-export"));
+        }
     }
 
     #[cfg(feature = "server")]

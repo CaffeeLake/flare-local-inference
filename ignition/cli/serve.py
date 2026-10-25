@@ -468,7 +468,7 @@ def serve(args) -> int:
             prepared.close()
             raise UsageError("this prepared recipe does not declare packed verification capacities")
         if plan.speculation.draft_prefix_selection == "gpu" and not any(
-                signature.kind == "packed_speculative" for signature in local_model.signatures.values()):
+                signature.kind == "speculative" and signature.confidence_width > 0 for signature in local_model.signatures.values()):
             prepared.close()
             raise UsageError("this prepared recipe does not declare GPU prefix-selection rounds")
     if args.direct:

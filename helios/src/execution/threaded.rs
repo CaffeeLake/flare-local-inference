@@ -3,6 +3,7 @@
 use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, Upload};
 use crate::{Error, ExecutionError, Result, Shutdown, cache::Fence};
 use std::{
+    collections::VecDeque,
     sync::{Arc, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -54,11 +55,12 @@ impl Step {
 }
 enum Command {
     Prepare(Arc<Step>),
-    Commit,
+    Commit(Fence, usize),
     Drain,
 }
 enum Reply {
-    Ready,
+    Initialized,
+    Ready(Fence, usize),
     Complete(FrameCompletion),
     Drained,
 }
@@ -66,7 +68,6 @@ struct Peer {
     sender: mpsc::Sender<Command>,
     receiver: mpsc::Receiver<Result<Reply>>,
     thread: Option<JoinHandle<Shutdown>>,
-    completion: Option<FrameCompletion>,
 }
 impl Peer {
     fn send(&self, command: Command) -> Result<()> {
@@ -80,11 +81,19 @@ impl Peer {
     }
 }
 
+struct Pending {
+    step: Arc<Step>,
+    dispatched: Instant,
+    committed: bool,
+    queued: bool,
+    ready: Vec<bool>,
+    completions: Vec<Option<FrameCompletion>>,
+}
+
 pub(crate) struct ThreadedExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
-    pending: Option<Instant>,
-    completion: Option<FrameCompletion>,
+    pending: VecDeque<Pending>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
 }
@@ -106,8 +115,7 @@ impl ThreadedExecutor {
         let mut result = Self {
             local,
             peers: Vec::new(),
-            pending: None,
-            completion: None,
+            pending: VecDeque::with_capacity(2),
             poison: None,
             shutdown: None,
         };
@@ -145,7 +153,6 @@ impl ThreadedExecutor {
                 sender,
                 receiver,
                 thread: Some(thread),
-                completion: None,
             };
             let ready = match peer.receiver.recv_timeout(TIMEOUT) {
                 Ok(reply) => reply,
@@ -158,7 +165,7 @@ impl ThreadedExecutor {
                     std::process::abort();
                 }
             };
-            if !matches!(ready, Ok(Reply::Ready)) {
+            if !matches!(ready, Ok(Reply::Initialized)) {
                 drop(peer.sender);
                 let _ = peer.thread.take().unwrap().join();
                 return Err(ready
@@ -173,12 +180,17 @@ impl ThreadedExecutor {
         self.local.manifest()
     }
     pub fn outstanding(&self) -> usize {
-        usize::from(self.pending.is_some())
+        self.pending.len()
     }
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
-            && self.pending.is_none()
+            && self.pending.len() < 2
+            && self.pending.back().is_none_or(|frame| frame.committed)
+            && (!grammar || self.pending.is_empty())
+            && !self.pending.iter().any(|frame| frame.step.grammar || !matches!(
+                self.local.manifest().graphs[frame.step.graph].kind,
+                super::GraphKind::Decode | super::GraphKind::Speculative))
             && self.local.can_submit(grammar)
     }
     pub fn next_fence(&self) -> Result<Fence> {
@@ -188,7 +200,10 @@ impl ThreadedExecutor {
         if self.shutdown.is_some() {
             return Err(invalid("rank executor is closed"));
         }
-        self.local.next_fence()
+        match self.pending.back() {
+            Some(frame) if !frame.committed => Ok(Fence(frame.step.fence.0 + 1)),
+            _ => self.local.next_fence(),
+        }
     }
     pub fn submit(
         &mut self,
@@ -197,48 +212,31 @@ impl ThreadedExecutor {
         grammar: bool,
     ) -> Result<Option<Fence>> {
         self.next_fence()?;
-        if self.pending.is_some() {
-            return Ok(None);
-        }
+        let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
+            Some(super::GraphKind::Decode | super::GraphKind::Speculative));
+        if !self.can_submit(barrier) { return Ok(None); }
         let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
             return Ok(None);
         };
-        let result = (|| {
-            let dispatched = Instant::now();
-            let step = Arc::new(Step {
-                fence,
-                graph,
-                grammar,
-                uploads: uploads
-                    .iter()
-                    .map(|u| OwnedUpload {
-                        buffer: u.buffer.to_owned(),
-                        offset: u.offset,
-                        bytes: u.bytes.to_vec(),
-                    })
-                    .collect(),
-            });
-            for peer in &self.peers {
-                peer.send(Command::Prepare(step.clone()))?;
+        let step = Arc::new(Step {
+            fence, graph, grammar,
+            uploads: uploads.iter().map(|u| OwnedUpload {
+                buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
+            }).collect(),
+        });
+        let queued = !self.pending.is_empty();
+        self.pending.push_back(Pending {
+            step: step.clone(), dispatched: Instant::now(), committed: false, queued,
+            ready: vec![false; self.peers.len()],
+            completions: (0..=self.peers.len()).map(|_| None).collect(),
+        });
+        for peer in &self.peers {
+            if let Err(error) = peer.send(Command::Prepare(step.clone())) {
+                self.poison = Some(error.clone());
+                return Err(error);
             }
-            for peer in &self.peers {
-                if !matches!(peer.receive()?, Reply::Ready) {
-                    return Err(invalid("rank did not validate the step"));
-                }
-            }
-            self.pending = Some(dispatched);
-            for peer in &self.peers {
-                peer.send(Command::Commit)?;
-            }
-            if self.local.submit(graph, uploads, grammar)? != Some(fence) {
-                return Err(invalid("rank-zero fence changed after validation"));
-            }
-            Ok(Some(fence))
-        })();
-        if let Err(error) = &result {
-            self.poison = Some(error.clone());
         }
-        result
+        Ok(Some(fence))
     }
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
         if let Some(error) = &self.poison {
@@ -254,58 +252,85 @@ impl ThreadedExecutor {
         }
     }
     fn poll_ranks(&mut self) -> Result<Option<FrameCompletion>> {
-        let Some(started) = self.pending else {
-            return Ok(None);
-        };
-        if started.elapsed() > TIMEOUT {
+        if self.pending.iter().any(|frame| frame.dispatched.elapsed() > TIMEOUT) {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
-        if self.completion.is_none() {
-            // Inspect both tags before moving the large inline completion.
-            // Empty polls must not copy its inactive record storage.
-            match self.local.poll() {
-                Ok(None) => {}
-                Ok(Some(completion)) => self.completion = Some(completion),
-                Err(error) => return Err(error),
+        if let Some(completion) = self.local.poll()? {
+            let frame = self.pending.iter_mut().find(|frame| frame.step.fence == completion.fence)
+                .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
+            if frame.completions[0].replace(completion).is_some() {
+                return Err(invalid("duplicate rank-zero completion"));
             }
-        }
-        for peer in &mut self.peers {
-            if peer.completion.is_some() {
-                continue;
-            }
-            match peer.receiver.try_recv() {
-                Ok(Ok(Reply::Complete(completion))) => peer.completion = Some(completion),
-                Ok(Err(error)) => return Err(error),
-                Err(mpsc::TryRecvError::Empty) => {}
-                _ => return Err(invalid("rank thread failed to return graph completion")),
-            }
-        }
-        if self.completion.is_none() || self.peers.iter().any(|p| p.completion.is_none()) {
-            return Ok(None);
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
-            let agreement = if self.local.manifest().graphs[self.completion.as_ref().unwrap().graph_index].kind
-                == super::GraphKind::PackedSpeculative { super::parallel::agree_packed } else { super::parallel::agree };
-            agreement(
-                self.completion.as_ref().unwrap(),
-                peer.completion.as_ref().unwrap(),
-            )
-            .map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
-            self.completion.as_mut().unwrap().timing.merge_rank(index + 1,
-                peer.completion.as_ref().unwrap().timing)?;
-            peer.completion = None;
+            loop {
+                let reply = match peer.receiver.try_recv() {
+                    Ok(reply) => reply?,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(_) => return Err(invalid("rank thread disconnected")),
+                };
+                match reply {
+                    Reply::Ready(fence, graph) => {
+                        let frame = self.pending.iter_mut().find(|f| f.step.fence == fence)
+                            .ok_or_else(|| invalid("unexpected rank readiness fence"))?;
+                        if frame.step.graph != graph || frame.ready[index] || frame.committed {
+                            return Err(invalid("rank readiness identity or state differs"));
+                        }
+                        frame.ready[index] = true;
+                    }
+                    Reply::Complete(completion) => {
+                        let expected = self.pending.iter_mut()
+                            .find(|f| f.completions[index + 1].is_none())
+                            .ok_or_else(|| invalid("unexpected rank completion"))?;
+                        if !expected.committed || expected.step.fence != completion.fence
+                            || expected.step.graph != completion.graph_index {
+                            return Err(invalid("rank completion order or identity differs"));
+                        }
+                        expected.completions[index + 1] = Some(completion);
+                    }
+                    _ => return Err(invalid("unexpected rank thread reply")),
+                }
+            }
         }
-        self.completion.as_mut().unwrap().timing.wall_ns =
-            started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.pending = None;
-        Ok(self.completion.take())
+        for frame in &mut self.pending {
+            if frame.committed { continue; }
+            if !frame.ready.iter().all(|ready| *ready) { break; }
+            let uploads = frame.step.uploads();
+            if self.local.validate_submission(frame.step.graph, &uploads, frame.step.grammar)?
+                != Some(frame.step.fence) {
+                return Err(invalid("rank-zero reservation changed before commit"));
+            }
+            for peer in &self.peers {
+                peer.send(Command::Commit(frame.step.fence, frame.step.graph))?;
+            }
+            if self.local.submit(frame.step.graph, &uploads, frame.step.grammar)? != Some(frame.step.fence) {
+                return Err(invalid("rank-zero fence changed after validation"));
+            }
+            frame.committed = true;
+        }
+        if !self.pending.front().is_some_and(|frame| frame.completions.iter().all(Option::is_some)) {
+            return Ok(None);
+        }
+        let mut frame = self.pending.pop_front().unwrap();
+        let mut root = frame.completions[0].take().unwrap();
+        for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
+            let completion = completion.unwrap();
+            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
+                super::parallel::agree_speculative
+            } else { super::parallel::agree };
+            agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
+            root.timing.merge_rank(index + 1, completion.timing)?;
+        }
+        root.timing.queued = frame.queued;
+        root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        Ok(Some(root))
     }
     pub fn close(&mut self) -> Shutdown {
         if let Some(shutdown) = &self.shutdown {
             return shutdown.clone();
         }
         let result = (|| {
-            while self.pending.is_some() {
+            while !self.pending.is_empty() {
                 self.poll()?;
                 thread::sleep(Duration::from_micros(50));
             }
@@ -358,54 +383,61 @@ fn rank_loop(
             .send(Ok(reply))
             .map_err(|_| invalid("rank coordinator disconnected"))
     };
-    send(Reply::Ready)?;
-    while let Ok(command) = receive(&commands, None) {
+    send(Reply::Initialized)?;
+    let mut prepared: Option<Arc<Step>> = None;
+    let mut prepared_at: Option<Instant> = None;
+    let mut started = VecDeque::new();
+    loop {
+        let command = if executor.outstanding() == 0 && prepared.is_none() {
+            match receive(&commands, None) { Ok(command) => Some(command), Err(_) => return Ok(()) }
+        } else {
+            match commands.try_recv() {
+                Ok(command) => Some(command),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(_) => return Err(invalid("rank coordinator disconnected during execution")),
+            }
+        };
         match command {
-            Command::Prepare(step) => {
-                let uploads = step.uploads();
-                if executor.validate_submission(step.graph, &uploads, step.grammar)?
-                    != Some(step.fence)
-                {
+            Some(Command::Prepare(step)) => {
+                if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
+                if executor.validate_submission(step.graph, &step.uploads(), step.grammar)? != Some(step.fence) {
                     return Err(invalid("rank submission fence differs"));
                 }
-                send(Reply::Ready)?;
-                if !matches!(receive(&commands, Some(TIMEOUT)), Ok(Command::Commit)) {
-                    return Err(invalid("rank commit missing after preparation"));
-                }
-                if executor.submit(step.graph, &uploads, step.grammar)? != Some(step.fence) {
+                send(Reply::Ready(step.fence, step.graph))?;
+                prepared = Some(step);
+                prepared_at = Some(Instant::now());
+            }
+            Some(Command::Commit(fence, graph)) => {
+                prepared_at = None;
+                let step = prepared.take().ok_or_else(|| invalid("rank commit arrived without preparation"))?;
+                if step.fence != fence || step.graph != graph { return Err(invalid("rank commit identity differs")); }
+                if executor.submit(graph, &step.uploads(), step.grammar)? != Some(fence) {
                     return Err(invalid("rank fence changed after validation"));
                 }
-                let started = Instant::now();
-                loop {
-                    match executor.poll() {
-                        Ok(None) => {}
-                        Ok(Some(completion)) => {
-                            send(Reply::Complete(completion))?;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                    if started.elapsed() > TIMEOUT {
-                        return Err(invalid("rank graph completion deadline expired"));
-                    }
-                    thread::yield_now();
-                }
+                started.push_back(Instant::now());
             }
-            Command::Drain => {
+            Some(Command::Drain) => {
+                if prepared.is_some() || executor.outstanding() != 0 { return Err(invalid("rank drain arrived with outstanding frames")); }
                 let shutdown = executor.close();
-                if !shutdown.drained {
-                    return Err(invalid("rank streams did not drain"));
-                }
-                if let Some(error) = shutdown.error {
-                    return Err(error);
-                }
+                if !shutdown.drained { return Err(invalid("rank streams did not drain")); }
+                if let Some(error) = shutdown.error { return Err(error); }
                 send(Reply::Drained)?;
                 return Ok(());
             }
-            Command::Commit => return Err(invalid("rank commit arrived without preparation")),
+            None => {}
         }
+        if let Some(completion) = executor.poll()? {
+            started.pop_front();
+            send(Reply::Complete(completion))?;
+        }
+        if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {
+            return Err(invalid("rank commit deadline expired after preparation"));
+        }
+        if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
+            return Err(invalid("rank graph completion deadline expired"));
+        }
+        if executor.outstanding() != 0 || prepared.is_some() { thread::yield_now(); }
     }
-    Ok(())
 }
 
 fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
@@ -446,6 +478,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
                 && a.batch_capacity == b.batch_capacity
                 && a.token_capacity == b.token_capacity
                 && a.draft_tokens == b.draft_tokens
+                && a.confidence_width == b.confidence_width
                 && a.packed_token_capacity == b.packed_token_capacity
                 && a.prefill_capacity == b.prefill_capacity
                 && a.input_bindings.len() == b.input_bindings.len()
@@ -599,14 +632,14 @@ mod tests {
             } else {
                 super::super::tests::manifest()
             };
-            root.abi_version = 3;
+            root.abi_version = super::super::ABI_VERSION;
             let records = root.buffers.iter_mut().find(|b| b.name == "completion_records").unwrap();
             records.nbytes = 2 * 4 * 24 * 8;
             records.shape = vec![2, 4, 24];
             records.strides = vec![4 * 24, 24, 1];
             root.buffers.push(BufferDescriptor {
-                name: "proposal_confidence".into(), address: 0x30000, nbytes: 4 * 5 * 4,
-                dtype: Dtype::Float32, shape: vec![4, 5], strides: vec![5, 1],
+                name: "proposal_confidence".into(), address: 0x30000, nbytes: 2 * 4 * 5 * 4,
+                dtype: Dtype::Float32, shape: vec![2, 4, 5], strides: vec![20, 5, 1],
             });
             root.buffers.push(BufferDescriptor {
                 name: "prefill_row".into(), address: 0x40000, nbytes: 4,
@@ -617,10 +650,7 @@ mod tests {
                 ("prefill", GraphKind::Prefill, 1, 4096, 0, 0),
                 ("decode", GraphKind::Decode, 4, 1, 0, 0),
                 ("resume", GraphKind::Resume, 4, 1, 0, 0),
-                ("speculative", GraphKind::Speculative, 4, 6, 0, 0),
-                ("proposal", GraphKind::Proposal, 4, 6, 0, 0),
-                ("verification", GraphKind::Verification, 4, 6, 0, 0),
-                ("packed", GraphKind::Verification, 4, 6, 0, 12),
+                ("speculative", GraphKind::Speculative, 4, 6, 0, 12),
                 ("mixed", GraphKind::Mixed, 4, 6, 4096, 0),
             ].into_iter().enumerate().map(|(index, (name, kind, batch, width, prefill, packed))| {
                 let mut graph = template.clone();
@@ -631,6 +661,7 @@ mod tests {
                 graph.token_capacity = width;
                 graph.prefill_capacity = prefill;
                 graph.packed_token_capacity = packed;
+                if kind == GraphKind::Speculative { graph.draft_tokens = 5; graph.confidence_width = 5; }
                 if kind == GraphKind::Mixed {
                     graph.input_bindings.push(InputBinding {
                         buffer_name: "prefill_row".into(), host_offset: root.input_frame_bytes, nbytes: 4,
@@ -669,7 +700,7 @@ mod tests {
                 // A repeated member of one delivery group would corrupt its completion accounting.
                 assert!(!same_layout(&ranks[0], &ranks[0]));
                 let mut bad = ranks[1].clone();
-                bad.graphs[6].input_bindings[0].host_offset += 8;
+                bad.graphs[3].input_bindings[0].host_offset += 8;
                 assert!(!same_layout(&ranks[0], &bad));
                 let mut bad = ranks[1].clone();
                 bad.buffers[2].shape[1] += 1;
@@ -678,3 +709,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "runtime-package"))]
+#[path = "threaded/cuda_tests.rs"]
+mod cuda_tests;

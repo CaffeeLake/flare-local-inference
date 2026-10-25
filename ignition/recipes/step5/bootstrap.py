@@ -161,7 +161,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if config.mtp else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         coordinator = CollectivePreparation(group)
         collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens),
             hidden_size=weights.config.hidden, element_bytes=4, ipc=package_storage.peer_storage)

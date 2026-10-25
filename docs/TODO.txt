@@ -83,10 +83,13 @@
     and exec_handover reproduces with both Python and native exporters.
 
 [ ] Qualify retained graph costs and funded remeasurement in live Helios:
-    idle/resume, concurrent decode latency, cost-change recovery, and split
-    proposal/verification transitions. Use per-fence scheduler traces and request
+    idle/resume, concurrent decode latency, cost-change recovery, and queued
+    generation transitions. Use per-fence scheduler traces and request
     latency measurements; measure GPU replay, queueing, and host planning separately.
     See scheduling-runtime-design.md#funded-timing-refresh.
+
+[ ] Extend the two-frame submission window to nonterminal prefill with
+    device-owned continuation positions and fenced cache reservations.
 
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.

@@ -169,11 +169,12 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         raise UsageError("--speculative-token-capacity must cover the maximum verification width")
     packed = default.packed_verification and drafts > 0
     prefix_selection = default.draft_prefix_selection if drafts else "cpu"
-    if packed and not adaptive:
+    if prefix_selection == "gpu" and not adaptive:
         raise UsageError(f"{alias} requires adaptive verification; --no-mtp-adaptive-verification does not apply")
-    if explicit_graph_budget and not (packed and adaptive):
-        raise UsageError("--speculative-graph-budget requires packed adaptive learned speculation with positive draft depth")
-    budget = graph_budget.value if packed else None
+    physical_catalog = packed
+    if explicit_graph_budget and not (physical_catalog and drafts > 0):
+        raise UsageError("--speculative-graph-budget requires a packed target catalog with positive draft depth")
+    budget = graph_budget.value if physical_catalog and drafts > 0 else None
     if budget is not None and (type(budget) is not int or budget < 1):
         raise UsageError("--speculative-graph-budget must be a positive integer")
     draft_head = getattr(args, "draft_head_quantization", None)

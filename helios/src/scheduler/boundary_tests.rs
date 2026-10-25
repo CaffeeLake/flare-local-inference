@@ -31,6 +31,7 @@ fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, act
             },
             draft_pages_per_request: 1,
             completion_inputs: vec![],
+            speculative_allocations: vec![],
             state_rows_per_request: None,
         },
     )

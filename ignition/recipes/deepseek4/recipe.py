@@ -24,7 +24,7 @@ def prepare(
         {}
         if speculation is None
         else {"speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
-              "speculative_fixed_width": speculation.fixed_width,
+              "speculative_graph_budget": speculation.graph_budget or 64, "speculative_fixed_width": speculation.fixed_width,
               "draft_head_quantization": speculation.draft_head_quantization,
               "markov_head_quantization": speculation.markov_head_quantization}
     )
@@ -77,7 +77,7 @@ RECIPE = Recipe(
     concurrency=32,
     max_concurrency=64,
     prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5, token_capacity=128),
+    speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=5,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,

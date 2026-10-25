@@ -4,9 +4,9 @@ Flare serves a prepared model from a runtime package containing everything a Rus
 process needs to rebuild the model's CUDA graphs and storage without a Python
 interpreter. The [package format](package-format-design.md) defines a packed
 `.safetensors` file and a directory form with `model.safetensors` plus immutable
-payload companions. The Flare model cache stores the directory form. Legacy
-packages retain their primary and sibling payload layout. Preparation happens in Python
-with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
+payload companions. The Flare model cache stores the directory form. Serving
+requires execution ABI 4 and prepared model contract 2; other versions require
+re-export. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
 the package, the Rust `flare` executable, and its system library dependencies
 (including libturbojpeg). Python and preparation tools are not required.
 The [core design](core-design.md) defines the model contracts, scheduling,
@@ -146,24 +146,19 @@ pool holds only graph-local intermediates and is also cleared, as are unused
 bytes in the preparation allocator. Weight tensors, MTP weights, rotary
 tables, pointer tables, and required initialized metadata retain their contents.
 
-Legacy packages use envelope version 6 with a hash-named snapshot container
-(`__metadata__: {"format": "flare-snapshot"}`) or the older `format: flare`
-container with physical payloads in numbered companions. Their authenticated
-`ModelIndex` version 4 or 5 addresses logical payload files, and
-`flare.layout` maps signed logical ranges to physical blobs. `StoredData.parts`,
-logical filenames, the 64 GB shard limit, the 100 logical-file and 65,536
-segment bounds, and key-free layout conversion apply only to these legacy
-packages. Unsigned rank staging uses `format: flare-staging` and cannot load.
-The canonical payload format replaces all of this with signed content ids,
-payload-relative initializers, and unsigned physical locations; see
-[payload packages](package-format-design.md).
+Serving accepts payload format 2 and signed format-6 logical-resource containers,
+with execution ABI 4 and prepared model contract 2 required in both carriers.
+Packages with another execution ABI or prepared contract require re-export with
+Ignition and fail loading before graph replay. Unsigned rank staging cannot load.
+The canonical format uses signed content IDs, payload-relative initializers,
+and unsigned physical locations; see [payload packages](package-format-design.md).
 
 `ModelIndex.contract` is a typed `ServingContract`. It declares serving defaults
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
 completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
-`Struct` configuration is not accepted. Execution ABI 2/3 and protected envelope
-version 6 are versioned separately from legacy model-index versions 4 and 5.
+`Struct` configuration is not accepted. Execution ABI 4, model contract 2, and
+payload format 2 are independent version domains.
 
 Two prepared-contract fields fail validation when absent or out of
 range. `vision` must decode to a well-formed `VisionCapabilities`: a
@@ -195,8 +190,7 @@ and layouts. Marker strings, feature tokens, and atomic
 image spans are data. Enum zero and unknown identifiers are rejected; enum
 numbers are stable and removed values must be reserved. Frontend identifiers
 cannot select scheduler, cache, text-graph packing, or completion policy.
-The serialized `prefix_boundary` field remains readable for package compatibility;
-message checkpoints derive from exact rendered prefixes without role filters.
+Message checkpoints derive from exact rendered prefixes without role filters.
 
 The index stores complete recipe-declared sampling parameters in
 `DefaultSamplingParameters` and structural frontend settings in
@@ -220,18 +214,11 @@ checkpoint config files, then exports only these consumed fields. The only front
 payload assets are `tokenizer.json` and the Jinja chat template; raw generation,
 tokenizer, processor, and model configuration files are not included.
 
-Legacy packages pack whole resources into hash-named blobs whose names are the
-SHA-256 of the complete safetensors file, and every resource span stores a
-logical sibling `filename`, a byte `offset` relative to that file's logical
-`flare.payload`, and its byte length. Canonical payload packages instead bind
-destination ranges to signed content objects and place those objects through
-unsigned locations; their payload descriptors, aggregation, and initializers are
-defined only in [payload packages](package-format-design.md).
-
-The legacy index is
-limited to 128 MiB and contains ordered rank bundles, peer-memory ownership,
-serving configuration, frontend asset spans, allocation descriptions, kernel
-metadata, and graph declarations. Each tensor-parallel size requires a distinct export.
+Payload descriptors bind destination ranges to signed content objects. Unsigned
+locations supply physical placement. Payload aggregation and initializers are
+defined in [payload packages](package-format-design.md). The metadata declares
+rank bundles, peer-memory ownership, serving configuration, frontend assets,
+allocations, kernels, and graph programs for each prepared deployment.
 
 Graph bodies, cubins, module globals, packed tensor data, tokenizer data, and
 other frontend assets live in separate indexed payload spans. A decoded graph body contains its declared number of nodes followed by its
@@ -311,14 +298,10 @@ with the total elapsed time.
 
 ### File placement and addressing
 
-Legacy package readers retain the 64 GB blob bound, including the 4096-byte
-header. Layout JSON carries `version: 1` and a `files` mapping from logical names
-to ordered `[length, blob]` segments, with at most 100 logical files and 65,536
-segments. Layout supplies physical addressing; signed bounds, compressed chunk
-hashes, and stored-data hashes authenticate reconstructed logical bytes. The
-loader pins selected blobs and rejects resources spanning blobs or padding.
-Legacy packages remain readable and servable. Export, conversion, and signing
-produce only the payload format.
+Payload packages use signed content IDs and unsigned locations. Signed format-6
+logical-resource containers use the archive reader and must declare execution
+ABI 4 and prepared model contract 2. Payload conversion accepts only payload
+packages; converting logical-resource containers requires re-export with Ignition.
 
 Canonical payload packages do not use logical filenames, layout segments, or
 key-free conversion of signed logical ranges: they use signed content ids,
@@ -355,10 +338,15 @@ Ignition does not yet provide that importer or a package rebuild command.
 `--no-weights` continues to prepare from the source checkpoint and reuse cached
 payloads. Offloaded embedding planes retain their existing typed table metadata.
 
+Speculative rebuild metadata records the resolved physical graph-count budget
+as `RebuildSpeculation.graph_budget`. Packed speculative preparation requires
+an explicit positive budget; rebuilding a catalog must use that recorded value
+rather than selecting a recipe default.
+
 Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
 `--all` includes the tensor catalogs. Absent manifests are reported as null.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
-catalog versions. Previously exported packages need no conversion to serve.
+catalog versions. Serving still requires execution ABI 4 and model contract 2.
 Changing signed rebuild metadata requires signing the package again.
 
 ### Publisher authentication and executable access
@@ -515,50 +503,36 @@ starting at zero, while loading progress retains the CLI's GPU labels. Flare
 sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requires
 compiled cubins; missing native GPU code fails instead of compiling PTX.
 
-`LoadOptions` selects runtime concurrency, MTP draft-token count, and adaptive
-or fixed verification before any CUDA context is initialized. Ignition captures
-every power-of-two request bucket through the padded concurrency maximum.
-Width one covers every bucket; wider speculative and verification graphs require
-`batch_capacity * token_capacity <= speculative_token_capacity`. The capacity
-defaults to the larger of padded concurrency and maximum verification width.
-Proposal graphs independently cover every bucket at the configured draft depth. Mixed graph coverage is sparse over prompt capacity
-and verification width; see [mixed execution](scheduling-runtime-design.md).
-Execution metadata
-identifies graph kind, sampling mode, batch capacity, token capacity, draft
-source, draft count, and verification count; the
-loader uses these fields rather than graph names to select variants. It checks
-required batch coverage and identical selected catalogs across TP ranks.
-The scheduler compares declared prefill capacities by useful service and
-estimated graph duration. A package must include its configured maximum prefill chunk;
-intermediate capacities are optional and need not follow a generated sequence.
-Draft count and verification count are independent declaration fields.
-Verification count includes the pending input token. Proposal graphs declare
-only draft count and source; verification graphs declare only verification count.
-A split catalog retains one configured proposal depth in both adaptive and fixed
-verification modes. Packages containing several producer depths load only the
-selected depth; shorter producers never enter scheduling or probe selection.
-Verification prefixes and packed target capacities remain adaptive. Packages
-containing only the maximum proposal depth remain supported. Combined graphs declare both
-counts. For a selected combined batch and width, the loader chooses one permitted draft count;
-it never loads duplicate MTP alternatives for that shape. The index lists
-each graph's function dependencies, so kernel selection also precedes graph
-body reads. Selection does not infer semantics from graph names.
+`LoadOptions` selects runtime concurrency, maximum actual MTP draft count, and
+adaptive or fixed prefix selection before CUDA initialization. Every required
+power-of-two request bucket has width-one execution. Wider programs fit the
+prepared aggregate target envelope. A package must include its configured
+maximum prefill chunk; intermediate prefill capacities are optional.
 
-`flare run` accepts `--max-concurrency N`, `--mtp-draft-tokens N`, and either
-`--mtp-adaptive-verification` or `--no-mtp-adaptive-verification`. Unspecified
-settings retain package defaults. Reductions must be supported by captured
-graphs; a concurrency limit of three still requires the batch-four bucket.
-Zero drafts selects ordinary prefill, decode, mixed, resume, and prefix-cache operations.
-The graph catalog's optional `speculation_enabled` field declares which serving
-mode an operation supports; absent means shared by both modes. Preparation includes
-ordinary operations alongside speculative operations, including width-one rounds
-that maintain draft state for subsequent wider rounds. Selection removes all
-unneeded variants before reading graph bodies. Captured weights and storage layouts
-remain shared; pinned zero does not execute draft generation or state maintenance.
-Missing variants required by the declared envelope and increases beyond package
-capacities fail before allocation. Split catalogs also require proposal-free
-width-one speculative graphs. Fixed loading retains those graphs and width-one
-verification alongside the full loaded width where the envelope permits it.
+Execution metadata identifies complete speculative programs by B/D/W/P: request
+capacity, captured proposal depth, per-request target capacity including the pending
+token, and physical aggregate target rows. P is explicit for rectangular programs
+as well as ragged programs. D is independent of W and must describe the captured
+computation. The loader selects supported reductions from actual programs, rejects
+uncaptured capacities, and verifies identical selected catalogs across ranks.
+Each program's function dependencies allow kernel selection before graph-body
+reads. Graph names do not select semantics.
+
+`QueryLength` inputs bind exact host-selected lengths. `SpeculativePrefixLimit`
+inputs bind immutable ceilings and leave actual lengths to a captured GPU causal
+allocator. Fixed prefix selection supports host-allocated ragged programs; GPU
+allocation requires adaptive selection. A confidence output declares
+`confidence_width` and uses FP32 `[2, request_slots, draft_capacity]` frames.
+
+`flare run` accepts `--max-concurrency`, `--mtp-draft-tokens`, and adaptive/fixed
+selection flags. Unspecified values retain package defaults. A concurrency limit
+of three requires the batch-four bucket. Zero drafts selects ordinary prefill,
+decode, mixed, resume, and prefix-cache operations. The optional
+`speculation_enabled` field selects complete serving modes for shared operations.
+Preparation includes ordinary programs and width-one speculative programs that
+preserve draft context. Selection removes unused variants before reading graph
+bodies; captured weights and storage remain shared. There are no standalone
+proposal or verification operations or separate packed-speculative operation.
 
 Unselected graph templates and executables are never reconstructed. Functions
 used only by omitted graphs are dropped, as are unused modules without globals.

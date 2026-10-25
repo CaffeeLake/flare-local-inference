@@ -101,43 +101,15 @@ impl Fixture {
     }
 
     fn worker_for(&self, receiver: mpsc::Receiver<Vec<Incoming>>) -> Worker<'_> {
+        let manifest = crate::model::testing::manifest(&self.config);
         let mut scheduler = RequestScheduler::new(
             self.config.identity,
             self.config.limits,
-            crate::model::scheduler_capabilities(&self.config),
-        )
-        .unwrap();
-        let mut graphs = Vec::new();
-        for batch in [1, 2, 4] {
-            for kind in [
-                GraphKind::Init,
-                GraphKind::Restore,
-                GraphKind::Snapshot,
-                GraphKind::Resume,
-                GraphKind::Decode,
-                GraphKind::Speculative,
-                GraphKind::Prefill,
-            ] {
-                for width in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                    graphs.push(crate::execution::GraphDescriptor {
-                        draft_tokens: 0,
-                        packed_token_capacity: 0,
-                        name: format!("{kind:?}-{batch}-{width}"),
-                        kind,
-                        sampling_mode: crate::execution::SamplingMode::General,
-                        handle: 1,
-                        batch_capacity: batch,
-                        token_capacity: if kind == GraphKind::Prefill {
-                            64
-                        } else {
-                            width
-                        },
-                        prefill_capacity: 0,
-                        estimated_duration_ns: 1000,
-                        input_bindings: vec![],
-                    });
-                }
-            }
+            crate::model::scheduler_capabilities_with_manifest(&self.config, &manifest).unwrap(),
+        ).unwrap();
+        let mut graphs = manifest.graphs.clone();
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = 1000;
         }
         scheduler.measured_graph_durations(&graphs).unwrap();
         if self.config.history_drafts
@@ -945,8 +917,9 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
     let mut manifest = crate::model::testing::manifest(&fixture.config);
     let name = "Speculative-4-8";
     let graph = manifest.graphs.iter_mut().find(|g| g.name == name).unwrap();
-    graph.kind = GraphKind::PackedSpeculative;
+    graph.kind = GraphKind::Speculative;
     graph.draft_tokens = 7;
+    graph.confidence_width = 7;
     graph.packed_token_capacity = 9;
     let contract = fixture
         .config
@@ -955,7 +928,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         .iter_mut()
         .find(|g| g.graph == name)
         .unwrap();
-    contract.kind = GraphOperation::PackedSpeculative;
+    contract.kind = GraphOperation::Speculative;
     for input in &mut contract.inputs {
         if input.source == ValueSource::QueryLength {
             input.source = ValueSource::SpeculativePrefixLimit;
@@ -964,19 +937,20 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
     let mut scheduler = RequestScheduler::new(
         fixture.config.identity,
         fixture.config.limits,
-        crate::model::scheduler_capabilities(&fixture.config),
+        crate::model::scheduler_capabilities_with_manifest(&fixture.config, &manifest).unwrap(),
     )
     .unwrap();
     let graphs: Vec<_> = manifest
         .graphs
         .iter()
-        .filter(|g| g.kind != GraphKind::Speculative || g.token_capacity == 1)
+        .filter(|g| g.kind != GraphKind::Speculative || g.token_capacity == 1 || g.name == name)
         .cloned()
         .map(|mut g| {
-            g.estimated_duration_ns = match g.kind {
-                GraphKind::Speculative | GraphKind::Decode => 100_000,
-                GraphKind::PackedSpeculative => 10_000,
-                _ => 100,
+            g.estimated_duration_ns = if g.name == name { 10_000 } else {
+                match g.kind {
+                    GraphKind::Speculative | GraphKind::Decode => 100_000,
+                    _ => 100,
+                }
             };
             g
         })
@@ -985,7 +959,6 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
     scheduler
         .enable_speculation(&(1..=8).collect::<Vec<_>>())
         .unwrap();
-    scheduler.split_speculation(8).unwrap();
     let (sender, receiver) = mpsc::channel();
     let mut generations = Vec::new();
     for token in 0..3 {
@@ -1011,7 +984,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         let (plan, _) = worker.plan(0).unwrap();
         let step = plan.unwrap();
         worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
-        if step.kind == GraphKind::PackedSpeculative {
+        if step.kind == GraphKind::Speculative {
             break step;
         }
         let frame = completion(
@@ -1042,7 +1015,7 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         });
     }
     worker
-        .complete(GraphKind::PackedSpeculative, frame)
+        .complete(GraphKind::Speculative, frame)
         .unwrap();
     let metrics = fixture.metrics.snapshot(true);
     assert_eq!(
@@ -2886,6 +2859,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         pending_token: None,
     });
     manifest.graphs.push(GraphDescriptor {
+        confidence_width: 0,
         draft_tokens: 0,
         name: "Vision-1-256".into(),
         kind: GraphKind::Vision,

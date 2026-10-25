@@ -15,7 +15,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.components.parallel import TensorParallelShard
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_shapes, speculative_token_capacity
+from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_token_capacity
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
@@ -68,15 +68,23 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    speculative_graph_budget: int = 64
 
     @property
-    def speculative_shapes(self):
-        return (speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
-                if self.draft_checkpoint is not None else ())
+    def speculative_round_shapes(self):
+        from ignition.components.capacity import parallel_speculative_shapes
+
+        return parallel_speculative_shapes(self.max_active, self.speculative_widths,
+            self.speculative_token_capacity, self.speculative_graph_budget,
+            fixed_width=self.speculative_fixed_width) if self.draft_checkpoint is not None else ()
 
     @property
     def decode_tokens(self):
-        return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
+        return max((packed for _, _, packed in self.speculative_round_shapes), default=request_capacity(self.max_active))
+
+    @property
+    def decode_samples(self):
+        return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -89,7 +97,7 @@ class PreparationConfig:
             raise ValueError("LiLiCorr supports at most seven draft tokens")
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the captured widths")
-        _ = self.speculative_shapes
+        _ = self.speculative_round_shapes
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
             raise ValueError("Nemotron-H context must be 128-aligned in [128,262144]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
@@ -133,7 +141,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if drafting else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "draft": weights.config.draft.text if drafting else None,
@@ -174,14 +182,15 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             buffers=graph_buffers, layer_buffers=layer_buffers)
     modes = (True, False) if drafting else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
-             + len(batch_sizes) + len(config.speculative_shapes) + len(PATCH_CAPACITIES))
+             + len(batch_sizes) + len(config.speculative_round_shapes) + len(PATCH_CAPACITIES))
     with phase(progress, "Construct graph catalog", total=count) as stage:
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
-            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled)
+            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
+                packed_token_capacity=packed_tokens)
             stage.update(advance=1)
 
         for capacity in reversed(PATCH_CAPACITIES):
@@ -218,13 +227,14 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         if speculation is not None:
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
-            for batch, width in sorted(config.speculative_shapes, reverse=True):
-                name = f"speculative{batch}x{width}"
-                speculation.begin(batch, width)
+            for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda shape: (shape[2], shape[0]), reverse=True):
+                name = f"speculative{batch}x{width}-tokens{packed}"
+                speculation.begin(batch, width, packed)
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                                                     buffers=speculation.cursor)
+                    buffers=speculation.cursor, target_token_capacity=packed)
                 forward.prepare()
-                add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"), enabled=True)
+                add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"),
+                    enabled=True, packed_tokens=packed)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             mode_weights = weights if enabled else replace(weights, draft=None)
@@ -283,7 +293,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         sampling_defaults=RECIPE.sampling_defaults.as_dict(), assets=assets,
         model_contract=prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency, vocabulary=vocabulary, draft_lag=0 if drafting else None))
     if drafting:
-        server_config.update(speculative_widths=config.speculative_widths,
+        server_config.update(speculative_widths=tuple(sorted({width for _, width, _ in config.speculative_round_shapes})),
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
             speculative_fixed_width=config.speculative_fixed_width)
     free, total = torch.cuda.mem_get_info(device)

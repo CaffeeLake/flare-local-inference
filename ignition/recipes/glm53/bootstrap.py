@@ -312,7 +312,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if config.mtp else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         # One rank holds whole sums and vocabularies: it prepares no collectives.
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage
@@ -484,7 +484,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                           pages=pool.memory_capacity[1:], shards=shards,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None)
                     forward = PreparedGeneration(decoders[name], batch, completion, frame, sequence,
-                        pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation", replicated_sampling=enabled)
+                        pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation")
                     if enabled:
                         from .speculative import PreparedPrefill
 
@@ -507,7 +507,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 name = f"resume{capacity}" + suffix
                 resume = PreparedResume(weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name, replicated_sampling=enabled)
+                    coordinator=coordinator, session=session, name=name)
                 add(name, resume, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix

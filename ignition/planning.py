@@ -354,7 +354,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")
-    if (speculation is not None and speculation.packed_verification and speculation.adaptive
+    if (speculation is not None and speculation.packed_verification
             and speculation.draft_tokens > 0
             and speculation.graph_budget is None and recipe.speculation is not None):
         speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)

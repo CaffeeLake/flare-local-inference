@@ -184,19 +184,14 @@ pub(crate) fn execution(
             .get("speculation_enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if kind == "packed_speculative" {
+        if kind == "speculative" || kind == "mixed" && speculative {
+            if !graph.contains_key("draft_tokens") {
+                return Err(super::invalid("speculative graph lacks explicit proposal depth"));
+            }
             graph.insert("verify_tokens".into(), width.into());
             graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "speculative" || kind == "mixed" && speculative {
-            graph.insert("draft_tokens".into(), width.saturating_sub(1).into());
-            graph.insert("verify_tokens".into(), width.into());
-            graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "proposal" {
-            graph.insert("draft_tokens".into(), width.saturating_sub(1).into());
-            graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "verification" {
-            graph.insert("verify_tokens".into(), width.into());
         }
+
     }
     message("Execution", &value)
 }
@@ -976,7 +971,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":3,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3}]});
+        let input = serde_json::json!({"abi_version":4,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));
