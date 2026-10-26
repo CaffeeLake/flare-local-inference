@@ -11,7 +11,7 @@ from ignition import planning
 from ignition.cli import display
 from ignition.errors import CapacityError, UsageError
 from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
-from ignition.recipes import recipes
+from ignition.recipes import ResolvedModel, recipes
 
 GIB, MIB = 1 << 30, 1 << 20
 
@@ -241,9 +241,10 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
         derive(reserve=16, prefill_chunk=65536)
 
 
-@pytest.mark.parametrize("alias,world_size,packed", [
-    (checkpoint.alias, 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
-     recipe.speculation.packed_verification)
+@pytest.mark.parametrize("model,world_size,packed", [
+    pytest.param(ResolvedModel(recipe, checkpoint),
+                 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+                 recipe.speculation.packed_verification, id=checkpoint.alias)
     for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
 ])
 @pytest.mark.parametrize("flags,configuration_text,expected", [
@@ -252,16 +253,14 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
     (("--max-concurrency", "8", "--prefill-chunk-size", "1024", "--speculative-token-capacity", "192"),
      '[models."{alias}"]\nmax_concurrency=16\nspeculative_token_capacity=96\n', (8, 1024, 192)),
 ])
-def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, alias, world_size, packed,
+def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, model, world_size, packed,
                                                                  flags, configuration_text, expected):
     from ignition.cli import _parser, preparation
     from ignition.cli.config import Configuration
-    from ignition.recipes import resolve
 
     path = tmp_path / "flare.toml"
-    path.write_text(configuration_text.format(alias=alias))
+    path.write_text(configuration_text.format(alias=model.checkpoint.alias))
     configuration = Configuration.load(path)
-    model = resolve(alias)
     if expected is None:
         expected = (4, 4096, 6) if model.recipe.name == "gemma4" else (32, 4096, 128)
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])

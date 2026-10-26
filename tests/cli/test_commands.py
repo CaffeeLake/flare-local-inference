@@ -285,3 +285,12 @@ def test_native_dense_activations_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).native_dense_activations
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--native-dense-activations"]).native_dense_activations
+
+
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_lock_gpu_clocks_flag(command):
+    from ignition.cli import _parser
+
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).lock_gpu_clocks
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--lock-gpu-clocks"]).lock_gpu_clocks

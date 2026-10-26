@@ -140,6 +140,15 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
+`--lock-gpu-clocks` locks each participating GPU to its maximum supported
+graphics frequency for the b12x tuning batch. It applies to serving ranks and
+extra tuning replicas, and does nothing with `--autotune-effort off`. The GPU's
+UUID selects the device under `CUDA_VISIBLE_DEVICES`. Run with permission to
+control clocks: Ignition uses `sudo -n nvidia-smi` when not root. Unsupported
+clock control or missing permission fails preparation. Locks reset to driver
+defaults after tuning or a Python exception; preexisting manual clock locks
+are not restored. Memory clocks and tuning caches are unchanged.
+
 Without extra tuning replicas, tensor-parallel ranks on identical GPUs divide
 each kernel race's candidates and adopt the fastest measured configuration.
 This applies within one host as well as across hosts. Fixed collective kernels

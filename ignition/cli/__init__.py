@@ -185,6 +185,9 @@ def _preparation_arguments(running):
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"
                                " check that pruning drops no winners (default: default)")
+    advanced.add_argument("--lock-gpu-clocks", action="store_true",
+                          help="lock each tuning GPU to its maximum supported graphics clock during"
+                               " autotuning; requires root or noninteractive sudo for nvidia-smi")
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")

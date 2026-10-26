@@ -651,3 +651,9 @@ def test_native_dense_activations_reach_plan(host, monkeypatch, native):
     assert main(["serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
     assert host["plan"].native_dense_activations is native
     assert host["plan"].to_dict()["native_dense_activations"] is native
+
+
+def test_lock_gpu_clocks_reaches_preparation_plan(host):
+    assert export("qwen3.8-flash", "--lock-gpu-clocks") == 0
+    assert host["plan"].lock_gpu_clocks is True
+    assert host["plan"].to_dict()["lock_gpu_clocks"] is True
