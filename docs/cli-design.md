@@ -509,7 +509,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
-| `--embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Disabled |
+| `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
 probability `p` as `sqrt(p)` when choosing complete speculative programs
@@ -538,8 +538,11 @@ existing memory budget. The cache remains fixed in size while serving and warms
 from requests each time the server starts.
 
 `--embedding-table-resident-scales` loads the original scale plane into immutable
-host RAM before KV sizing. It applies to every table in the package's embedding
-catalog, including Qwen PLE and DeepSeek Engram. The loader uses the declared
+host RAM before KV sizing. Disk-backed tables enable this by default unless any
+selected GPU shares host memory, as on DGX Spark. Explicit enable and disable
+flags override the hardware default on each host. RAM table storage and packages
+without embedding tables do not enable it automatically. It applies to every
+table in the package's embedding catalog, including Qwen PLE and DeepSeek Engram. The loader uses the declared
 weight and scale row sizes; it does not select behavior by model identity.
 Weight rows remain on disk, and a row-cache miss reads
 only the weight plane. The resident scale allocation is additional to

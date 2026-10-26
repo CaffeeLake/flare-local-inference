@@ -438,7 +438,9 @@ buffers and signal captured consumer events. Preparation appends the immutable
 checkpoint slices without materializing the tables. Packages containing shared
 table planes retain their prepared replicated computation and shared row delivery.
 For disk storage, `--embedding-table-resident-scales` retains the original scale
-bytes in RAM and removes scale reads on row-cache misses. DeepSeek V4.1 Flash
+bytes in RAM and removes scale reads on row-cache misses. This is enabled by
+default on discrete GPUs and disabled when any selected GPU shares host memory.
+Use `--no-embedding-table-resident-scales` to disable it explicitly. DeepSeek V4.1 Flash
 TP4 uses about 1.4 GiB per rank for these scales, in addition to any row-cache
 budget. The loader reserves this memory before sizing KV storage.
 Select four available GPUs explicitly:
