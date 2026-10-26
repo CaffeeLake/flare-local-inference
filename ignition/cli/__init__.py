@@ -121,7 +121,8 @@ def _preparation_arguments(running):
     running.add_argument("model", nargs="?", metavar="MODEL",
                          help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")
     running.add_argument("--gpus", metavar="LIST",
-                         help="GPU indices as NVML enumerates them, such as 0, 0,1, or 0-3;"
+                         help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
+                              " such as 0, 0,1, or 0-3;"
                               " their count is the tensor-parallel size (default: first GPUs that fit)")
     running.add_argument("--max-concurrency", type=int, metavar="N",
                          help="maximum simultaneously active requests (default: defaults.max_concurrency,"
@@ -210,7 +211,7 @@ def _preparation_arguments(running):
                                " default: checkpoint precision)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
-                               " pages (Kimi K3; default: the recipe's image support)")
+                               " pages (recipes with a separable encoder; default: the recipe's image support)")
 
 
 def main(argv=None) -> int:

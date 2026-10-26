@@ -22,22 +22,23 @@ there is no package.
 
 ## Usage
 
-On one host, GLM-5.3 Flash at TP1 on a GB300:
+On one host, reproduce an eight-request GLM-5.3 Flash workload at TP1 on a GB300:
 
 ```sh
 CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct
+  --max-concurrency 8 --direct
 CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --eager
+  --max-concurrency 8 --direct --eager
 ```
 
-Across DGX Sparks, rank zero adds `--ranks N --rendezvous ADDR:PORT` and each
+Across DGX Sparks, this example prepares 16 concurrent requests. Rank zero
+adds `--ranks N --rendezvous ADDR:PORT` and each
 peer runs `ignition join` exactly as for in-process serving
 ([multi-host.md](multi-host.md)); peers learn the execution mode from rank zero:
 
 ```sh
 .venv/bin/ignition serve glm-5.3-flash --ranks 4 --rendezvous 10.200.0.12:29630 \
-  --gpus 0 --max-concurrency 16 --host 0.0.0.0 --port 8000 --direct
+  --gpus 0 --max-concurrency 16 --host 0.0.0.0 --direct
 .venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 4   # and ranks 2, 3
 ```
 
@@ -53,9 +54,9 @@ decode rounds from those times (see "Eager forwards"):
 
 ```sh
 CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --graph-times glm-tp1-c8.json
+  --max-concurrency 8 --direct --graph-times glm-tp1-c8.json
 CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --eager --graph-times glm-tp1-c8.json
+  --max-concurrency 8 --direct --eager --graph-times glm-tp1-c8.json
 ```
 
 The listener answers non-streaming `POST /v1/chat/completions`, `GET

@@ -1,6 +1,6 @@
 # Working on Flare
 
-Flare is a local inference server for NVIDIA SM120/SM121 GPUs. Ignition, the
+Flare is a local inference server for NVIDIA SM103/SM120/SM121 GPUs. Ignition, the
 Python package in `ignition/`, prepares models with PyTorch, Transformers, and
 FlashInfer, including b12x. Its `flare_heliopause` extension is built by the
 `heliopause/` crate. The Rust CLI in `flare/` links Helios, the runtime library
@@ -120,6 +120,11 @@ model-specific launch instructions, and hardware setup. The
 [CLI design](docs/cli-design.md) defines flags, configuration, signing, and
 package selection.
 
+Use the preparation guide's [DeepSeek V4.1](docs/model-preparation.md#deepseek-v41-flash)
+or [DeepSeek V4](docs/model-preparation.md#deepseek-v4-flash) commands for those
+models. For repeated exports with compatible weights, follow
+[re-exporting with cached weights](docs/model-preparation.md#re-exporting-with-cached-weights).
+
 For serving-only Rust changes, rebuild Flare and load a compatible package.
 To exercise changes to prepared kernels, capacities, or the package format,
 export a package containing those changes. Packages must satisfy the declared
@@ -129,8 +134,9 @@ Launch an exported package with `flare/target/release/flare run PACKAGE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
 
-For development without export, `ignition serve` requires Heliopause's
-`qualification` Cargo feature; follow the
+For development without export, native `ignition serve` requires Heliopause's
+`qualification` Cargo feature. Diagnostic `ignition serve --direct` does not.
+Follow the
 [development launch instructions](docs/cli-design.md#development-without-package-export).
 
 ## Architecture and ownership

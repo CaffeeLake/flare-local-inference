@@ -86,7 +86,7 @@ hashing, copying, cache reuse, compression, and publication progress. Export
 publishes a directory entry in the shared model cache and selects it as the
 model's default. Ignition exits without opening a listener after publication.
 Launch the exported package
-with `flare run PACKAGE`. Qwen, GLM, and DeepSeek provide native package storage support.
+with `flare run PACKAGE`.
 Tensor-parallel packages contain one resource bundle per selected GPU and load
 in one process with one execution thread per rank. API keys are excluded from
 the package.
@@ -95,7 +95,7 @@ Build the public serving executable, which links the Helios library:
 
 ```sh
 cargo build --release --manifest-path flare/Cargo.toml
-flare/target/release/flare run PACKAGE --gpus 0 --host 127.0.0.1 --port 8000
+flare/target/release/flare run PACKAGE --gpus 0
 ```
 
 ```
@@ -197,7 +197,7 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | Flag | Meaning | Default |
 |---|---|---|
 | `MODEL` | Alias such as `qwen3.8-flash`, Hugging Face repository id such as `org/name` or `org/name@revision`, or checkpoint directory | `defaults.model` |
-| `--gpus LIST` | GPU indices as NVML enumerates them: `0`, `0,1`, `0-3`. The count is the tensor-parallel size and must be one the recipe supports. | First GPUs that fit |
+| `--gpus LIST` | Indices relative to `CUDA_VISIBLE_DEVICES` when set, otherwise NVML indices: `0`, `0,1`, `0-3`. The count is the tensor-parallel size and must be one the recipe supports. | First GPUs that fit |
 | `--max-concurrency N` | Maximum simultaneously active requests, 1 through the recipe's limit | `defaults.max_concurrency`, else the recipe default |
 | `--host ADDR` | Listening address. `serve` only. | `server.host`, else `127.0.0.1` |
 | `--port N` | Listening port. `serve` only. | `server.port`, else `8000` |
@@ -207,7 +207,6 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--reuse-weights` | Reuse the cached default version's weight hashes and mappings without reading live or cached weight payloads; requires matching checkpoint and prepared layouts | Off |
 | `--publisher-key PATH` | Public publisher profile authenticating the cached weight source | Embedded profiles and the local development profile |
 | `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
-| `--staging PATH` | Export workspace | `paths.export_staging` |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Normal export reuses matching cached weight payloads automatically after hashing
@@ -241,8 +240,8 @@ explicit flags take precedence.
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
-| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 |
-| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for DeepSeek V4.1 |
+| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
+| `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
@@ -265,11 +264,13 @@ recorded in the plan and the exported graph catalog; it changes graph scheduling
 not kernel selection, so its packages share tuned kernels with overlapped ones.
 
 Gemma 4 defaults to four concurrent requests and six speculative target-token
-rows. Other recipes default to 32 concurrent requests, with speculative recipes
-declaring 128 target-token rows. Their rectangular catalogs cover the recipe's
-full draft depth through batch 16 and up to three drafts at batch 32; Step-5's three-draft catalog
-covers its full depth at batch 32. Each recipe selects its proposal and
-prefix-allocation mode.
+rows. Other recipes default to 32 concurrent requests and 128 target-token rows.
+Qwen3.8 Flash, Qwen3.8 27B, and GLM 5.3 use rectangular catalogs covering five
+drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
+covers its full three-draft depth at batch 32. DeepSeek V4/V4.1, MiMo V2.6 Pro,
+Kimi K3, Nemotron Bolt, and MiniMax M3.1 use packed catalogs with a default
+budget of 64 round graphs plus width-one continuations. Each recipe selects
+its proposal and prefix-allocation mode.
 DeepSeek V4.1 defaults to seven draft tokens, concurrency 32, a 4096-token
 prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
@@ -289,24 +290,24 @@ physical target capacity to 24 rows while retaining six-token per-request prefix
 ```sh
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 8 --mtp-draft-tokens 5 \
-  --speculative-token-capacity 24 --prefill-chunk-size 4096 --verbose
+  --speculative-token-capacity 24
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
 Packed packages require adaptive execution at their captured draft depth, or
 `--mtp-draft-tokens 0` for ordinary execution. Native serving uses all captured
 packed capacities by default. Prefer `--mtp-max-verification-token-budget N` to
-retain every captured capacity at or below a ceiling; for example:
+retain every captured capacity at or below a ceiling. This example limits the
+24-row package above to at most 16 target rows per round:
 
 ```sh
 ./flare/target/release/flare run \
   /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors \
-  --gpus 0,1,2,3 --mtp-max-verification-token-budget 24 \
-  --host 127.0.0.1 --port 8001
+  --gpus 0,1,2,3 --mtp-max-verification-token-budget 16
 ```
 
 For a controlled comparison, replace the maximum flag with
-`--mtp-verification-token-budget 24` to select one exact captured capacity per
+`--mtp-verification-token-budget 16` to select one exact captured capacity per
 batch, bounded by that batch's full prefix extent. The exact and maximum flags
 are mutually exclusive and require a packed adaptive catalog.
 
@@ -328,15 +329,11 @@ fail before GPU initialization.
 
 DeepSeek V4.1 defaults to BF16 MLA arithmetic. `--mla-compute-mode auto`
 lets b12x choose arithmetic. Packed KV storage remains unchanged, and compatible
-kernels still autotune. The pinned
-FlashInfer dependency supplies the required preparation API. For example:
+kernels still autotune. To use automatic MLA arithmetic with the recipe's
+capacity defaults:
 
 ```sh
-.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
-  --max-concurrency 8 --mtp-draft-tokens 5 \
-  --speculative-token-capacity 24 --prefill-chunk-size 4096 \
-  --mla-compute-mode bf16 --verbose
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24-bf16.safetensors
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 --mla-compute-mode auto
 ```
 
 The arithmetic choice applies to target, prefill, and draft attention and is
@@ -393,14 +390,13 @@ sizes the serving cache from the memory available after loading the model.
 Select idle serving GPUs explicitly. Tensor-parallel preparation distributes
 forward compilation across the ranks within their memory budgets. Compiler
 workers release their CUDA contexts before cache storage is materialized.
-Build the extension once, then start a TP2 DeepSeek V4 development server:
+Build the extension once, then start a TP2 DeepSeek V4 development server
+with recipe defaults:
 
 ```sh
 uv pip install --python .venv/bin/python --no-deps ./heliopause \
   --config-settings 'build-args=--features=qualification'
-.venv/bin/ignition serve deepseek-v4-flash --gpus 0,1 \
-  --max-concurrency 1 --mtp-draft-tokens 3 --no-mtp-adaptive-verification \
-  --prefill-chunk-size 4096 --host 127.0.0.1 --port 8001 --verbose
+.venv/bin/ignition serve deepseek-v4-flash --gpus 0,1
 ```
 
 Rebuild the extension after changing its Rust code. Python recipe and component
@@ -417,19 +413,18 @@ Compressed routed-expert scales remain in GPU memory. Serialized layers reuse sc
 b12x prepares the scales needed by its selected MoE kernel before execution.
 Kernel autotuning uses the selected effort across the supported execution plans.
 
-DeepSeek V4.1 development serving keeps its Engram table partitions in RAM. Allow
-about 189 GiB of host RAM across the four ranks, in addition to preparation and
-serving memory. Each rank loads the checkpoint spans for its six hash heads into
-immutable resident storage. Requests gather rows from RAM without reading the
-checkpoint files or calling Python. Each rank owns its delivery staging and CUDA
-events. This development path supports ranks on one host and uses RAM only.
+DeepSeek V4.1 development serving keeps the complete Engram tables in shared
+RAM. Allow about 189 GiB of host RAM, in addition to preparation and serving
+memory. Rank zero loads the checkpoint spans once and shares their descriptors
+with the local ranks. Requests gather rows from RAM without reading the
+checkpoint files or calling Python. Each rank owns its delivery staging and
+CUDA events. This development path supports ranks on one Linux host and uses
+RAM only.
 
 With four serving GPUs, run:
 
 ```sh
-.venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3 \
-  --max-concurrency 32 --mtp-draft-tokens 5 --prefill-chunk-size 4096 \
-  --speculative-token-capacity 128 --host 0.0.0.0 --port 8001 --verbose
+.venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3
 ```
 
 The command prepares and captures graphs, loads the RAM tables once, and starts
@@ -440,21 +435,10 @@ for final native performance validation: development ranks run in separate
 processes with separate delivery staging, while the native CLI shares staging
 between its rank threads.
 
-DeepSeek V4.1 exports combined packed rounds with GPU prefix allocation by
-default. This command uses the recipe's concurrency 32, seven draft tokens,
-4096-token prefill chunk, and 128 physical target rows:
-
-```sh
-.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/ds41-tp4-c32-d7-p128.safetensors
-```
-
-The default catalog contains 64 packed rounds with logical width eight and six
-proposal-free width-one rounds. Packed execution generates the seven-draft block,
-then allocates actual prefixes on the GPU within each request's immutable limit
-and the captured aggregate row capacity. It reports one terminal completion.
-Ordinary prefill, decode, and maintenance graphs remain available when native
-serving selects `--mtp-draft-tokens 0`.
+For export, conversion, and native serving, use the
+[DeepSeek V4.1 workflow](model-preparation.md#deepseek-v41-flash).
+[Re-exporting with cached weights](model-preparation.md#re-exporting-with-cached-weights)
+shows how to rebuild a compatible package with `--reuse-weights`.
 
 ### 3.2 Native serving flags
 
@@ -564,7 +548,6 @@ for requests. It replaces the package aliases; the canonical model ID remains
 accepted and appears as the model card's `root`. The override does not modify
 the package or change its identity. `flare run` accepts numeric IPv4 and IPv6 addresses through
 `--host`; use an unbracketed IPv6 address such as `--host ::1 --port 8001`.
-The combined `--bind` flag has been removed.
 
 Selected concurrency and draft depth cannot exceed prepared capacity.
 Concurrency three requires the batch-four bucket. Fixed host allocation selects
@@ -972,9 +955,11 @@ cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native b
 `[models.<alias>]` overrides `[defaults]`; flags override both.
 Both sections accept `speculative_token_capacity`, overridden during preparation
 by `--speculative-token-capacity`. Omitting it uses the recipe declaration when
-supplied: every speculative recipe declares 128 target rows.
+supplied: all speculative recipes except Gemma 4 declare 128 target rows.
+Gemma 4 derives the larger of padded concurrency and draft count plus one,
+giving six rows at its defaults.
 Both sections also accept positive integer `speculative_graph_budget`, overridden
-by `--speculative-graph-budget`. DeepSeek V4.1 declares 64 packed round graphs.
+by `--speculative-graph-budget`. Packed recipes declare 64 round graphs.
 The `[defaults]` graph budget applies only to active packed adaptive learned
 speculation; unsupported recipes, `--no-mtp`, and zero draft depth ignore it.
 An explicit flag or model-specific graph budget rejects those incompatible modes.
@@ -1022,7 +1007,7 @@ Configuration assigns each decision to one owner:
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
 | Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the package reserve |
-| Preparation headroom | 1 GiB for compiled warmup and capture |
+| Preparation headroom | 1 GiB for compiled warmup and capture, plus 128 KiB per effective prefill token above 4096, including mixed prompt/decode rows |
 | Serving driver margin | 64 MiB after graph upload |
 | Prefill chunk | Recipe default, overridden by `--prefill-chunk-size` |
 | Speculation | Recipe default, overridden by `--no-mtp` and the advanced speculation flags |
@@ -1080,7 +1065,7 @@ Export accepts no output path or form selection. Use `ignition convert` on the
 printed cache entry path to create a standalone packed file or directory.
 For multi-host export, the coordinator stages rank resources through Heliopause
 and publishes the complete entry in its shared model cache.
-`--staging PATH` selects the export workspace. `--no-weights` requires exact
+`[paths] export_staging` selects the export workspace. `--no-weights` requires exact
 cached weight payloads; initial state and executable resources may be produced
 fresh. Export closes the prepared model and exits without starting a listener.
 Preparation failures publish no entry.

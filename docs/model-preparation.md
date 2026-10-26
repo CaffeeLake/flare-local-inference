@@ -210,6 +210,32 @@ supported repository ID or a local source-checkpoint directory. Ignition
 downloads missing source weights, loads and tunes kernels, compiles forwards,
 warms and captures execution variants, writes the package, and exits.
 Compilation is enabled by default; `--no-compile` is for development.
+The examples omit default settings. Configuration-file overrides still apply;
+inspect `ignition export MODEL --help` and the printed preparation plan for the
+resolved capacities. Select idle GPUs explicitly. Native serving listens on
+`127.0.0.1:8000` unless configuration or `--host` / `--port` overrides it.
+Add `--verbose` for per-phase detail or `--lock-gpu-clocks` to lock clocks during
+autotuning.
+
+### Re-exporting with cached weights
+
+After an ordinary export, use `--reuse-weights` when rebuilding graphs with
+the same checkpoint, TP size, architecture, and compatible weight layouts.
+For a DeepSeek V4.1 TP4 export:
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 --reuse-weights
+flare/target/release/flare run CACHE_ENTRY --gpus 0,1,2,3
+```
+
+Replace `CACHE_ENTRY` with the directory printed by this export. The command
+uses the model's cached default version as its weight source and publishes
+the resulting package as the default. Checkpoint loading, preparation, and
+capture still run; compatible tuning and compilation caches remain reusable.
+Use ordinary export after changing weight values or packing, or when no
+compatible cached default exists. `--no-weights` instead hashes the live
+weights and requires their exact payloads to be cached; it cannot be combined
+with `--reuse-weights`.
 
 ## Nemotron 3.5 Bolt 74B-A9B 24GB
 
@@ -220,15 +246,16 @@ The recipe includes the C-RADIO encoder for still images. Video is not prepared.
 seven draft tokens with adaptive verification. Both checkpoints use the standard
 Hugging Face hub cache (`~/.cache/huggingface/hub`), or `[paths].hub_cache` when configured.
 
+This example limits preparation to eight concurrent requests and 64 target rows:
+
 ```sh
-.venv/bin/python -m ignition export nemotron-bolt-24gb --gpus 0 \
-  --max-concurrency 8 --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
-  --speculative-token-capacity 64 --verbose
-.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors
+.venv/bin/ignition export nemotron-bolt-24gb --gpus 0 \
+  --max-concurrency 8 --speculative-token-capacity 64
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors \
-  --gpus 0 --bind 127.0.0.1:8001
+  --gpus 0
 ```
 
 Use `--no-mtp` during preparation to omit the draft model. Mamba-2 prefill
@@ -246,7 +273,7 @@ scaled NVFP4 gate and up projections also overlap. Prepare with
 Routing excludes padded target rows using the packed batch's valid-token count.
 The 64-row speculative capacity covers eight requests with seven draft tokens each.
 For concurrency 32 with seven draft tokens per request, use
-`--max-concurrency 32 --speculative-token-capacity 256`.
+`--speculative-token-capacity 256`.
 
 ## Qwen3.8 27B
 
@@ -262,8 +289,8 @@ host-mapped tables or vision graphs. Prepare on the same GPU architecture as
 the serving device:
 
 ```sh
-.venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 --verbose
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1-c4.safetensors
+.venv/bin/ignition export qwen3.8-27b --gpus 0
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1.safetensors
 ```
 
 Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
@@ -280,12 +307,10 @@ These options use the package's existing MTP graphs and are not export settings.
 Export Qwen with up to five MTP draft tokens per round:
 
 ```sh
-.venv/bin/ignition export qwen3.8-flash --gpus 2 \
-  --mtp-draft-tokens 5 --max-concurrency 32 --verbose
+.venv/bin/ignition export qwen3.8-flash --gpus 2
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-tp1-mtp5.safetensors
 
-.venv/bin/ignition export qwen3.8-flash --gpus 0,1 \
-  --mtp-draft-tokens 5 --max-concurrency 32 --verbose
+.venv/bin/ignition export qwen3.8-flash --gpus 0,1
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-tp2-mtp5.safetensors
 ```
 
@@ -433,43 +458,40 @@ completion. Native scheduling compares complete measured round cost and expected
 emitted-token value across the packed and width-one candidates. Prefix limits
 include output and context budgets, grammar constraints, and host-stop barriers.
 Physical target padding executes at the captured row capacity.
-Its 188.8 GiB of Engram tables are stored once in the package, partitioned by
-hash head across TP ranks. Heads are assigned round-robin, so each TP4 rank
-owns two bigram, two trigram, and two four-gram heads, with their projection
-input columns. Table rows and projection scales retain checkpoint precision.
-Each rank reads its table rows, computes a partial
-projection, and reduces the result before residual mixing. Multi-host package
-distribution transfers only the table partitions owned by the receiving rank.
+Its 188.8 GiB of Engram tables are stored once in the package in checkpoint
+row order. Every host needs the complete tables; local ranks share their
+reader and host cache. Projection input columns are assigned round-robin by
+hash head, so each TP4 rank computes two bigram, two trigram, and two four-gram
+head contributions and reduces its partial projection before residual mixing.
+Table rows and projection scales retain checkpoint precision.
 Disk storage reads rows on demand through bounded direct-I/O staging;
-`flare run --embedding-table-storage ram` loads the assigned partitions into
+`flare run --embedding-table-storage ram` loads the complete tables into
 ordinary resident memory. Both modes copy compact rows into each rank's prepared
 buffers and signal captured consumer events. Preparation appends the immutable
-checkpoint slices without materializing the tables. Packages containing shared
-table planes retain their prepared replicated computation and shared row delivery.
+checkpoint spans without materializing the tables.
 For disk storage, `--embedding-table-resident-scales` retains the original scale
 bytes in RAM and removes scale reads on row-cache misses. This is enabled by
 default on discrete GPUs and disabled when any selected GPU shares host memory.
-Use `--no-embedding-table-resident-scales` to disable it explicitly. DeepSeek V4.1 Flash
-TP4 uses about 1.4 GiB per rank for these scales, in addition to any row-cache
-budget. The loader reserves this memory before sizing KV storage.
-Select four available GPUs explicitly:
+Use `--no-embedding-table-resident-scales` to disable it explicitly. The scale
+planes are shared across local ranks and add to the host's row-cache budget.
+The loader reserves this memory before sizing KV storage.
+Export with the recipe defaults on four available GPUs, then optionally create
+a standalone packed file and serve it:
 
 ```sh
-.venv/bin/python -m ignition export deepseek-v4.1-flash --gpus 0,4,6,8 \
-  --max-concurrency 32 --mtp-draft-tokens 5 --prefill-chunk-size 4096 \
-  --speculative-token-capacity 128 --speculative-graph-budget 64 --expert-scale-compression csf --verbose
-.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4.safetensors
 
 ./flare/target/release/flare run \
-  /data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors \
-  --gpus 0,4,6,8 --host 127.0.0.1 --port 8001
+  /data/flare-runtime/deepseek41-tp4.safetensors \
+  --gpus 0,1,2,3
 ```
 
-For four DGX Sparks with one GPU per host, replace `--gpus 0,4,6,8` during
+For four DGX Sparks with one GPU per host, replace `--gpus 0,1,2,3` during
 export with `--gpus 0 --ranks 4 --rendezvous 10.200.0.12:29630` and start an
 `ignition join` process on each peer. Rank zero retains the checkpoint; peers
 request their weight ranges during preparation. From a paired controller, use
-`flare orbit run maxwell:/data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors --cluster sparks --gpus 0`
+`flare orbit run maxwell:/data/flare-runtime/deepseek41-tp4.safetensors --cluster sparks --gpus 0`
 with a four-node `sparks` cluster. The prepared model uses RoCEnante collectives
 across hosts. See [multi-host preparation and serving](multi-host.md) for
 preparation authentication, orbit setup, and rank placement.
@@ -487,7 +509,7 @@ A 4 GiB reserve leaves insufficient memory for continuation rows. Disk-backed
 Engram tables retain the default 1 GiB row cache per host.
 
 `--image-concurrency` defaults to the smaller of four and `--max-concurrency`.
-For example, add `--max-concurrency 64 --image-concurrency 4` during export to
+For example, add `--max-concurrency 64` during export to
 prepare 64 text request slots while retaining four independent image feature slots.
 The native server can lower text concurrency at load time. Engram histories
 exclude image positions, so n-grams cannot cross an image boundary.
@@ -533,13 +555,12 @@ packaged rendering behavior and require both tokenizer and template assets.
 Use two or four available GPUs for preparation and serving:
 
 ```sh
-.venv/bin/python -m ignition export deepseek-v4-flash --gpus 3,4,5,6 \
-  --max-concurrency 4 --mtp-draft-tokens 5 --prefill-chunk-size 4096 --verbose
-.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek-v4-flash-vision-tp4-c4-dspark5.safetensors
+.venv/bin/ignition export deepseek-v4-flash --gpus 0,1,2,3
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek4-tp4.safetensors
 
 ./flare/target/release/flare run \
-  /data/flare-runtime/deepseek-v4-flash-vision-tp4-c4-dspark5.safetensors \
-  --gpus 3,4,5,6 --host 127.0.0.1 --port 8001
+  /data/flare-runtime/deepseek4-tp4.safetensors \
+  --gpus 0,1,2,3
 ```
 
 V4 uses 256-token logical pages containing 64 C4 latent records with an FP8
@@ -561,13 +582,12 @@ and seven DFlash draft tokens with adaptive verification. Audio is not prepared.
 Select eight available GPUs:
 
 ```sh
-.venv/bin/ignition export mimo-v2.6-pro-mopd --gpus 0,1,2,3,4,5,6,7 \
-  --max-concurrency 4 --mtp-draft-tokens 7 --prefill-chunk-size 4096 --verbose
-.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-pro-mopd-tp8-c4-dflash7.safetensors
+.venv/bin/ignition export mimo-v2.6-pro-mopd --gpus 0-7
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-pro-mopd-tp8.safetensors
 
 ./flare/target/release/flare run \
-  /data/flare-runtime/mimo-v26-pro-mopd-tp8-c4-dflash7.safetensors \
-  --gpus 0,1,2,3,4,5,6,7 --host 127.0.0.1 --port 8001
+  /data/flare-runtime/mimo-v26-pro-mopd-tp8.safetensors \
+  --gpus 0,1,2,3,4,5,6,7
 ```
 
 Global attention uses paged KV storage; continuation rows retain sliding-window
@@ -595,20 +615,24 @@ K/V, including MTP windows, use FP8 E4M3 with unit descales;
 sliding attention consumes live candidates in BF16 before committing them to FP8 history;
 Q/K normalization and rotary computation retain their BF16 rounding before the
 FP8 store. With CSF scales and shared scratch, the concurrency-16/MTP3 graph
-catalog, including vision, fits on four RTX PRO 6000 Blackwell GPUs:
+catalog, including vision, fits on four RTX PRO 6000 Blackwell GPUs. This
+memory-constrained example limits speculative target rows to 16 and selects
+fixed-width serving, with width-one execution at batches that cannot fit wider
+verification. The recipe defaults are concurrency 32, 128 target rows, and
+adaptive verification:
 
 ```sh
 .venv/bin/ignition export step5-preview-nvfp4 --gpus 0,1,2,3 \
-  --max-concurrency 16 --mtp-draft-tokens 3 --no-mtp-adaptive-verification \
-  --speculative-token-capacity 16 --prefill-chunk-size 4096 --expert-scale-compression --verbose
+  --max-concurrency 16 --no-mtp-adaptive-verification \
+  --speculative-token-capacity 16 --expert-scale-compression csf
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/step5-tp4-mtp3-c16-fp8kv.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/step5-tp4-mtp3-c16-fp8kv.safetensors \
-  --gpus 0,1,2,3 --host 127.0.0.1 --port 8001
+  --gpus 0,1,2,3
 ```
 
-Add `--expert-scale-compression csf` to compress all Step-5 routed-expert block
+`--expert-scale-compression csf` compresses all Step-5 routed-expert block
 scales losslessly during loading. Both checkpoint W4A4 experts and converted
 W4A16 experts use CSF, retaining their activation modes. Serialized layers share
 one pair of expansion buffers, whose contents are zero-initialized on export.
@@ -674,15 +698,17 @@ precision. DSpark converts its context projection, attention outputs, and MLPs.
 Shared and routed experts keep disjoint
 kernel scratch when their execution overlaps.
 
+This example limits concurrency to four and enables online MXFP8 conversion;
+image concurrency follows the four-request limit:
+
 ```sh
-.venv/bin/python -m ignition export /data/models/Kimi-K3-MXFP4-CSF --gpus 0-15 \
-  --max-concurrency 4 --image-concurrency 4 --mtp-draft-tokens 7 \
-  --prefill-chunk-size 4096 --compile-workers 16 --online-mxfp8 --verbose
-.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors
+.venv/bin/ignition export kimi-k3-mxfp4-csf --gpus 0-15 \
+  --max-concurrency 4 --online-mxfp8
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors \
-  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 --host 127.0.0.1 --port 8001
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 ```
 
 The draft consumes AttnRes mixtures entering target layers 24, 48, 72, 88,
@@ -744,10 +770,9 @@ their expansion scratch across routed layers. Planning retains the native
 weight budget for this encoding; loading reports its actual allocation.
 
 ```sh
-ignition export minimax-m3-1-flash --gpus 0-3 --language-model-only \
-  --expert-scale-compression csf
-ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
-flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0-3
+.venv/bin/ignition export minimax-m3-1-flash --gpus 0-3
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
+flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
 
 ## Storage and graph capacities
@@ -762,16 +787,19 @@ selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, Qwen3.8 27B, GLM 5.3, DeepSeek V4 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash, Qwen3.8 27B, GLM 5.3 | 5 | Rectangular | 34 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
-| MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Rectangular | 44 | 3 |
-| DeepSeek V4.1 | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
+| DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
+| DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
+| Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
 
-Rectangular catalogs cover full draft depth through batch 16. The counts include
+The 128-row rectangular catalogs cover full draft depth through batch 16.
+Gemma 4's six-row default covers five drafts at batch 1 and two at batch 2,
+with width-one execution at batch 4. The counts include
 width-one speculative graphs and exclude ordinary decode, prefill, maintenance,
 and vision graphs. Capturing full rectangular depth at batch 32 requires 192 rows
 for five drafts or 256 rows for seven drafts, set with
-`--speculative-token-capacity`. DeepSeek V4.1's packed graph count is bounded
+`--speculative-token-capacity`. Every packed recipe's round graph count is bounded
 independently by `--speculative-graph-budget`.
 
 Every model export prints a VRAM inventory for each rank after final publication,
@@ -796,8 +824,9 @@ Ignition commands accept `--config PATH`; the default configuration is
 `~/.config/flare/config.toml`. Storage locations are configured with
 `[paths] hub_cache`, `kernel_cache`, and `package_cache`; `[memory] reserve`
 leaves GPU memory available for other processes during preparation and serving.
-Ignition additionally budgets 1 GiB for warm-up and capture. Preparation KV backing
-covers a prefill chunk plus boundary pages per captured request row, unless an
+Ignition additionally budgets 1 GiB for warm-up and capture, plus 128 KiB per
+effective prefill token above 4096, including mixed prompt/decode rows.
+Preparation KV backing covers a prefill chunk plus boundary pages per captured request row, unless an
 explicit preparation page count is supplied programmatically. Continuation
 backing covers the null row, live request and verification rows, and snapshot
 destinations used during preparation. Planned prefix-cache slots remain virtual;
@@ -825,9 +854,10 @@ Ignition captures power-of-two
 batch capacities through the concurrency limit
 and width one at every bucket. Rectangular speculative and verification shapes
 require `batch * width <= speculative_token_capacity`; the preparation flag
-`--speculative-token-capacity` defaults to 128 physical target rows for every
-speculative recipe. DeepSeek V4.1's packed capacities follow its packed catalog table
-above rather than rectangular `batch * width` shapes. Previously exported separate-proposal
+`--speculative-token-capacity` defaults to 128 physical target rows except for
+Gemma 4's derived capacity. Packed recipes use the shared capacity selection
+described under DeepSeek V4.1 rather than rectangular `batch * width` shapes.
+Previously exported separate-proposal
 catalogs cover every bucket and load-time draft depth independently of that limit.
 Flare can reduce concurrency at load time. Rectangular catalogs permit smaller
 positive draft limits; packed catalogs require their captured positive depth or
@@ -845,16 +875,16 @@ Load an exported `.safetensors` package directly with the native CLI:
 
 ```sh
 ./flare/target/release/flare run /data/flare-runtime/qwen38-tp2-mtp5.safetensors \
-  --gpus 0,1 --host 127.0.0.1 --port 8001
-curl --fail http://127.0.0.1:8001/health
+  --gpus 0,1
+curl --fail http://127.0.0.1:8000/health
 ```
 
 Select a subset of a package's captured execution capacities:
 
 ```sh
-./flare/target/release/flare run /data/flare-runtime/qwen38-tp1-c4-mtp5.safetensors \
+./flare/target/release/flare run /data/flare-runtime/qwen38-tp1-mtp5.safetensors \
   --gpus 2 --max-concurrency 2 --mtp-draft-tokens 3 \
-  --no-mtp-adaptive-verification --host 127.0.0.1 --port 8001
+  --no-mtp-adaptive-verification
 ```
 
 `--mtp-draft-tokens N` limits each round to N drafts plus its pending input.
@@ -921,9 +951,9 @@ and failures.
 Export a package, then launch the native server:
 
 ```sh
-.venv/bin/ignition export qwen3.8-flash --gpus 0,1 --verbose
+.venv/bin/ignition export qwen3.8-flash --gpus 0,1
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output qwen.safetensors
-flare/target/release/flare run qwen.safetensors --gpus 0,1 --port 8001
+flare/target/release/flare run qwen.safetensors --gpus 0,1
 ```
 
 To test a serving-only Rust change, rebuild Flare and load an existing compatible
