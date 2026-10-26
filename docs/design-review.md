@@ -92,7 +92,9 @@ before committing; a design acknowledgment cannot authorize them.
     shapes, tails, inactive rows, graph transitions, cache boundaries, request
     lifecycle, and allocation stability. Preserve native frontend and request-local
     sampling semantics. Performance claims require equivalent baselines, complete
-    GPU steps across all ranks, and actual Helios service measurements. Correctness
+    GPU steps across all ranks, and actual Helios service measurements. Comparisons
+    against other runtimes must use exported packages with `flare run`;
+    `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
 13. **Validate the supported model package contract.** Serving requires execution

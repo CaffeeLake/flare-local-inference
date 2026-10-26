@@ -40,7 +40,7 @@ def test_export_rejects_history_preferences_and_copy_only_preparation(flags):
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_mla_arithmetic_flag_defaults_and_override(command):
     arguments = [command, "deepseek-v4.1-flash"]
     default = _parser().parse_args(arguments)
@@ -69,7 +69,7 @@ def test_independent_draft_precision_flags_require_learned_proposals(model, flag
         speculation(args, resolve(model))
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_mxfp8_draft_precision_reaches_deepseek41_plan(command):
     from ignition import planning
     from ignition.cli.preparation import speculation
@@ -90,7 +90,7 @@ def test_mxfp8_draft_precision_reaches_deepseek41_plan(command):
                      speculation=selected)
 
 
-@pytest.mark.parametrize("command", [[], ["export"], ["serve"]])
+@pytest.mark.parametrize("command", [[], ["export"], ["debug-serve"]])
 def test_help_lists_every_recipe(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([*command, "--help"])
@@ -103,9 +103,13 @@ def test_help_lists_every_recipe(command, capsys):
     assert "Drafts (default/max)" in output
     assert "--packed-verification" not in output
     assert "--draft-prefix-selection" not in output
+    if command == ["debug-serve"]:
+        normalized = " ".join(output.split())
+        assert "not for actual serving or performance comparisons against other runtimes" in normalized
+        assert "ignition export and flare run" in normalized
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_model_help_explains_step5_limits_and_compression(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([command, "step5-preview-nvfp4", "--help"])
@@ -144,7 +148,7 @@ assert not {'torch', 'transformers', 'flare_heliopause', 'huggingface_hub', 'pyn
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_deepseek41_help_reports_packed_gpu_recipe_defaults(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([command, "deepseek-v4.1-flash", "--help"])
@@ -166,7 +170,7 @@ def test_deepseek41_help_reports_packed_gpu_recipe_defaults(command, capsys):
     assert "Packed rounds need more target rows than active requests" in output
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_qwen_help_reports_concurrency_and_target_row_defaults(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([command, "qwen3.8-flash", "--help"])
@@ -189,7 +193,7 @@ def test_optional_features_follow_the_selected_recipe(capsys):
         assert ("--expert-scale-compression" in details) == bool(checkpoint.scale_compressed_device_bytes)
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_all_recipe_help_reports_concurrency_and_speculative_capacity_defaults(command, capsys):
     for recipe in recipes():
         for checkpoint in recipe.checkpoints:
@@ -233,7 +237,7 @@ def test_mistyped_alias_suggests_step5():
         resolve("step4-preview-nvfp4")
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
 def test_autotune_effort_flag(command, effort):
     args = [command, "deepseek-v4.1-flash"]

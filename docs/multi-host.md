@@ -283,7 +283,7 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
-For a physical ring, add `--roce-ring` to rank zero's export or serve command;
+For a physical ring, add `--roce-ring` to rank zero's `export` or `debug-serve` command;
 for hosts cabled as a chain with no link between the first and last rank, add
 `--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
 require Orbit agents, pairing, a cluster file, or controller keys. Every rank

@@ -134,8 +134,15 @@ Launch an exported package with `flare/target/release/flare run PACKAGE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
 
-For development without export, native `ignition serve` requires Heliopause's
-`qualification` Cargo feature. Diagnostic `ignition serve --direct` does not.
+`ignition debug-serve` is only for diagnosing model and preparation faults.
+Do not use it for actual serving or apples-to-apples performance comparisons
+against other runtimes, including its native, `--direct`, and `--eager` modes.
+Use `ignition export` followed by `flare run PACKAGE` for those workflows.
+Debug execution retains preparation resources and bounded preparation caches;
+its process, memory, and loading paths differ from native package serving.
+
+For debugging without export, native `ignition debug-serve` requires Heliopause's
+`qualification` Cargo feature. Diagnostic `ignition debug-serve --direct` does not.
 Follow the
 [development launch instructions](docs/cli-design.md#development-without-package-export).
 
@@ -223,7 +230,7 @@ architectural boundary before committing the change.
 - Keep graph executables, captured buffers, resource owners, and the CUDA
   context alive for their full native use. Model state and metadata must be
   explicit storage that Helios can manage without Python execution.
-- `ignition serve --direct [--eager]` is the one Python execution path, a
+- `ignition debug-serve --direct [--eager]` is the one Python execution path, a
   diagnostic and qualification tool requested by the project owner for
   reproducing model faults without Helios ([direct execution](docs/direct-execution.md)).
   It is never production serving or a fallback, and only its explicit flags
@@ -287,6 +294,9 @@ are permitted when they do not design or change the restricted mechanisms above.
 
 ## Validation and performance
 
+- Compare other runtimes against an exported package running through `flare run`.
+  Timings from `ignition debug-serve` are diagnostic measurements and cannot
+  establish comparative serving performance.
 - When a potential correctness, memory, or performance deficiency appears in
   one model, inspect the shared components and equivalent paths in every
   supported recipe before scoping the fix. Track follow-up work across all

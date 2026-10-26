@@ -56,12 +56,13 @@ then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
 
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
+ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
 repository id with an optional `@revision`, or a local checkpoint directory;
-with no `MODEL`, `export` and `serve` use `defaults.model` from the configuration file and
+with no `MODEL`, `export` and `debug-serve` use `defaults.model` from the configuration file and
 fail with a usage error if it is unset.
 
 `ignition --help` and preparation-command help list every declared model alias,
@@ -188,9 +189,9 @@ storage according to those selections and available GPU memory.
 
 ### 3.1 Ignition command-line flags
 
-`export` and `serve` accept the preparation flags below. `export` publishes a
+`export` and `debug-serve` accept the preparation flags below. `export` publishes a
 directory entry in the shared model cache. Listener flags apply only to
-`serve`; native package serving uses `flare run` flags. Development `serve` also
+`debug-serve`; native package serving uses `flare run` flags. Development `debug-serve` also
 accepts the runtime `--history-drafts` / `--no-history-drafts` options for native
 serving. `export` accepts neither option, and `--direct` rejects history drafting.
 
@@ -199,8 +200,8 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `MODEL` | Alias such as `qwen3.8-flash`, Hugging Face repository id such as `org/name` or `org/name@revision`, or checkpoint directory | `defaults.model` |
 | `--gpus LIST` | Indices relative to `CUDA_VISIBLE_DEVICES` when set, otherwise NVML indices: `0`, `0,1`, `0-3`. The count is the tensor-parallel size and must be one the recipe supports. | First GPUs that fit |
 | `--max-concurrency N` | Maximum simultaneously active requests, 1 through the recipe's limit | `defaults.max_concurrency`, else the recipe default |
-| `--host ADDR` | Listening address. `serve` only. | `server.host`, else `127.0.0.1` |
-| `--port N` | Listening port. `serve` only. | `server.port`, else `8000` |
+| `--host ADDR` | Listening address. `debug-serve` only. | `server.host`, else `127.0.0.1` |
+| `--port N` | Listening port. `debug-serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
 | `--no-weights` | Export only when exact stored-data blobs are cached | Off |
@@ -363,7 +364,7 @@ are selected only by `--tuning-gpus`.
 
 Both Ignition commands accept `--config`.
 
-Multi-host `ignition export` and `ignition serve` transfer checkpoint tensor
+Multi-host `ignition export` and `ignition debug-serve` transfer checkpoint tensor
 ranges and prepared export payloads over the discovered CX7 fabric interfaces.
 Direct cables between two ranks and switched fabrics use direct peer TCP
 connections. `--roce-ring` selects forwarding through rank neighbors for a
@@ -378,7 +379,12 @@ buffer bounds, and rendezvous traffic.
 
 #### Development without package export
 
-For development, `ignition serve` prepares graphs and hands them directly to
+`ignition debug-serve` is for diagnosing model and preparation faults. It is
+not intended for actual serving or apples-to-apples performance comparisons
+against other runtimes. Use `ignition export` and `flare run PACKAGE` for those
+workflows. This restriction applies to native, `--direct`, and `--eager` modes.
+
+For diagnosis, `ignition debug-serve` prepares graphs and hands them directly to
 Helios in the same process. It requires a cached checkpoint and a Heliopause
 build with the `qualification` feature. Requests execute in Rust without Python
 callbacks. This command skips package export and reload; weight loading, kernel
@@ -396,7 +402,7 @@ with recipe defaults:
 ```sh
 uv pip install --python .venv/bin/python --no-deps ./heliopause \
   --config-settings 'build-args=--features=qualification'
-.venv/bin/ignition serve deepseek-v4-flash --gpus 0,1
+.venv/bin/ignition debug-serve deepseek-v4-flash --gpus 0,1
 ```
 
 Rebuild the extension after changing its Rust code. Python recipe and component
@@ -424,7 +430,7 @@ RAM only.
 With four serving GPUs, run:
 
 ```sh
-.venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3
+.venv/bin/ignition debug-serve deepseek-v4.1-flash --gpus 0,1,2,3
 ```
 
 The command prepares and captures graphs, loads the RAM tables once, and starts
@@ -608,7 +614,7 @@ budgets, allocated KV tokens, and whether memory, the selected KV ceiling, or
 prepared virtual extents limited the pool. TP ranks agree on a capacity each
 can back. Runtime memory flags reuse the same prepared package and do not
 alter preparation or captured graphs. They are absent
-from `ignition export` and the diagnostic `ignition serve` commands.
+from `ignition export` and the diagnostic `ignition debug-serve` commands.
 
 ### Downloading published packages
 
@@ -1297,7 +1303,7 @@ cannot honor the settings reports a capacity error in the section 6 form.
 
 ### Experimental RoCE ring configuration
 
-`ignition export` and `ignition serve` accept `--roce-ring` or `--roce-chain` with `--ranks N`;
+`ignition export` and `ignition debug-serve` accept `--roce-ring` or `--roce-chain` with `--ranks N`;
 `flare run` and `flare orbit run` accept it with a multi-host package. Rank
 order defines the ring, including the cluster's node order when agents launch
 ranks. The transport accepts 2..16
@@ -1322,7 +1328,7 @@ configuration. Serving distribution uses plain TCP and normal package trust.
 See [multi-host serving](multi-host.md) and [RoCE ring transport](roce-ring.md).
 
 `--prompt-logprobs` is an opt-in preparation flag for `export` and
-development `serve`. It captures separate scored prefill graphs; default exports
+development `debug-serve`. It captures separate scored prefill graphs; default exports
 contain no prompt scoring storage or graphs. See [the logprob contract](logprobs-design.md#prompt-scoring).
 
 ## 10. Non-goals

@@ -1,4 +1,4 @@
-"""The `ignition` preparation and development serving command line."""
+"""The `ignition` preparation and diagnostic command line."""
 
 import argparse
 from pathlib import Path
@@ -22,7 +22,7 @@ def _parser() -> argparse.ArgumentParser:
             name, help=summary, description=summary, allow_abbrev=False, add_help=False,
             formatter_class=argparse.RawDescriptionHelpFormatter)
         subparser.add_argument("-h", "--help",
-                               action=RecipeHelp if name in ("export", "serve") else "help",
+                               action=RecipeHelp if name in ("export", "debug-serve") else "help",
                                help="show this help message and exit")
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
@@ -40,7 +40,9 @@ def _parser() -> argparse.ArgumentParser:
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
     _preparation_arguments(exporting)
-    serving = command("serve", serve.serve, "prepare in this process and serve over HTTP, with peer ranks on other hosts")
+    serving = command("debug-serve", serve.debug_serve,
+                      "prepare and run diagnostic HTTP requests; not for actual serving or performance"
+                      " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
     _preparation_arguments(serving)

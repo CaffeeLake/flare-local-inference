@@ -96,7 +96,7 @@ even when the buffered handle is idle. Diagnose table reads separately from grap
 replay using the `flare_engram_disk_{plan,submit,wait,complete}_nanoseconds_total`
 counters; their help text describes platform-specific timing boundaries.
 
-The `ignition serve` development handoff for shared RAM embedding tables uses
+The `ignition debug-serve` development handoff for shared RAM embedding tables uses
 Linux file descriptors. On Windows, export a package and load it with
 `flare run --embedding-table-storage ram`; native resident-table serving uses
 the Windows reader and does not require this development handoff.

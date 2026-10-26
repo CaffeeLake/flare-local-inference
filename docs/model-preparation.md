@@ -982,7 +982,10 @@ Use `.venv/bin/ignition export --help` for preparation flags and
 `flare/target/release/flare run --help` for serving flags. See [the runtime package design](runtime-package-design.md)
 for resource ownership and [the CLI design](cli-design.md) for configuration.
 
-For model development, `ignition serve` hands prepared graphs directly to Helios
-without exporting a package. It requires Heliopause's `qualification` Cargo
-feature. Select idle devices explicitly; see [the development launch example](cli-design.md#development-without-package-export)
-for the extension build and serving commands.
+For fault diagnosis, `ignition debug-serve` hands prepared graphs directly to
+Helios without exporting a package. Its native path requires Heliopause's
+`qualification` Cargo feature. All debug modes, including `--direct` and
+`--eager`, are unsuitable for actual serving or apples-to-apples performance
+comparisons against other runtimes; use an exported package with `flare run`.
+Select idle devices explicitly; see [the debug launch example](cli-design.md#development-without-package-export)
+for the extension build and diagnostic commands.

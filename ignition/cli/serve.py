@@ -372,11 +372,12 @@ def _serving_progress(verbose):
     return Progress()
 
 
-def serve(args) -> int:
-    """Prepare in this process and serve over HTTP; with --ranks, one peer rank per other host joins.
+def debug_serve(args) -> int:
+    """Prepare in this process for diagnostic HTTP requests, optionally across ranks.
 
     Requires heliopause's qualification build, which embeds the HTTP server in Python. With
     --direct, Ignition's diagnostic step loop serves instead, without Helios or that build.
+    Actual serving and comparisons against other runtimes use exported packages with flare run.
     """
     from ignition.progress import phase
 
@@ -393,7 +394,7 @@ def serve(args) -> int:
     if args.direct and args.history_drafts:
         raise UsageError("--history-drafts requires native serving; it does not apply to --direct")
     if not args.direct:
-        requirement = ("ignition serve requires Heliopause's qualification Cargo feature; rebuild ./heliopause "
+        requirement = ("ignition debug-serve requires Heliopause's qualification Cargo feature; rebuild ./heliopause "
                        "with --config-settings 'build-args=--features=qualification'")
         try:
             import flare_heliopause
