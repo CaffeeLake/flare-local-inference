@@ -3634,6 +3634,51 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
+    fn adjacent_external_allocations_download_exact_bytes() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        let size = 2 << 20;
+        let mut addresses = Vec::new();
+        let result = (|| -> ExportResult<()> {
+            for _ in 0..32 {
+                let mut address = 0;
+                cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, size)?;
+                addresses.push(address);
+            }
+            addresses.sort_unstable();
+            let pair = addresses.windows(2).find(|pair| pair[0] + size as u64 == pair[1])
+                .ok_or_else(|| invalid("CUDA allocator did not provide adjacent external allocations"))?;
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), pair[0], 0x37, size)?;
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), pair[1], 0xa5, size)?;
+            cuda.synchronize()?;
+            let allocations = external_allocations(
+                vec![(pair[0], size as u64), (pair[1], size as u64)], size as u64)?;
+            assert_eq!(allocations.len(), 1);
+            let allocation = &allocations[0];
+            let mut actual = vec![0; 2 * size];
+            let mut downloader = Downloader::new(&cuda)?;
+            downloader.for_each(allocation, allocation.snapshot_spans.as_ref().unwrap(), |offset, bytes| {
+                actual[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })?;
+            assert!(actual[..size].iter().all(|byte| *byte == 0x37));
+            assert!(actual[size..].iter().all(|byte| *byte == 0xa5));
+            Ok(())
+        })();
+        cuda.synchronize()?;
+        for address in addresses {
+            cu!(&cuda, "cuMemFree_v2", (u64), address)?;
+        }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
     fn weight_payload_device_materialization_matches_staged_bytes() -> ExportResult<()> {
         let cuda = Cuda::new()?;
         cu!(&cuda, "cuInit", (u32), 0)?;
