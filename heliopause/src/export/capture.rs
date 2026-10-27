@@ -845,7 +845,10 @@ impl<'a> Downloader<'a> {
                 address + (index * Self::CHUNK) as u64,
                 chunk.len(),
                 self.stream
-            )?;
+            ).map_err(|error| invalid(format!(
+                "reading {memory} storage at {:#x}+{}: {error}",
+                address + (index * Self::CHUNK) as u64, chunk.len()
+            )))?;
             self.drain()?;
             chunk.copy_from_slice(unsafe {
                 std::slice::from_raw_parts(pointer.cast::<u8>(), chunk.len())
@@ -904,7 +907,10 @@ impl<'a> Downloader<'a> {
                 allocation.address + offset,
                 size,
                 self.stream
-            )?;
+            ).map_err(|error| invalid(format!(
+                "scanning allocation {:?} ({}) at {:#x}+{}, offset {offset}: {error}",
+                allocation.name, allocation.memory, allocation.address + offset, size
+            )))?;
             cu!(
                 self.cuda,
                 "cuEventRecord",
@@ -1297,7 +1303,10 @@ impl PackedDownload<'_, '_> {
                 self.allocation.address + start + relative,
                 bytes,
                 self.downloader.stream
-            )?;
+            ).map_err(|error| invalid(format!(
+                "packing allocation {:?} at {:#x}+{}: {error}",
+                self.allocation.name, self.allocation.address + start + relative, bytes
+            )))?;
             copied += bytes;
             logical += length;
             if copied == count {
@@ -1441,7 +1450,11 @@ impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
                 #[cfg(test)]
                 { downloader.copies += 1; }
                 cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
-                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)?;
+                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)
+                    .map_err(|error| invalid(format!(
+                        "reading weight allocation {:?} at {:#x}+{}: {error}",
+                        allocation.name, allocation.address + offset, output.len()
+                    )))?;
             }
             Ok(())
         })?;
