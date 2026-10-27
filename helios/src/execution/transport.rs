@@ -488,13 +488,20 @@ impl GraphExecutor {
         let mut reset = resources.model.host_buffer(4)?;
         reset.bytes_mut().copy_from_slice(&(-1i32).to_ne_bytes());
         let readback = resources.model.host_buffer(4)?;
+        let outputs = graph.outputs.iter().map(|name| {
+            let buffer = self.manifest.buffer(name)?;
+            Ok((buffer, resources.model.host_buffer(buffer.nbytes.min(64))?))
+        }).collect::<Result<Vec<_>>>()?;
         let completed = resources.model.event()?;
         let started = Instant::now();
         let result = (|| -> Result<()> {
-            // Both pinned buffers remain alive until the event confirms all transfers.
+            // Pinned buffers remain alive until the event confirms all transfers.
             unsafe { resources.model.upload(status.address, &reset, 0, 4)?; }
             resources.model.launch(graph.handle)?;
             unsafe { resources.model.download(&readback, status.address, 4)?; }
+            for (buffer, host) in &outputs {
+                unsafe { resources.model.download(host, buffer.address, buffer.nbytes.min(64))?; }
+            }
             resources.model.record(&completed)?;
             while !completed.completed()? {
                 if started.elapsed() > std::time::Duration::from_secs(120) {
@@ -526,6 +533,13 @@ impl GraphExecutor {
         let status = i32::from_ne_bytes(readback.bytes().try_into().unwrap());
         if status != 0 {
             return Err(format!("startup tuning graph {:?} failed with status {status}", graph.name).into());
+        }
+        for (buffer, host) in &outputs {
+            let consumers = self.manifest.graphs.iter().filter(|consumer| {
+                consumer.tuned_bindings.iter().any(|binding| binding.buffer == buffer.name)
+            }).map(|consumer| consumer.name.as_str()).collect::<Vec<_>>();
+            eprintln!("Startup tuning output: device={} graph={:?} buffer={:?} dtype={:?} shape={:?} bytes={:02x?} consumers={consumers:?}",
+                self.manifest.device, graph.name, buffer.name, buffer.dtype, buffer.shape, host.bytes());
         }
         self.startup_next += 1;
         Ok(())
