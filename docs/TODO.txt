@@ -69,6 +69,13 @@
     exercise alternating text/image graphs, proposal/verification, and rollback.
     See performance-work.md#cross-model-scratch-planning.
 
+[ ] Validate cooperative Inductor reductions in full vision-enabled exports of
+    kimi-k3-mxfp4-csf, step5-preview-nvfp4, mimo-v2.6-pro-mopd, glm-5.3-flash,
+    and nemotron-bolt-24gb. Exercise every vision capacity, TP kernel agreement,
+    frozen preparation-cache reload, and native image replay. RADIO validation
+    passes single-rank and TP2 tests; full Qwen3.8 export passes. The five listed
+    full-model vision paths remain untested. See model-preparation.md#environment-setup.
+
 [ ] Investigate Qwen vision's canonical-reference accuracy failure in
     test_actual_vision_encoder_native_replay: relative L2 0.078 exceeds 0.03
     with standalone scratch. Pooled and standalone native replay are exact.
