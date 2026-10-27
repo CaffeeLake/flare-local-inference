@@ -290,7 +290,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             max_tokens=max(config.request_capacity, sample_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring, ring_open=config.roce_chain)
     elif group is not None:
-        collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity, hidden_size=reduction_width, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity, hidden_size=reduction_width, ipc=ipc)
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=sample_rows, columns=248320, ipc=ipc)
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(

@@ -241,7 +241,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             )
         elif group is not None:
             collective = create_all_reduce_runtime(
-                group, device, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
+                group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
             )
             prefill_collective = create_dma_all_reduce_runtime(
                 group,

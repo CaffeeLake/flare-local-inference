@@ -192,7 +192,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
         # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
-        collective = create_all_reduce_runtime(group, device, max_tokens=channel_rows,
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),

@@ -326,3 +326,18 @@ def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatc
     assert "'missing': 1200, 'extra': 1200" in str(error.value)
     assert len(str(error.value)) < 500
     assert closed == [True]
+
+
+@pytest.mark.parametrize("mode", [None, "static", "runtime"])
+def test_joint_workspace_is_provisioned_only_for_runtime_selection(monkeypatch, mode):
+    from b12x.comm.pcie import AllReduce
+    from ignition.preparation.collectives import create_all_reduce_runtime
+
+    calls = []
+    result, group, device, ipc = object(), object(), object(), object()
+    monkeypatch.setattr(AllReduce, "from_exchange_group", lambda **kwargs: calls.append(kwargs) or result)
+    options = {} if mode is None else {"collective_tuning": mode}
+    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc, **options) is result
+    assert calls == [dict(exchange_group=group, device=device, single_channel=True,
+                         max_size=32 * 2560 * 2, eager_buffer_bytes=32 * 2560 * 2,
+                         ipc=ipc, joint=mode == "runtime")]

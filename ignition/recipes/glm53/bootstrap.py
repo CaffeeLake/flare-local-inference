@@ -347,7 +347,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
-            collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)

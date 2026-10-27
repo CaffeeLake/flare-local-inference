@@ -192,7 +192,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc = package_storage.peer_storage
         draft_rows = slots * weights.config.draft.block_size if config.dflash else 0
         tokens = max(config.prefill_chunk_size, config.decode_tokens, draft_rows)
-        collective = create_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=6144, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=6144, ipc=ipc)
         prefill_collective = create_dma_all_reduce_runtime(
             group, device, max_tokens=config.prefill_chunk_size, hidden_size=6144, ipc=ipc
         )

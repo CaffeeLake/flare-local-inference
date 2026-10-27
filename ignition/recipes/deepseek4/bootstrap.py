@@ -201,7 +201,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         coordinator = CollectivePreparation(group)
         ipc = package_storage.peer_storage
         tokens = max(config.prefill_chunk_size, config.decode_tokens, slots * config.draft_tokens)
-        collective = create_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=4096, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=4096, ipc=ipc)
         prefill_collective = create_dma_all_reduce_runtime(
             group, device, max_tokens=config.prefill_chunk_size, hidden_size=4096, ipc=ipc
         )

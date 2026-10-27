@@ -211,7 +211,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 ring=config.roce_ring, package_storage=package_storage)
             vision_collective = collective if config.vision else None
         else:
-            collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
+            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
                 element_bytes=4, ipc=package_storage.peer_storage)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
                 hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)

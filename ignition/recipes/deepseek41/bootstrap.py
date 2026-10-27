@@ -301,7 +301,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
