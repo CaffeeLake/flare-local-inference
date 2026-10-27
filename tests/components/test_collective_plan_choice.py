@@ -101,3 +101,27 @@ def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypat
     with pytest.raises(ImportError, match="joint_finalist_policy"):
         collectives.PreparedAllReduce(source, torch.empty_like(source), runtime=runtime,
             session=object(), coordinator=object(), name="reduce")
+
+
+def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
+    from b12x.comm.pcie import joint_finalist_policy
+    from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
+    from b12x.preparation import FrozenMapping
+    from b12x.preparation.session import PreparationJob
+
+    def key(implementation, policy):
+        config = CollectiveConfig(implementation=implementation, threads=256, blocks=64)
+        query = CollectiveQuery(operation="all_reduce", world_size=2, rank=0,
+            alternatives=FrozenMapping({implementation: {"call": {"shape": (32, 2560)}}}), default=config)
+        plan = SimpleNamespace(contract=TUNING, invocation=FrozenMapping())
+        request = SimpleNamespace(plan=plan, dependencies=(), finalist_policy=policy)
+        obligation = SimpleNamespace(request=request, candidate_program_identity="same-program",
+            configuration=SimpleNamespace(encoded_query=TUNING.encode_query(query), pinned=None))
+        return PreparationJob._choice_key(None, obligation, {})
+
+    static = key("oneshot", None)
+    runtime_without_finalists = key("joint_latency", None)
+    runtime = key("joint_latency", joint_finalist_policy())
+    assert len({static, runtime_without_finalists, runtime}) == 3
+    assert static == key("oneshot", None)
+    assert runtime == key("joint_latency", joint_finalist_policy())

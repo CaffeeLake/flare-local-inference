@@ -480,7 +480,7 @@ def test_namespace_is_exact_and_reserved_policy_cannot_be_overridden(backend):
     session = make_session(device=0, checkpoint="revision", namespace={"headers": "digest"})
     assert session.namespace["checkpoint"] == "revision"
     assert session.namespace["headers"] == "digest"
-    for key in ("checkpoint", "workload_schema", "numerical_policy", "collective_tuning"):
+    for key in ("checkpoint", "workload_schema", "numerical_policy"):
         with pytest.raises(ValueError, match="cannot override"):
             make_session(device=0, checkpoint="revision", namespace={key: "different"})
 
@@ -503,7 +503,7 @@ def test_qwen_recipe_preserves_preparation_cache_identity(backend):
 
     session = preparation_session(device=0, checkpoint="revision", namespace={"headers": "digest"})
     assert session.namespace.to_dict() == {
-        "checkpoint": "revision", "headers": "digest", "collective_tuning": "static",
+        "checkpoint": "revision", "headers": "digest",
         "workload_schema": "qwen38-active-operators-v1",
         "numerical_policy": "qsa16-gdn-sequential-k1-dense-mxfp8-auto-vision-nvfp4-a16-moe-a4-route-fp32",
     }
@@ -1511,10 +1511,19 @@ def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals(
 
 
 @pytest.mark.parametrize("mode", ["static", "runtime"])
-def test_collective_selection_is_in_cache_identity_and_report(backend, mode):
+def test_collective_selection_is_reported_without_partitioning_operator_cache(backend, tmp_path, mode):
     session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode)
     assert session.collective_tuning == mode
-    assert session.namespace["collective_tuning"] == mode
+    from b12x.preparation._cache import SelectionCache
+
+    static = make_session(device=0, checkpoint="collective-policy")
+    assert session.namespace == static.namespace
+    identity = dict(schema_version=23, tuning_cache_version=1, namespace=session.namespace.to_dict())
+    original = dict(schema_version=23, tuning_cache_version=1,
+                    namespace=dict(checkpoint="collective-policy", workload_schema="test-operators-v1",
+                                   numerical_policy="default"))
+    assert SelectionCache(tmp_path, identity).path == SelectionCache(tmp_path, original).path
+    static.close()
     session.declare((declaration("op"),))
     assert session.tune()["collective_tuning"] == mode
     session.close()

@@ -87,11 +87,11 @@ class RecordedPreparationSession(PreparationSession):
             raise ValueError("collective_tuning must be static or runtime")
         self.collective_tuning = collective_tuning
         identity = dict(namespace or {})
-        reserved = {"checkpoint", "workload_schema", "numerical_policy", "collective_tuning"}
+        reserved = {"checkpoint", "workload_schema", "numerical_policy"}
         if reserved.intersection(identity):
             raise ValueError("tuning namespace cannot override its workload identity")
         identity.update(checkpoint=checkpoint, workload_schema=workload_schema,
-                        numerical_policy=numerical_policy, collective_tuning=collective_tuning)
+                        numerical_policy=numerical_policy)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
         self.lock_gpu_clocks = lock_gpu_clocks
