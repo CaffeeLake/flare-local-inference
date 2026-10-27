@@ -1061,12 +1061,6 @@ fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResul
         .into_iter()
         .enumerate()
         .map(|(index, (start, end, spans))| {
-            let spans = merge_ranges(
-                spans
-                    .into_iter()
-                    .map(|(address, size)| (address, address + size))
-                    .collect(),
-            );
             Ok(Allocation {
                 name: format!("external-{index}"),
                 address: start,
@@ -1079,7 +1073,8 @@ fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResul
                 snapshot_spans: Some(
                     spans
                         .into_iter()
-                        .map(|(address, stop)| (address - start, stop - address))
+                        // Adjacent CUDA allocations require separate device transfers.
+                        .map(|(address, size)| (address - start, size))
                         .collect(),
                 ),
                 sizing: None,
@@ -1279,7 +1274,8 @@ struct PackedDownload<'a, 'b> {
 impl PackedDownload<'_, '_> {
     fn queue(&mut self, index: usize, offset: u64) -> ExportResult<()> {
         let count = (self.size - offset).min(Downloader::CHUNK as u64) as usize;
-        let slot = &mut self.downloader.slots[index];
+        let downloader = &mut self.downloader;
+        let slot = &mut downloader.slots[index];
         slot.offset = offset;
         slot.nbytes = count;
         let mut logical = 0;
@@ -1291,22 +1287,23 @@ impl PackedDownload<'_, '_> {
             }
             let relative = offset.saturating_sub(logical);
             let bytes = (length - relative).min((count - copied) as u64) as usize;
-            self.downloader.drained = false;
-            self.downloader.downloaded += bytes as u64;
-            #[cfg(test)]
-            { self.downloader.copies += 1; }
-            cu!(
-                self.downloader.cuda,
-                "cuMemcpyDtoHAsync_v2",
-                (Handle, u64, usize, Handle),
-                slot.pointer.cast::<u8>().wrapping_add(copied).cast(),
-                self.allocation.address + start + relative,
-                bytes,
-                self.downloader.stream
-            ).map_err(|error| invalid(format!(
-                "packing allocation {:?} at {:#x}+{}: {error}",
-                self.allocation.name, self.allocation.address + start + relative, bytes
-            )))?;
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>().add(copied), bytes)
+            };
+            let whole = [(0, self.allocation.nbytes)];
+            let ranges = self.allocation.snapshot_spans.as_deref().unwrap_or(&whole);
+            copy_recorded_ranges(ranges, self.allocation.nbytes, start + relative, output, |source, output| {
+                downloader.drained = false;
+                downloader.downloaded += output.len() as u64;
+                #[cfg(test)]
+                { downloader.copies += 1; }
+                cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
+                    output.as_mut_ptr().cast(), self.allocation.address + source, output.len(), downloader.stream)
+                    .map_err(|error| invalid(format!(
+                        "packing allocation {:?} at {:#x}+{}: {error}",
+                        self.allocation.name, self.allocation.address + source, output.len()
+                    )))
+            })?;
             copied += bytes;
             logical += length;
             if copied == count {
@@ -1319,11 +1316,11 @@ impl PackedDownload<'_, '_> {
             ));
         }
         cu!(
-            self.downloader.cuda,
+            downloader.cuda,
             "cuEventRecord",
             (Handle, Handle),
             slot.event,
-            self.downloader.stream
+            downloader.stream
         )?;
         self.pending.push_back(index);
         self.next = offset + count as u64;
@@ -3666,6 +3663,23 @@ mod tests {
             })?;
             assert!(actual[..size].iter().all(|byte| *byte == 0x37));
             assert!(actual[size..].iter().all(|byte| *byte == 0xa5));
+            let expected = actual.clone();
+            let spans = [(0, (2 * size) as u64)];
+            let mut packed = PackedDownload {
+                downloader: &mut downloader, allocation, spans: &spans, size: (2 * size) as u64,
+                pending: std::collections::VecDeque::new(), next: 0,
+            };
+            actual.fill(0);
+            packed.fill(0, &mut actual)?;
+            assert_eq!(actual, expected);
+            let spans = [weight_payload::PayloadSpan {
+                payload_offset: 0, allocation: allocation.name.clone(), destination_offset: 0,
+                nbytes: (2 * size) as u64,
+            }];
+            let mut weights = WeightDownload::new(&mut downloader, &allocations, &spans)?;
+            actual.fill(0);
+            weights.read_into(&allocation.name, 0, &mut actual)?;
+            assert_eq!(actual, expected);
             Ok(())
         })();
         cuda.synchronize()?;
