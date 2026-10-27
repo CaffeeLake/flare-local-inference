@@ -167,6 +167,12 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
+Eligible plain BF16 direct PCIe reductions use joint collective kernels.
+With `default` or `audit`, preparation retains the best measured CTA count for
+each submode of the selected compiled launcher; a captured startup tuner chooses
+among those profiles when the package loads. `off` keeps the heuristic joint
+profile fixed and emits no startup tuner or measured-finalist requirement.
+
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving

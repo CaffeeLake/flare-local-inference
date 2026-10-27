@@ -562,6 +562,9 @@ class RecordedPreparationSession(PreparationSession):
                     getattr(value, "nbytes", 0))) for value in self._benchmark_resources.values()),
                 "search_limits": dict(self._search_limits),
             }
+            registry = getattr(self, "_startup_collectives", None)
+            if registry is not None:
+                self.tuning_report.update(registry.memory_report())
             if context_report is not None:
                 self.tuning_report["contextual_tuning"] = context_report
             self._tune_status = "releasing"

@@ -9,6 +9,7 @@ from ignition.progress import graph_catalog, phase
 
 from .aot import ForwardCache
 from .compilation import _defer_full_collection
+from .startup_tuning import capture_consumers
 
 
 @_defer_full_collection()
@@ -120,7 +121,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     with torch.cuda.stream(stream):
                         before_run(name)
                     stream.synchronize()
-                with communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
+                with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
                 if retain_graphs:
                     if progress is not None:
