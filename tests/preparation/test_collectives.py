@@ -258,45 +258,30 @@ def test_sharded_tuning_reconciles_every_cache_and_adopts_each_race_fastest_resu
 
 
 def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
-    from ignition.preparation.collectives import _winners
+    from ignition.preparation.collectives import _tuning_results
 
-    winners = _winners([race("b", 5.0, 4), race("a", 2.0, 1), race("b", 5.0, 2), race("a", 3.0, 0),
+    winners = _tuning_results([race("b", 5.0, 4), race("a", 2.0, 1), race("b", 5.0, 2), race("a", 3.0, 0),
                         race("a", 0, 0, assignment=False)])
     assert [(item.key, item.candidate_index) for item in winners] == [("a", 1), ("b", 2)]
     with pytest.raises(RuntimeError, match="no rank completed"):
-        _winners([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
+        _tuning_results([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
-def test_sharded_finalists_merge_families_and_keep_ordinary_winner():
-    from dataclasses import dataclass
-    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping
-    from ignition.preparation.collectives import _winners
+def test_sharded_finalists_preserve_empty_shards_and_rank_order():
+    from dataclasses import replace
+    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
+    from ignition.preparation.collectives import _tuning_results
 
-    @dataclass(frozen=True)
-    class Contribution:
-        key: str
-        latency_us: float
-        candidate_index: int
-        assignment: object
-        finalist_policy: FinalistPolicy
-        finalists: tuple[FinalistRecord, ...]
-
-    policy = FinalistPolicy(family_fields=("split_k_slices",), per_family=1, max_total=2)
-    def finalist(index, split, latency):
-        return FinalistRecord(assignment=FrozenMapping({"candidate": index}),
-            family=FrozenMapping({"split_k_slices": split}), candidate_index=index,
-            latency_us=latency)
-
-    first = Contribution("qkv", 5.0, 4, {"candidate": 4}, policy,
-        (finalist(4, 1, 5.0), finalist(6, 2, 4.0)))
-    second = Contribution("qkv", 4.5, 8, {"candidate": 8}, policy,
-        (finalist(8, 2, 4.5), finalist(9, 1, 3.0)))
-    (winner,) = _winners((first, second))
-    assert winner.candidate_index == 8
-    assert {item.candidate_index for item in winner.finalists} == {8, 9}
+    policy = FinalistPolicy(family_fields=("width",))
+    assignment = FrozenMapping({"width": 1})
+    first = TuningRequirement("qkv", (0, 1, 2, 3), assignment, 5., 0,
+        finalist_policy=policy,
+        finalists=(FinalistRecord(assignment=assignment, family=assignment, candidate_index=0, latency_us=5.),))
+    shards = (first, *(replace(first, assignment=None, latency_us=None, candidate_index=None,
+                              finalists=()) for _ in range(3)))
+    assert _tuning_results(shards) == shards
     with pytest.raises(ValueError, match="policies differ"):
-        _winners((first, Contribution("qkv", 4.5, 8, {"candidate": 8},
-            FinalistPolicy(family_fields=("tile_n",)), second.finalists)))
+        _tuning_results((first, replace(shards[1], finalist_policy=None)))
 
 
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):

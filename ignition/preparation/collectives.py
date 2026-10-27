@@ -1,7 +1,6 @@
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
 import json
-from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -135,59 +134,25 @@ def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head
         total_heads=heads, head_dim=head_dim, query_head_dim=query_head_dim, stream_affine=False, ipc=ipc)
 
 
-def _winners(contributions):
-    """Each sharded race's fastest complete contribution, ties going to the lower candidate index."""
-    races, members = {}, {}
+def _tuning_results(contributions):
+    """Forward finalist shards in rank order and select ordinary race winners."""
+    races = {}
     for item in contributions:
-        members.setdefault(item.key, []).append(item)
-        best = races.get(item.key)
-        if item.assignment is not None and (
-                best is None or (item.latency_us, item.candidate_index) < (best.latency_us, best.candidate_index)):
-            best = item
-        races[item.key] = best
-    if missing := [key for key, item in races.items() if item is None]:
-        raise RuntimeError(f"no rank completed a candidate of tuning race {missing[0]!r}")
-    return tuple(_with_merged_finalists(races[key], members[key]) for key in sorted(races))
-
-
-def _with_merged_finalists(winner, contributions):
-    policy = getattr(winner, "finalist_policy", None)
-    if any(getattr(item, "finalist_policy", None) != policy for item in contributions):
-        raise ValueError("sharded finalist policies differ across ranks")
-    if policy is None:
-        return winner
-    by_index = {}
-    for item in contributions:
-        for finalist in item.finalists:
-            previous = by_index.get(finalist.candidate_index)
-            if previous is not None and previous.family != finalist.family:
-                raise ValueError("sharded finalist index has conflicting families")
-            if previous is None or finalist.latency_us < previous.latency_us:
-                by_index[finalist.candidate_index] = finalist
-    if winner.candidate_index not in by_index:
-        raise ValueError("sharded finalists omit the ordinary winner")
-    families = {}
-    for finalist in by_index.values():
-        family = json.dumps(finalist.family.to_dict(), sort_keys=True, separators=(",", ":"))
-        families.setdefault(family, []).append(finalist)
-    retained = []
-    for family in sorted(families):
-        ranked = sorted(families[family], key=lambda item: (item.latency_us, item.candidate_index))
-        chosen = ranked[:policy.per_family]
-        ordinary = next((item for item in ranked if item.candidate_index == winner.candidate_index), None)
-        if ordinary is not None and ordinary not in chosen:
-            chosen[-1] = ordinary
-        retained.extend(chosen)
-    retained.sort(key=lambda item: (item.latency_us, item.candidate_index))
-    if len(retained) > policy.max_total:
-        chosen = retained[:policy.max_total]
-        ordinary = by_index[winner.candidate_index]
-        if ordinary not in chosen:
-            chosen[-1] = ordinary
-        retained = chosen
-    retained.sort(key=lambda item: (json.dumps(item.family.to_dict(), sort_keys=True,
-        separators=(",", ":")), item.latency_us, item.candidate_index))
-    return replace(winner, finalists=tuple(retained))
+        races.setdefault(item.key, []).append(item)
+    results = []
+    for key in sorted(races):
+        members = races[key]
+        policy = getattr(members[0], "finalist_policy", None)
+        if any(getattr(item, "finalist_policy", None) != policy for item in members):
+            raise ValueError("sharded finalist policies differ across ranks")
+        if policy is not None:
+            results.extend(members)
+        else:
+            completed = [item for item in members if item.assignment is not None]
+            if not completed:
+                raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
+            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+    return tuple(results)
 
 
 class CollectivePreparation:
@@ -197,8 +162,9 @@ class CollectivePreparation:
     coordinator releases a collective only after all group members report the
     same declaration. When the session shards tuning, it also relays b12x's
     two exchanges: every rank's cached selections, which b12x reconciles in
-    rank order, and each race's fastest result among the ranks' disjoint
-    candidate shares. It is unused after graph handoff.
+    rank order, and candidate results. Ordinary races use the fastest result;
+    finalist races retain every shard for b12x to consolidate. It is unused
+    after graph handoff.
     """
 
     def __init__(self, group, *, timeout=timedelta(minutes=2)):
@@ -331,8 +297,8 @@ class CollectivePreparation:
                                 differences[rank] = {"missing": len(missing), "extra": len(extra),
                                                      "examples": sorted(missing | extra)[:2]}
                         raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    winners = _winners(contribution for item in states for contribution in item[4])
-                    authorization = {"tuning": winners[0] if len(winners) == 1 else winners}
+                    results = _tuning_results(contribution for item in states for contribution in item[4])
+                    authorization = {"tuning": results[0] if len(results) == 1 else results}
                     continue
                 ready = [item[1] for item in states]
                 if all(ready):
