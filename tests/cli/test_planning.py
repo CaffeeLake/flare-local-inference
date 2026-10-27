@@ -131,6 +131,27 @@ def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
         planning.fit(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), mla_compute_mode="bf16", **options)
 
 
+def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="deepseek41"))
+    assert not ordinary.joint_tuning
+    joint = replace(ordinary, joint_tuning=True)
+    assert joint.to_dict()["joint_tuning"] is True
+    assert replace(joint, joint_tuning=False) == ordinary
+    for plan in (ordinary, joint):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).joint_tuning == plan.joint_tuning
+    with pytest.raises(UsageError, match="DeepSeek V4.1"):
+        replace(derive(), joint_tuning=True)
+    with pytest.raises(UsageError, match="autotune-effort"):
+        replace(joint, autotune_effort="off")
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)

@@ -181,6 +181,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    joint_tuning: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     hub_cache: Path | None = None
@@ -191,6 +192,13 @@ class Plan:
     online_mxfp8: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+
+    def __post_init__(self):
+        if self.joint_tuning:
+            if self.recipe.name != "deepseek41":
+                raise UsageError("--joint-tuning requires DeepSeek V4.1")
+            if self.autotune_effort == "off":
+                raise UsageError("--joint-tuning requires --autotune-effort default or audit")
 
     @property
     def world_size(self) -> int:
@@ -297,6 +305,7 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
+            "joint_tuning": self.joint_tuning,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],

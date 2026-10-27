@@ -294,3 +294,10 @@ def test_lock_gpu_clocks_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).lock_gpu_clocks
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--lock-gpu-clocks"]).lock_gpu_clocks
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_joint_tuning_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).joint_tuning
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--joint-tuning"]).joint_tuning

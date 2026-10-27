@@ -69,14 +69,18 @@ def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, visi
 
 
 def _can_race_contextual_plans(config, signatures, device):
-    if (not config.dspark or config.autotune_effort == "off" or not any(
-            signature.kind == "speculative" and signature.batch_capacity == 1
-            and signature.token_capacity == 8 and signature.packed_token_capacity is not None
-            and signature.packed_token_capacity >= 8 for signature in signatures.values())):
+    if not config.joint_tuning:
         return False
+    if config.autotune_effort == "off":
+        raise ValueError("--joint-tuning requires --autotune-effort default or audit")
     from b12x.quantization import mla_norm_mxfp8
 
-    return mla_norm_mxfp8.is_supported(device)
+    if not mla_norm_mxfp8.is_supported(device):
+        raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
+    if not any(signature.kind in ("prefill", "scored_prefill", "decode", "speculative")
+               for signature in signatures.values()):
+        raise ValueError("--joint-tuning requires prepared text graphs")
+    return True
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,7 @@ class PreparationConfig:
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
+    joint_tuning: bool = False
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.

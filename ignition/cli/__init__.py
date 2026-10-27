@@ -189,6 +189,9 @@ def _preparation_arguments(running):
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"
                                " check that pruning drops no winners (default: default)")
+    advanced.add_argument("--joint-tuning", action="store_true",
+                          help="jointly tune DeepSeek V4.1 attention projection plans across the prepared"
+                               " prefill, decode, and speculative shapes (default: off)")
     advanced.add_argument("--lock-gpu-clocks", action="store_true",
                           help="lock each tuning GPU to its maximum supported graphics clock during"
                                " autotuning; requires root or noninteractive sudo for nvidia-smi")

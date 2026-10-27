@@ -16,6 +16,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
                      warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
+                     report_catalog=True,
                      compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
     """Retain compiled callables and capture with an optional b12x IPC runtime.
 
@@ -28,7 +29,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     forwards, then checks every owner's guards and storage aliases before
     capturing their distinct CUDA graphs.
     """
-    if (progress is not None and not getattr(session, "_graph_catalog_reported", False)
+    if (report_catalog and progress is not None and not getattr(session, "_graph_catalog_reported", False)
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
         graph_catalog(progress, (signatures[name] for name in functions))
         session._graph_catalog_reported = True
