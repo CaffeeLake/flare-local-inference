@@ -116,7 +116,7 @@ def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
         plan = SimpleNamespace(contract=TUNING, invocation=FrozenMapping())
         request = SimpleNamespace(plan=plan, dependencies=(), finalist_policy=policy)
         obligation = SimpleNamespace(request=request, candidate_program_identity="same-program",
-            configuration=SimpleNamespace(encoded_query=TUNING.encode_query(query), pinned=None))
+            configuration=SimpleNamespace(encoded_query=FrozenMapping(TUNING.encode_query(query)), pinned=None))
         return PreparationJob._choice_key(None, obligation, {})
 
     static = key("oneshot", None)
