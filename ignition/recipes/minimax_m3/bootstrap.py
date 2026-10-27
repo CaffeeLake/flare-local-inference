@@ -51,6 +51,7 @@ def _target_decoder(weights, tables, scratch, metadata, pool, **kwargs):
 
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
@@ -231,7 +232,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             tuning_replica=config.tuning_replica, device=device, checkpoint=identity,
             workload_schema="minimax-m3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage,
-            autotune_effort=config.autotune_effort)
+            collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)

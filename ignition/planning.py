@@ -181,6 +181,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    collective_tuning: str | None = None
     joint_tuning: bool = False
     shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
@@ -195,6 +196,10 @@ class Plan:
     language_model_only: bool = False
 
     def __post_init__(self):
+        if self.collective_tuning is None:
+            object.__setattr__(self, "collective_tuning", self.recipe.collective_tuning)
+        if self.collective_tuning not in ("static", "runtime"):
+            raise UsageError("--collective-tuning must be static or runtime")
         if self.shard_hyperconnections:
             if self.recipe.name != "qwen38":
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
@@ -311,6 +316,7 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
+            "collective_tuning": self.collective_tuning,
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,

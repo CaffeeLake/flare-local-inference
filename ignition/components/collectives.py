@@ -124,7 +124,9 @@ class PreparedAllReduce:
             from b12x.comm.pcie import joint_finalist_policy
 
             channel = runtime.for_stream()
-            startup_joint = source.dtype == torch.bfloat16 and getattr(channel, "_joint_workspace", None) is not None
+            startup_joint = (getattr(session, "collective_tuning", "static") == "runtime"
+                             and source.dtype == torch.bfloat16
+                             and getattr(channel, "_joint_workspace", None) is not None)
             self.plan = runtime.plan(source, out=output, **({"joint_only": True} if startup_joint else {}))
             group = runtime.exchange_group
 

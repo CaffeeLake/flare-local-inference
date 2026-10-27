@@ -308,3 +308,10 @@ def test_shard_hyperconnections_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "qwen3.8-flash"]).shard_hyperconnections
     assert parser.parse_args([command, "qwen3.8-flash", "--shard-hyperconnections"]).shard_hyperconnections
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_collective_tuning_preparation_flag_is_explicit(command):
+    assert _parser().parse_args([command, "qwen3.8-flash"]).collective_tuning is None
+    for mode in ("static", "runtime"):
+        assert _parser().parse_args([command, "qwen3.8-flash", "--collective-tuning", mode]).collective_tuning == mode

@@ -480,7 +480,7 @@ def test_namespace_is_exact_and_reserved_policy_cannot_be_overridden(backend):
     session = make_session(device=0, checkpoint="revision", namespace={"headers": "digest"})
     assert session.namespace["checkpoint"] == "revision"
     assert session.namespace["headers"] == "digest"
-    for key in ("checkpoint", "workload_schema", "numerical_policy"):
+    for key in ("checkpoint", "workload_schema", "numerical_policy", "collective_tuning"):
         with pytest.raises(ValueError, match="cannot override"):
             make_session(device=0, checkpoint="revision", namespace={key: "different"})
 
@@ -503,7 +503,7 @@ def test_qwen_recipe_preserves_preparation_cache_identity(backend):
 
     session = preparation_session(device=0, checkpoint="revision", namespace={"headers": "digest"})
     assert session.namespace.to_dict() == {
-        "checkpoint": "revision", "headers": "digest",
+        "checkpoint": "revision", "headers": "digest", "collective_tuning": "static",
         "workload_schema": "qwen38-active-operators-v1",
         "numerical_policy": "qsa16-gdn-sequential-k1-dense-mxfp8-auto-vision-nvfp4-a16-moe-a4-route-fp32",
     }
@@ -1508,3 +1508,13 @@ def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals(
     collective = declaration("reduce")
     collective.collective = object()
     assert _local_tuning_catalog((first, collective)) == _local_tuning_catalog((first,))
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_collective_selection_is_in_cache_identity_and_report(backend, mode):
+    session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode)
+    assert session.collective_tuning == mode
+    assert session.namespace["collective_tuning"] == mode
+    session.declare((declaration("op"),))
+    assert session.tune()["collective_tuning"] == mode
+    session.close()

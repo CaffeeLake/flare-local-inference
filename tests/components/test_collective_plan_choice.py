@@ -53,8 +53,9 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
     assert operation.runtime is runtime and operation.plan is plan
 
 
+@pytest.mark.parametrize("mode", ["static", "runtime"])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort):
+def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort, mode):
     from b12x.comm import pcie
     from b12x.preparation import AutotuneEffort
     from ignition.components import collectives
@@ -74,9 +75,9 @@ def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort):
     source = torch.ones(32, dtype=torch.bfloat16)
     output = torch.empty_like(source)
     operation = collectives.PreparedAllReduce(source, output, runtime=runtime,
-        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort)), coordinator=object(), name="reduce")
-    assert calls == [dict(out=output, joint_only=True)]
-    if effort == "off":
+        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort), collective_tuning=mode), coordinator=object(), name="reduce")
+    assert calls == [dict(out=output, **({"joint_only": True} if mode == "runtime" else {}))]
+    if effort == "off" or mode == "static":
         assert "finalist_policy" not in requests[0]
         assert registered == []
     else:

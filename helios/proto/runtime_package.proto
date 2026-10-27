@@ -102,6 +102,8 @@ message RebuildManifest {
   bool joint_tuning = 23;
   // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
   bool shard_hyperconnections = 24;
+  // Preparation-time collective selection policy: static or runtime.
+  string collective_tuning = 25;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

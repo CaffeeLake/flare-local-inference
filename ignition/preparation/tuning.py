@@ -78,17 +78,20 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", native_dense_activations=False, lock_gpu_clocks=False):
+                 tuning_replica=None, autotune_effort="default", collective_tuning="static", native_dense_activations=False, lock_gpu_clocks=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
             raise ValueError("tuning requires a workload schema and numerical policy")
+        if collective_tuning not in ("static", "runtime"):
+            raise ValueError("collective_tuning must be static or runtime")
+        self.collective_tuning = collective_tuning
         identity = dict(namespace or {})
-        reserved = {"checkpoint", "workload_schema", "numerical_policy"}
+        reserved = {"checkpoint", "workload_schema", "numerical_policy", "collective_tuning"}
         if reserved.intersection(identity):
             raise ValueError("tuning namespace cannot override its workload identity")
         identity.update(checkpoint=checkpoint, workload_schema=workload_schema,
-                        numerical_policy=numerical_policy)
+                        numerical_policy=numerical_policy, collective_tuning=collective_tuning)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
         self.lock_gpu_clocks = lock_gpu_clocks
@@ -541,6 +544,7 @@ class RecordedPreparationSession(PreparationSession):
             self.tuning_report = {
                 "workload_schema": self._workload_schema, "namespace": self.namespace.to_dict(),
                 "autotune_effort": self.autotune_effort,
+                "collective_tuning": self.collective_tuning,
                 "native_dense_activations": self.native_dense_activations,
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
