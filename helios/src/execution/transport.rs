@@ -370,6 +370,7 @@ pub struct GraphExecutor {
     resolved_uploads: Vec<ResolvedUpload>,
     startup_next: usize,
     startup_ready: bool,
+    diagnostic_choices: Vec<(Vec<u32>, Vec<String>)>,
     next_sequence: u64,
     completed: Fence,
     poison: Option<Error>,
@@ -469,6 +470,7 @@ impl GraphExecutor {
             resolved_uploads: Vec::with_capacity(upload_capacity),
             startup_next: 0,
             startup_ready: false,
+            diagnostic_choices: Vec::new(),
             next_sequence: 1,
             completed: Fence(0),
             poison: None,
@@ -534,13 +536,15 @@ impl GraphExecutor {
         if status != 0 {
             return Err(format!("startup tuning graph {:?} failed with status {status}", graph.name).into());
         }
-        for (buffer, host) in &outputs {
-            let consumers = self.manifest.graphs.iter().filter(|consumer| {
-                consumer.tuned_bindings.iter().any(|binding| binding.buffer == buffer.name)
-            }).map(|consumer| consumer.name.as_str()).collect::<Vec<_>>();
-            eprintln!("Startup tuning output: device={} graph={:?} buffer={:?} dtype={:?} shape={:?} bytes={:02x?} consumers={consumers:?}",
-                self.manifest.device, graph.name, buffer.name, buffer.dtype, buffer.shape, host.bytes());
-        }
+        let mut profiles = outputs.iter().filter_map(|(_, host)| {
+            <[u8; 4]>::try_from(host.bytes()).ok().map(u32::from_ne_bytes)
+        }).collect::<Vec<_>>();
+        profiles.sort_unstable();
+        profiles.dedup();
+        let consumers = self.manifest.graphs.iter().filter(|consumer| {
+            consumer.tuned_bindings.iter().any(|binding| binding.tuning_graph == graph.name)
+        }).map(|consumer| consumer.name.clone()).collect();
+        self.diagnostic_choices.push((profiles, consumers));
         self.startup_next += 1;
         Ok(())
     }
@@ -548,7 +552,67 @@ impl GraphExecutor {
     pub(super) fn report_startup(&self, started: Instant) {
         if self.startup_next != 0 {
             eprintln!("Startup tuning: {} graphs completed in {:.2}s", self.startup_next, started.elapsed().as_secs_f64());
+            self.report_collective_choices();
         }
+    }
+
+    fn report_collective_choices(&self) {
+        use std::collections::BTreeMap;
+        use std::fmt::Write;
+
+        // Temporary interpretation of Qwen graph names and b12x packed selectors.
+        fn mode(value: u32) -> &'static str {
+            match value >> 16 {
+                0 => "Full", 1 => "Payload RSAG", 2 => "Bulk Push",
+                3 => "Bulk Pull", 4 => "Pull", _ => "Unknown",
+            }
+        }
+        fn describe(profiles: impl Iterator<Item = u32>) -> String {
+            let mut modes: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+            for value in profiles {
+                let ctas = value & 0xffff;
+                let range = modes.entry(mode(value)).or_insert((ctas, ctas));
+                range.0 = range.0.min(ctas);
+                range.1 = range.1.max(ctas);
+            }
+            modes.into_iter().map(|(name, (lo, hi))| {
+                if lo == hi { format!("{name} ({lo} CTAs)") }
+                else { format!("{name} ({lo}–{hi} CTAs)") }
+            }).collect::<Vec<_>>().join(", ")
+        }
+        let mut totals = BTreeMap::new();
+        let mut prefill = BTreeMap::<usize, Vec<u32>>::new();
+        let mut decode = Vec::new();
+        let mut shared = Vec::new();
+        for (profiles, consumers) in &self.diagnostic_choices {
+            let name = if profiles.len() == 1 { mode(profiles[0]) } else { "Mixed/unknown" };
+            *totals.entry(name).or_insert(0usize) += 1;
+            if consumers.iter().any(|name| name.starts_with("speculative")) {
+                decode.extend(profiles.iter().copied());
+            }
+            let sizes = consumers.iter().filter_map(|name| {
+                name.strip_prefix("prefill").and_then(|size| size.parse::<usize>().ok())
+            }).collect::<Vec<_>>();
+            if sizes.len() > 1 {
+                shared.extend(profiles.iter().copied());
+            } else if let Some(size) = sizes.first() {
+                prefill.entry(*size).or_default().extend(profiles.iter().copied());
+            }
+        }
+        let mut text = format!("  Collective choices · device {} · diagnostic\n", self.manifest.device);
+        let counts = totals.iter().map(|(name, count)| format!("{name}: {count} groups"))
+            .collect::<Vec<_>>().join(" · ");
+        writeln!(text, "  {counts}").unwrap();
+        if !decode.is_empty() {
+            writeln!(text, "  Decode/speculative   {}", describe(decode.into_iter())).unwrap();
+        }
+        if !shared.is_empty() {
+            writeln!(text, "  Shared across sizes  {}", describe(shared.into_iter())).unwrap();
+        }
+        for (size, profiles) in prefill {
+            writeln!(text, "  Prefill {size:>4} tokens  {}", describe(profiles.into_iter())).unwrap();
+        }
+        eprint!("{text}");
     }
 
     pub(super) fn finish_startup(&mut self) -> Result<()> {
