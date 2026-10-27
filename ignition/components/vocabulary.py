@@ -19,7 +19,7 @@ class PreparedVocabularyProjection:
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, workspace=None):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -33,7 +33,7 @@ class PreparedVocabularyProjection:
                 session=session, name=f"{name}.projection")
         else:
             self.projection = QuantizedProjection(source, weight, local_output,
-                session=session, name=f"{name}.projection", activation_mode=activation_mode)
+                session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
         if columns < output.shape[1]:

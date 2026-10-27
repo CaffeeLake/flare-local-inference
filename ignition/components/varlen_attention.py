@@ -5,45 +5,10 @@ from functools import partial
 import torch
 from b12x.attention import varlen
 from b12x.preparation import PreparedCall
-from b12x.preparation.types import plan_from_handle
 
 from ignition.preparation.fixtures import varlen_attention as fixtures
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
-
-
-@torch.library.custom_op("flare::varlen_attention", mutates_args=("out", "scratch"))
-def _attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu: torch.Tensor,
-    out: torch.Tensor,
-    scratch: torch.Tensor,
-    sink: torch.Tensor | None,
-    handle: int,
-    max_seqlen: int,
-) -> None:
-    binding = varlen.bind(
-        plan_from_handle(handle),
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=q.shape[-1] ** -0.5,
-        causal=False,
-        attention_sink_bias=sink,
-        scratch=scratch,
-    )
-    values, _ = varlen.run(binding)
-    out.copy_(values)
-
-
-@_attention.register_fake
-def _fake_attention(q, k, v, cu, out, scratch, sink, handle, max_seqlen):
-    pass
 
 
 class PreparedVarlenAttention:
@@ -59,6 +24,7 @@ class PreparedVarlenAttention:
         self.plan = varlen.plan(q, k, v, cu, max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen,
                                causal=False, window_size=window, attention_sink_bias=sink, **arithmetic)
         arguments = {
+            "out": out,
             "q": q,
             "k": k,
             "v": v,
@@ -94,5 +60,7 @@ class PreparedVarlenAttention:
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
     def __call__(self):
-        _attention(self.q, self.k, self.v, self.cu, self.out, self.scratch, self.sink, self.plan.handle, self.max_seqlen)
+        varlen.run_out(self.q, self.k, self.v, self.cu, out=self.out,
+            scratch=self.scratch, plan=self.plan, attention_sink_bias=self.sink,
+            max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen)
         return self.out
