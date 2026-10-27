@@ -583,3 +583,24 @@ def test_recipe_b12x_settings_name_b12x_variables():
         replace(RECIPE, b12x_environment={"CUDA_VISIBLE_DEVICES": "0"})
     with pytest.raises(ValueError, match="B12X_"):
         replace(RECIPE, b12x_environment={"B12X_PCIE_DCP_THREADS": 512})
+
+
+def test_sharded_hyperconnections_require_qwen_tp_and_survive_rebuild_serialization(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="qwen38"), gpus=(gpu(0, 95), gpu(1, 95)), selected=(0, 1))
+    assert not ordinary.shard_hyperconnections
+    sharded = replace(ordinary, shard_hyperconnections=True)
+    assert sharded.to_dict()["shard_hyperconnections"] is True
+    assert replace(sharded, shard_hyperconnections=False) == ordinary
+    for plan in (ordinary, sharded):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).shard_hyperconnections == plan.shard_hyperconnections
+    with pytest.raises(UsageError, match="Qwen3.8 Flash"):
+        replace(derive(), shard_hyperconnections=True)
+    with pytest.raises(UsageError, match="tensor parallelism"):
+        replace(derive(model=replace(SOLO, name="qwen38")), shard_hyperconnections=True)

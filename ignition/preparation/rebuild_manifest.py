@@ -219,6 +219,8 @@ def from_plan(model, plan, *, compiled_forwards):
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
+    if plan.shard_hyperconnections:
+        result['shard_hyperconnections'] = True
     if plan.joint_tuning:
         result['joint_tuning'] = True
     if (s := plan.speculation) is not None:

@@ -100,6 +100,8 @@ message RebuildManifest {
   bool roce_chain = 22;
   // Preparation-only joint attention-plan selection across the captured text shapes.
   bool joint_tuning = 23;
+  // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
+  bool shard_hyperconnections = 24;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

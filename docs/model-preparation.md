@@ -338,6 +338,17 @@ rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
 
+`ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
+the 320-wide hyperconnection bottleneck across ranks, including target and MTP
+final mixers. Each rank loads its down-projection rows and up-projection columns;
+normalization and residual injection stay replicated. Partial gate logits round
+to BF16 before transport, and the reduced BF16 logits feed sigmoid and the stream
+mean. This changes reduction rounding relative to the replicated projection.
+The option requires TP2 or TP4 and is recorded in the package's rebuild metadata.
+Replicated execution is the default: the compute savings must outweigh the extra
+10,240-element reduction per mixer and token. Changing the option requires a
+fresh export; `--reuse-weights` requires matching prepared weight layouts.
+
 Vision recipes accept `--image-concurrency N`, independently of
 `--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
 as `image_concurrency` in `[defaults]` or a model's configuration section.

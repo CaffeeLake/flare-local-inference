@@ -182,6 +182,7 @@ class Plan:
     compile_workers: int | None = None
     autotune_effort: str = "default"
     joint_tuning: bool = False
+    shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     hub_cache: Path | None = None
@@ -194,6 +195,11 @@ class Plan:
     language_model_only: bool = False
 
     def __post_init__(self):
+        if self.shard_hyperconnections:
+            if self.recipe.name != "qwen38":
+                raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
+            if self.world_size < 2:
+                raise UsageError("--shard-hyperconnections requires tensor parallelism")
         if self.joint_tuning:
             if self.recipe.name != "deepseek41":
                 raise UsageError("--joint-tuning requires DeepSeek V4.1")
@@ -306,6 +312,7 @@ class Plan:
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
             "joint_tuning": self.joint_tuning,
+            "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],

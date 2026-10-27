@@ -46,7 +46,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
-           joint_tuning: bool = False) -> planning.Plan:
+           joint_tuning: bool = False, shard_hyperconnections: bool = False) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     workers = compiler_workers(configuration, compile_workers)
     result = planning.plan(
@@ -58,7 +58,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
-                     joint_tuning=joint_tuning,
+                     joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
 

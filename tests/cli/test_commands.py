@@ -301,3 +301,10 @@ def test_joint_tuning_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).joint_tuning
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--joint-tuning"]).joint_tuning
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_shard_hyperconnections_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "qwen3.8-flash"]).shard_hyperconnections
+    assert parser.parse_args([command, "qwen3.8-flash", "--shard-hyperconnections"]).shard_hyperconnections
