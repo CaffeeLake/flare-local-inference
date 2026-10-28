@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .config import AttentionGeometry
+from ignition.components.dflash2_geometry import DraftAttentionGeometry
 
 REPOSITORY = "nvidia/Muse-Spark-Open-816B-A42B-DFlash2"
 REVISION = "fbec887a79866e9ecff6c57adfd9fd02aa3cadea"
@@ -62,7 +62,7 @@ class DraftConfig:
     @property
     def attention(self):
         c = self.text
-        return AttentionGeometry(c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"],
+        return DraftAttentionGeometry(c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"],
             c["head_dim"], c["head_dim"], c["rope_theta"], c["sliding_window"])
 
     def validate_shard(self, shard):

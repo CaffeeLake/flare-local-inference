@@ -37,6 +37,11 @@ for _container, _fields in (
     # Shared Ignition weight containers: only these fields hold stored weights.
     ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
     ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
+    ('ignition.components.dflash2_weights.DraftLayerWeights',
+     ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm',
+      'mlp', 'attention_conv', 'mlp_conv')),
+    ('ignition.components.dflash2_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'layers', 'selector')),
     # Recipe weight containers reached inside a declared layer/component.
     ('ignition.recipes.deepseek41.weights.ExpertWeights',
      ('router', 'correction', 'experts', 'shared', 'vision_correction')),
@@ -110,8 +115,6 @@ for _container, _fields in (
     ('ignition.recipes.qwen38.vision.VisionWeights', ('parameters', 'projections')),
     ('ignition.recipes.qwen38.mtp_weights.MTPWeights',
      ('module', 'attention', 'moe', 'embedding', 'lm_head', 'draft_head')),
-    ('ignition.recipes.qwen38_dense.weights.MTPWeights',
-     ('layer', 'embedding_norm', 'hidden_norm', 'norm', 'fc')),
     ('ignition.recipes.step5.vision_weights.VisionWeights',
      ('patch', 'position', 'norm', 'layers', 'first', 'second', 'projector')),
 ):

@@ -327,13 +327,16 @@ For concurrency 32 with seven draft tokens per request, use
 `qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation on one GPU.
 It uses the canonical Qwen3.5 dense decoder with tensor-scaled FP8 attention
 projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNet
-continuations reside in device memory. The checkpoint's BF16 MTP layer shares
-the target embedding and vocabulary head. Speculation defaults to five draft
-tokens, supports up to seven, and commits accepted GDN corrections into one
-recurrent row per request. Draft KV trails target consumption by one token;
-prefix snapshots preserve its partial page separately. The recipe has no
-host-mapped tables or vision graphs. Prepare on the same GPU architecture as
-the serving device:
+continuations reside in device memory. The pinned BF16
+`incoai/Qwen3.8-27B-DFlash2` draft consumes residual features from target layers
+5, 19, 33, 47, and 61 before final normalization, shares the target embedding and
+vocabulary head, and proposes eight-token noncausal blocks. Speculation defaults
+to seven draft tokens with adaptive packed verification capped at 128 physical
+target rows and a 64-graph budget. Accepted GDN corrections commit into one
+recurrent row per request. Five 2,048-token FP8 draft KV rings per continuation
+track target consumption without lag and survive prefix snapshot/restore.
+The recipe has no host-mapped tables or vision graphs. Prepare on the same GPU
+architecture as the serving device:
 
 ```sh
 .venv/bin/ignition export qwen3.8-27b --gpus 0
@@ -342,7 +345,7 @@ the serving device:
 
 Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
 retain draft context so adaptive verification can resume wider rounds.
-`--no-mtp` omits the draft weights and state during preparation;
+`--no-mtp` skips the draft download and omits its weights and state during preparation;
 `flare run PACKAGE --mtp-draft-tokens 0` selects the package's ordinary graphs.
 
 ## Qwen3.8 Flash
