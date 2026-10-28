@@ -319,6 +319,10 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--gpus', required=True)
     parser.add_argument('--config', type=Path)
+    parser.add_argument('--autotune-effort', choices=('off', 'default', 'audit'),
+                        help='override preparation tuning effort')
+    parser.add_argument('--no-compile', action='store_true',
+                        help='capture prepared Python forwards without Torch compilation')
     parser.add_argument('--measure-replay', action='store_true', help='measure valid B1/B4 captured decode after correctness readback')
     parser.add_argument('--profile-replay', action='store_true', help='control profiler capture around measured B1/B4 regions')
     parser.add_argument('--fence-operations', action='store_true',
@@ -335,7 +339,8 @@ def main():
     configuration = Configuration.load(args.config)
     model = resolve_model(configuration, str(args.snapshot.resolve()))
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus,
-        concurrency=Setting(4, 'diagnostic'), speculation=None, prefill_chunk=4096, prompt_logprobs=True)
+        concurrency=Setting(4, 'diagnostic'), speculation=None, prefill_chunk=4096, prompt_logprobs=True,
+        autotune_effort=args.autotune_effort)
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
     import torch
     from ignition.preparation.package_storage import PackageStorage
@@ -347,7 +352,7 @@ def main():
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != 'off',
         devices=tuple(range(plan.world_size)), context=plan.context, max_active=plan.concurrency,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=True,
+        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=not args.no_compile,
         kernel_cache=configuration.directory('kernel_cache'), retain_graphs=args.measure_replay)
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
