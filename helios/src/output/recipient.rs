@@ -229,6 +229,9 @@ impl RecipientOutput {
     }
     fn parse_calls(&self, body: &str) -> Result<Vec<(String, String)>> {
         let calls = parse_atem(body, &self.tools)?;
+        if calls.len() != 1 {
+            return Err("recipient frames require exactly one ATEM invocation".into());
+        }
         if calls.iter().any(|(name, _)| {
             self.recipient
                 .as_ref()
@@ -574,5 +577,25 @@ mod tests {
                 Event::Content("Done".into())
             ]
         );
+    }
+    #[test]
+    fn generic_tool_recipient_uses_one_registered_invocation_per_frame() {
+        let call = "<atem:function_calls><atem:invoke name=\"lookup\"></atem:invoke></atem:function_calls>";
+        let text = format!(
+            " to=tool<|message|>{call}<|eom|><|start|>assistant to=lookup<|message|>{call}"
+        );
+        let events = feed(&mut parser(), &text, 0);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolBegin { .. }))
+                .count(),
+            2
+        );
+        let mut parser = parser();
+        parser.push(Input::Text(" to=tool")).unwrap();
+        parser.push(Input::Token(2)).unwrap();
+        parser.push(Input::Text("<|message|><atem:function_calls><atem:invoke name=\"lookup\"></atem:invoke><atem:invoke name=\"lookup\"></atem:invoke></atem:function_calls>")).unwrap();
+        assert!(parser.finish(Termination::Eos).is_err());
     }
 }

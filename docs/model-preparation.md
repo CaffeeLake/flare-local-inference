@@ -56,12 +56,13 @@ Unsigned rank staging is private to preparation and cannot load in Helios.
 Flare loads the package files without Python. Helios is a Rust library;
 `flare_heliopause` is a CPython extension imported by Ignition.
 
-Every recipe defaults to FP8 E4M3 KV storage, including learned draft-model
-caches. Qwen Flash retains BF16 selector keys; GLM and DeepSeek retain their
-packed latent formats, including scale metadata and any BF16 rotary fields.
+Muse Spark uses BF16 KV storage. Other recipes default to FP8 E4M3 KV storage,
+including learned draft-model caches. Qwen Flash retains BF16 selector keys;
+GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
-scales, and memory planning includes FP8 pages and partial-page snapshots.
+scales where required, and memory planning includes each cache's declared page
+precision and partial-page snapshots.
 Export a package to use these cache layouts; existing packages retain the
 layouts captured when they were prepared.
 
@@ -891,6 +892,20 @@ recommended inference default. Reasoning effort accepts `low`, `medium`,
 `reasoning_effort` or `chat_template_kwargs.reasoning_effort` explicitly to
 override it.
 
+Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
+routed-expert outputs, independent FC1 half gains, and BF16 head-dimension-64
+paged decode. The FlashInfer Git dependency pinned in `pyproject.toml` lacks
+these operators. After the standard environment setup, install a local checkout
+containing those interfaces explicitly:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps -e /path/to/flashinfer
+```
+
+Running `uv sync --locked --extra prepare --extra test` restores the pinned Git
+dependency, so repeat the editable installation afterward when preparing Muse
+Spark. The local checkout must provide both the `flashinfer` and `b12x` imports.
+
 The annotated template in `ignition/recipes/muse_spark/assets/chat_template.jinja`
 preserves the canonical checkpoint bytes when message marks are removed.
 Native recipient headers route `self` messages to reasoning, `commentary` and
@@ -901,17 +916,19 @@ to JSON objects before rendering. Caller content and header attributes retain
 the canonical control-sequence escaping.
 
 ```sh
-.venv/bin/ignition export muse-spark-open-nvfp4 --gpus 0-7
+.venv/bin/ignition export muse-spark-open-nvfp4 --gpus 0-7 --prompt-logprobs
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/muse-spark-tp8.safetensors
 flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
 ```
 
 ## Storage and graph capacities
 
-Gemma 4 defaults to four concurrent requests; its speculative target-token capacity
-is the larger of padded concurrency and draft count plus one, giving six rows at
-its default settings. Other recipes default to 32 concurrent requests, with
-speculative recipes declaring 128 target-token rows independently of concurrency.
+Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
+target-token capacity is the larger of padded concurrency and draft count plus
+one, giving six rows at its default settings. Muse Spark prepares ordinary
+execution without speculative rows. Other recipes default to 32 concurrent
+requests, with speculative recipes declaring 128 target-token rows independently
+of concurrency.
 Explicit flags and configuration override these defaults; existing packages retain their
 captured capacities. Memory planning rejects capacities that do not fit the
 selected GPUs.

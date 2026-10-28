@@ -1,12 +1,13 @@
 """Muse Spark text acceptance against an exported package served by ``flare run``.
 
 Set FLARE_RUN_CUDA_TESTS=1, FLARE_MUSE_TEST_URL, and FLARE_MUSE_SPARK_SNAPSHOT.
-The package must prepare TP8 SM120, context 262144, concurrency four, and a
-4096-token prefill chunk. These tests never launch a diagnostic Python server.
+Export with --prompt-logprobs. The package must prepare TP8 SM120, context
+262144, concurrency four, and a 4096-token prefill chunk. These tests never launch a diagnostic Python server.
 """
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -248,3 +249,37 @@ def test_native_protocol_endpoints(service, path, body):
         text = ''.join(part['text'] for item in response['output'] if item['type'] == 'message'
                        for part in item['content'] if part['type'] == 'output_text')
         assert text.strip() == 'PROTOCOL-RESPONSES'
+
+
+@pytest.mark.parametrize('protocol', ['completions', 'chat'])
+def test_prompt_logprob_scores_align_with_actual_checkpoint_tokens(service, protocol):
+    prompt = 'A cache preserves context. café 世界 17 times 23 equals 391.'
+    if protocol == 'completions':
+        tokens = service.expected_prompt(service.body(prompt))
+        body = dict(model=service.model, prompt=tokens, max_tokens=0,
+                    prompt_logprobs=2, return_token_ids=True)
+        result = service.request('/v1/completions', body)
+        scores = result['choices'][0]['prompt_logprobs']
+        assert result['usage']['completion_tokens'] == 0
+        assert result['choices'][0]['finish_reason'] == 'length'
+    else:
+        body = service.body(prompt, max_tokens=1, prompt_logprobs=2)
+        tokens = service.expected_prompt(body)
+        result = service.request('/v1/chat/completions', body)
+        assert result['prompt_token_ids'] == tokens
+        scores = result['prompt_logprobs']
+        assert result['usage']['completion_tokens'] == 1
+    assert result['usage']['prompt_tokens'] == len(tokens)
+    assert len(scores) == len(tokens)
+    assert scores[0] is None
+    for token, values in zip(tokens[1:], scores[1:], strict=True):
+        assert str(token) in values
+        assert 2 <= len(values) <= 3
+        for token_id, value in values.items():
+            assert 0 <= int(token_id) < len(service.tokenizer)
+            assert math.isfinite(value['logprob']) and value['logprob'] <= 0
+            assert value['rank'] >= 1
+            assert isinstance(value['decoded_token'], str)
+        ordered = sorted(values.values(), key=lambda entry: entry['logprob'], reverse=True)
+        for first, second in zip(ordered, ordered[1:]):
+            assert first['rank'] <= second['rank']

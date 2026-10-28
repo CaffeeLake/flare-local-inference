@@ -317,11 +317,11 @@ impl GrammarCompiler {
             for (index, name) in envelope.tools.iter().enumerate() {
                 let attr = name.replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&#39;").replace('<', "&lt;").replace('>', "&gt;");
                 let invoke = marker(&format!("<atem:invoke name=\"{attr}\">"));
-                rules.push_str(&format!("invoke_{index}: {invoke} parameters\nnamed_tool_{index}: {} {message} {open} ws invoke_{index} (ws invoke_{index})* ws {close}\n", marker(&format!(" to={name}"))));
+                rules.push_str(&format!("invoke_{index}: {invoke} parameters\nnamed_tool_{index}: {} {message} {open} ws invoke_{index} ws {close}\n", marker(&format!(" to={name}"))));
                 names.push(format!("named_tool_{index}"));
                 invocations.push(format!("invoke_{index}"));
             }
-            rules.push_str(&format!("invocation: {}\ntool_body: {open} ws invocation (ws invocation)* ws {close}\ntool: {} | {} {message} tool_body\n", invocations.join(" | "), names.join(" | "), marker(" to=tool")));
+            rules.push_str(&format!("invocation: {}\ntool_body: {open} ws invocation ws {close}\ntool: {} | {} {message} tool_body\n", invocations.join(" | "), names.join(" | "), marker(" to=tool")));
             rules.push_str("tools: tool (resume (reasoning | commentary)* tool)* (resume (reasoning | commentary)* answer)?\n");
             ending = "(answer | tools)".into();
         }
@@ -1724,6 +1724,7 @@ mod recipient_tests {
             (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
             (OutputStart::RecipientHeader,vec!["lookup".into(),"other".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
             (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup", "to=tool"),true),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("</atem:function_calls>", "<atem:invoke name=\"lookup\"></atem:invoke></atem:function_calls>"),false),
             (OutputStart::Reasoning,vec![],format!("Plan{resume} to=user<|message|>{answer}"),true),
             (OutputStart::Content,vec![],answer.into(),true),
             (OutputStart::RecipientFrame,vec![],format!("<|start|>assistant{reasoning} to=user<|message|>{answer}"),true),

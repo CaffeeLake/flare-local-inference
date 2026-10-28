@@ -239,7 +239,10 @@ frames. The `self` recipient carries reasoning; `commentary` and `user` carry
 visible content. Tool recipients contain ATEM `<atem:function_calls>` blocks
 with named invocations and schema-typed scalar or JSON parameters. These two
 syntax identifiers are paired because their parser consumes complete recipient
-frames. `<|eom|>` closes an internal message and permits another assistant
+frames. A frame carries one invocation; parallel calls use consecutive assistant
+frames. The generic `tool` recipient accepts the request's registered invocation
+names. A named tool recipient requires the invocation to match that exact name.
+`<|eom|>` closes an internal message and permits another assistant
 header. Generation ends only at the package's EOS IDs. Header controls delimit
 frames only when observed as their tokenizer tokens. An initially open
 `<|start|>assistant` header accepts the generated recipient suffix; assistant
