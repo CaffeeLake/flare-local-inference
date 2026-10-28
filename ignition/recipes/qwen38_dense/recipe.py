@@ -21,11 +21,12 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         drafting = dict(draft_snapshot=Path(snapshot_download(REPOSITORY, revision=REVISION,
             cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors"))),
             speculative_graph_budget=speculation.graph_budget or 64)
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
+    selection = plan.benchmark_selection
+    config = PreparationConfig(benchmark_selection=selection, collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
-        max_active=plan.concurrency, context=plan.context,
+        max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,

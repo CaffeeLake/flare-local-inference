@@ -9,6 +9,7 @@ from ignition.errors import FlareError
 def _parser() -> argparse.ArgumentParser:
     from . import serve
     from . import publishing
+    from . import bench
     from .help import RecipeHelp, recipe_help
 
     parser = argparse.ArgumentParser(
@@ -40,6 +41,10 @@ def _parser() -> argparse.ArgumentParser:
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
     _preparation_arguments(exporting)
+    benchmarking = command("bench", bench.run,
+        "measure complete prepared GPU graph latency without export or HTTP; not serving throughput")
+    _preparation_arguments(benchmarking, model_default="defaults.model, else qwen3.8-27b")
+    bench.arguments(benchmarking)
     serving = command("debug-serve", serve.debug_serve,
                       "prepare and run diagnostic HTTP requests; not for actual serving or performance"
                       " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
@@ -113,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _preparation_arguments(running):
+def _preparation_arguments(running, *, model_default="defaults.model"):
     from .help import recipe_help
 
     running.usage = "%(prog)s [MODEL] [options]"
@@ -121,7 +126,7 @@ def _preparation_arguments(running):
     running.set_defaults(roce_ring=False, roce_chain=False)
     running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
     running.add_argument("model", nargs="?", metavar="MODEL",
-                         help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")
+                         help=f"recipe alias, repository id, or checkpoint directory (default: {model_default})")
     running.add_argument("--gpus", metavar="LIST",
                          help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
                               " such as 0, 0,1, or 0-3;"

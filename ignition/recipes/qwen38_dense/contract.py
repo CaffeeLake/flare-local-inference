@@ -14,7 +14,8 @@ FRONTEND = c.frontend(tools=p.QWEN_CODER, wrapping_newlines=1, terminal_markers=
 
 def prepare(signatures, buffers, pool, *, vocabulary):
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
-    inputs["decode"].pop("token_ids", None)
+    if "decode" in inputs:
+        inputs["decode"].pop("token_ids", None)
     continuation = c.state_view("state_pool", pool.layout.row_bytes)
     mtp = any(s.speculation_enabled for s in signatures.values())
     consumed = pool.layout.region("consumed_tokens") if mtp else None

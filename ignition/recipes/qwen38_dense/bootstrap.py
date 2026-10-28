@@ -1,7 +1,7 @@
 """Prepare a single-GPU dense Qwen text graph catalog with device-resident state."""
 
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, replace
 from functools import partial
 import hashlib
 import json
@@ -33,6 +33,7 @@ from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
+from ignition.preparation.selection import BenchmarkSelection
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
@@ -63,6 +64,7 @@ class PreparationConfig:
     compile_decoder: bool = True
     retain_graphs: bool = False
     kernel_cache: Path | None = None
+    benchmark_selection: BenchmarkSelection | None = None
     mtp: bool = True
     draft_snapshot: Path | None = None
     speculative_graph_budget: int = 64
@@ -72,6 +74,17 @@ class PreparationConfig:
 
     def __post_init__(self):
         request_capacity(self.max_active)
+        selection = self.benchmark_selection
+        if selection is not None:
+            if not self.mtp or self.prompt_logprobs:
+                raise ValueError("benchmark preparation requires speculative unscored text graphs")
+            if selection.max_batch > self.max_active or selection.width not in self.speculative_widths:
+                raise ValueError("benchmark shapes exceed the configured request or width capacities")
+            if selection.max_context + selection.width > self.context:
+                raise ValueError("benchmark context must leave room for a complete round")
+            if (self.speculative_token_capacity is not None
+                    and selection.max_batch * selection.width > self.speculative_token_capacity):
+                raise ValueError("benchmark shapes exceed the speculative token capacity")
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
             raise ValueError("Qwen dense context must be 128-aligned in [128,262144]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
@@ -89,6 +102,8 @@ class PreparationConfig:
 
     @property
     def speculative_round_shapes(self):
+        if self.benchmark_selection is not None:
+            return self.benchmark_selection.speculative_round_shapes
         return (parallel_speculative_shapes(self.max_active, self.speculative_widths,
             self.speculative_token_capacity, self.speculative_graph_budget,
             fixed_width=self.speculative_fixed_width) if self.mtp else ())
@@ -204,7 +219,10 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame)
     forwards, signatures, metadata = {}, {}, {}
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
-    modes = (True, False) if config.mtp else (False,)
+    if config.benchmark_selection is not None:
+        prefill_sizes = config.benchmark_selection.prefill_capacities(config.prefill_chunk_size)
+        batch_sizes = config.benchmark_selection.batches
+    modes = (True,) if config.benchmark_selection is not None else ((True, False) if config.mtp else (False,))
     with phase(progress, "Construct graph catalog"):
         def add(name, forward, kind, rows, tokens, fields, enabled, packed=0):
             if kind == "scored_prefill":
@@ -295,6 +313,13 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             speculative_fixed_width=config.speculative_fixed_width,
             speculative_token_capacity=speculative_token_capacity(
                 config.max_active, max(config.speculative_widths), config.speculative_token_capacity))
+    if config.benchmark_selection is not None:
+        pages = max(pages, config.benchmark_selection.physical_pages(PAGE_TOKENS))
+        package_storage.grow("KV_PAGES", pages)
+        pool.memory_capacity[1] = pages
+        pool.clear_for_preparation()
+        server_config["pages"] = pages
+        torch.cuda.synchronize(device)
     free, total = torch.cuda.mem_get_info(device)
     memory = dict(rank=0, world_size=1, device=config.device, weights_bytes=weights.allocated_bytes,
         mapped_host_bytes=0, offloaded_bytes=0, continuation_bytes=pool.backing.nbytes, state_rows=state_rows,
@@ -309,9 +334,22 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         target_buffer_bytes=target_buffers.nbytes, context_buffer_bytes=context_buffers.nbytes, graph_buffer_bytes=graph_buffers.nbytes, private_buffer_bytes=private_buffers.nbytes)
     if scoring is not None:
         memory.update(scoring.memory_report())
+    state = None
+    if config.benchmark_selection is not None:
+        state = {name: tensor for name, tensor in buffers.items() if name != "state_pool"}
+        state["state_pool"] = pool.backing[:int(pool.memory_capacity[0].item())]
+        state.update((f"cache.{name}", tensor[:pages]) for name, tensor in pool.pages.items())
+        state.update((f"request.{field.name}", getattr(requests, field.name)) for field in dataclass_fields(requests))
+        state.update((f"speculation.rng.{field.name}", getattr(speculation.rng, field.name))
+                     for field in dataclass_fields(speculation.rng))
+        state.update({"speculation.generation": speculation.generation, "speculation.offset": speculation.offset})
     roots, components = _declared_weight_roots(weights)
-    return PreparedModel(rebuild_weights=declare_weights(roots, components=components, layers=()), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
+    prepared = PreparedModel(rebuild_weights=declare_weights(roots, components=components, layers=()), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
+        benchmark_state=state, benchmark_pool=pool if state is not None else None,
+        benchmark_requests=requests if state is not None else None,
+        benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
+            if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, arena.tensor, metadata,
@@ -321,3 +359,5 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator,
                    graph_buffers, private_buffers, target_buffers, context_buffers, draft_buffers, speculation))
+
+    return prepared

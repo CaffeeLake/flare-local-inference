@@ -61,6 +61,7 @@ for patch application in standalone Python tools.
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
+ignition bench [MODEL] [flags]                   measure complete prepared GPU graph round latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
@@ -68,6 +69,7 @@ Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
 repository id with an optional `@revision`, or a local checkpoint directory;
 with no `MODEL`, `export` and `debug-serve` use `defaults.model` from the configuration file and
 fail with a usage error if it is unset.
+`bench` uses the explicit model, then `defaults.model`, then `qwen3.8-27b`.
 
 `ignition --help` and preparation-command help list every declared model alias,
 supported tensor-parallel size, and default/maximum draft count. Put an alias or
@@ -188,6 +190,56 @@ startup settings win. Serving requires execution ABI 5 and prepared model
 contract 3; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
+
+### GPU graph latency benchmark
+
+`ignition bench qwen3.8-27b` prepares the real Qwen3.8-27B target and DFlash2
+draft checkpoint, captures the selected graph catalog, and measures complete
+speculative GPU rounds with CUDA events. It opens no HTTP listener and exports
+no package. The benchmark supports the Qwen3.8-27B dense recipe on one local GPU;
+other recipes fail explicitly.
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 \
+  --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
+```
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4` | `1,2,4` |
+| `--contexts LIST` | Distinct consumed context lengths before each measured round; positive multiples of 128 | `512,2048,8192,16384` |
+| `--verify-width N` | Target tokens per request, including the pending token; only eight is supported, with seven draft tokens | `8` |
+| `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
+| `--repetitions N` | Timed restored rounds per case and seed | `20` |
+| `--seeds LIST` | Distinct input and sampling seeds | `0,1,2` |
+| `--output PATH` | JSON destination for configuration, device identity, per-case statistics, and raw samples | None; table still prints |
+
+The default matrix contains twelve cases: each batch at each context, with
+verification width eight and aggregate target rows `P = B × 8`. Seven draft
+tokens plus one pending token form each request's verification block. The
+speculative token capacity remains 128 unless configuration or an explicit flag
+overrides it. Preparation accepts the normal GPU, memory, cache, compiler,
+autotuning, precision, and overlap settings. Omitted concurrency defaults to the
+largest selected batch; configured and explicit capacities must cover it.
+The prepared request capacity is the largest selected batch. JSON distinguishes
+that capacity from the concurrency requested through configuration or flags.
+`--no-mtp`, mixed prefill, and prompt-logprob graphs do not apply.
+
+Each case starts from a real tokenized and prefilled context. Context length
+counts consumed positions before the pending token. Complete cache and
+speculative state restoration occurs outside CUDA timing before every round.
+Timing includes draft proposals, target verification, vocabulary projection,
+sampling, and state commit. Preparation, context prefill, state restoration,
+native scheduling, and HTTP are outside the measured interval.
+
+The table reports each case's median and interquartile range in milliseconds.
+The aggregate is the equal-weight arithmetic mean of case medians, with lower
+values better. Equal weights describe matrix coverage rather than production
+traffic. JSON retains every sample by seed. Scores from different GPU classes
+remain separate. These measurements support graph optimization; serving
+throughput and comparisons against other runtimes still require exported
+packages running through `flare run`.
 
 ## 3. Parameters
 

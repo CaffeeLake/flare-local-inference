@@ -76,7 +76,7 @@ cargo build --release --manifest-path flare/Cargo.toml
 
 Ignition applies three bundled preparation patches to the pinned PyTorch 2.14.1 and
 Triton 3.8 preparation environment before importing preparation libraries in
-`export`, `debug-serve`, and `join`, including commands launched through `uv run`.
+`export`, `debug-serve`, `bench`, and `join`, including commands launched through `uv run`.
 `ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
 Triton's 150-character physical cache filenames while retaining full CUDA symbol
 names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
@@ -347,6 +347,20 @@ Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
 retain draft context so adaptive verification can resume wider rounds.
 `--no-mtp` skips the draft download and omits its weights and state during preparation;
 `flare run PACKAGE --mtp-draft-tokens 0` selects the package's ordinary graphs.
+
+For complete GPU graph round latency without package export, use:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
+```
+
+This prepares only the selected benchmark graph catalog. Defaults cover request
+batches 1, 2, and 4, verification width eight, and consumed contexts 512, 2,048,
+8,192, and 16,384 tokens. Timing uses real prefilled contexts and restores full
+cache and speculative state before each sample, outside CUDA event timing.
+The [benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines workload
+selection, repetitions, seeds, and the equal-weight latency score. Native
+serving measurements still use an exported package with `flare run`.
 
 ## Qwen3.8 Flash
 
