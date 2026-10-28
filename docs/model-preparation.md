@@ -895,12 +895,20 @@ override it.
 Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
 routed-expert outputs, independent FC1 half gains, and BF16 head-dimension-64
 paged decode. The FlashInfer Git dependency pinned in `pyproject.toml` lacks
-these operators. After the standard environment setup, install a local checkout
-containing those interfaces explicitly:
+these operators. Complete the standard environment setup and install the local
+checkout's build and runtime requirements into `.venv` first. Build requirements
+include `setuptools>=77`, `packaging>=24`, and `apache-tvm-ffi>=0.1.11,<0.2`;
+the CUDA 13 checkout's NCCL-EP dependency requires `nvidia-nccl-cu13>=2.30.7`.
+Install the checkout containing the required operators with:
 
 ```sh
-uv pip install --python .venv/bin/python --no-deps -e /path/to/flashinfer
+FLASHINFER_BUILD_NO_PIP=1 uv pip install --python .venv/bin/python \
+  --no-deps --no-build-isolation -e /path/to/flashinfer
 ```
+
+`FLASHINFER_BUILD_NO_PIP=1` disables nested dependency installation and NCCL
+upgrades in the FlashInfer build hook. `--no-build-isolation` uses the build
+requirements already installed in `.venv`.
 
 Running `uv sync --locked --extra prepare --extra test` restores the pinned Git
 dependency, so repeat the editable installation afterward when preparing Muse
