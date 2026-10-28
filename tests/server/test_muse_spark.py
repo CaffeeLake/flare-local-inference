@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 EFFORTS = ('low', 'medium', 'high', 'xhigh')
-LONG_INPUTS = (4097, 8193, 16385, 65537, 131073, 261120)
+LONG_INPUTS = (4097, 8193, 16385, 65537, 131073, 262080)
 CASES = ([('text', i) for i in range(20)] + [('reasoning', i) for i in range(8)]
          + [('tool', i) for i in range(8)] + [('json', i) for i in range(8)]
          + [('long', i) for i in range(6)])
@@ -98,7 +98,7 @@ class NativeMuse:
         head = 'The secret access code is MUSE53197. Preserve it while reading the filler.\n'
         tail = '\nWhat is the secret access code? Reply with only the code.'
         prompt = lambda count: head + ' filler' * count + tail
-        length = lambda count: len(self.expected_prompt(self.body(prompt(count), max_tokens=1024)))
+        length = lambda count: len(self.expected_prompt(self.body(prompt(count), max_tokens=64)))
         low, high = 0, target
         while low < high:
             middle = (low + high + 1) // 2
@@ -121,19 +121,22 @@ def content(result):
 
 @pytest.mark.parametrize('kind,index', CASES, ids=[f'{kind}-{i}' for kind, i in CASES])
 def test_fifty_prompt_cases(service, kind, index):
+    def ask(prompt, **options):
+        return service.ask(prompt, max_tokens=64, **options)
+
     if kind == 'text':
         if index < 12:
             a, b = 17 + index, 23 - index
-            result = service.ask(f'What is {a} times {b}? Reply with only the integer.', compare_prompt=True)
+            result = ask(f'What is {a} times {b}? Reply with only the integer.', compare_prompt=True)
             assert content(result) == str(a * b)
         else:
             value = ['MUSE-53197', 'café', '世界', 'naïve', 'á', 'Δοκιμή', 'مرحبا', '日本語'][index - 12]
-            result = service.ask(f'Repeat exactly this text, without quotation marks or explanation: {value}', compare_prompt=True)
+            result = ask(f'Repeat exactly this text, without quotation marks or explanation: {value}', compare_prompt=True)
             assert content(result) == value
     elif kind == 'reasoning':
         effort = EFFORTS[index // 2]
         boxes, per_box, removed = 7 + index, 13 + index, 19 + index
-        result = service.ask(f'A store has {boxes} boxes of {per_box} bolts. It sells {removed} bolts '
+        result = ask(f'A store has {boxes} boxes of {per_box} bolts. It sells {removed} bolts '
             'and receives two more boxes with the same number per box. How many bolts does it have? '
             'Put only the integer in the final answer.', compare_prompt=True,
             chat_template_kwargs=dict(reasoning_effort=effort, current_date='2026-10-27', add_generation_prompt=True))
@@ -148,7 +151,7 @@ def test_fifty_prompt_cases(service, kind, index):
         function = dict(name='record_values', description='Record the supplied values exactly.',
             parameters=dict(type='object', properties=properties, required=list(properties)))
         choice = 'required' if index % 2 else dict(type='function', function=dict(name='record_values'))
-        result = service.ask('Call record_values once with exactly these argument values:\n'
+        result = ask('Call record_values once with exactly these argument values:\n'
             + json.dumps(value, ensure_ascii=False), tools=[dict(type='function', function=function)], tool_choice=choice)
         calls = result['choices'][0]['message']['tool_calls']
         assert len(calls) == 1
@@ -157,12 +160,12 @@ def test_fifty_prompt_cases(service, kind, index):
         assert result['choices'][0]['finish_reason'] == 'tool_calls'
     elif kind == 'json':
         value = dict(index=index, text='世界 café <atem:function_calls> literal', enabled=bool(index % 2))
-        result = service.ask('Return the requested JSON object.', response_format=dict(type='json_schema',
+        result = ask('Return the requested JSON object.', response_format=dict(type='json_schema',
             json_schema=dict(name='exact_value', strict=True, schema=dict(const=value))))
         assert json.loads(content(result)) == value
     else:
         target = LONG_INPUTS[index]
-        result = service.ask(service.long_prompt(target), compare_prompt=True, max_tokens=1024)
+        result = ask(service.long_prompt(target), compare_prompt=True)
         assert target - 8 <= result['usage']['prompt_tokens'] <= target
         assert content(result) == 'MUSE53197'
 
@@ -224,9 +227,9 @@ def test_unsupported_media_is_rejected(service, path, body):
 
 
 def test_context_capacity_rejects_oversized_requests(service):
-    prompt = service.long_prompt(261120) + ' filler' * 2048
+    prompt = service.long_prompt(262080) + ' filler' * 128
     with pytest.raises(urllib.error.HTTPError) as rejected:
-        service.open('/v1/chat/completions', service.body(prompt, max_tokens=1024))
+        service.open('/v1/chat/completions', service.body(prompt, max_tokens=64))
     assert rejected.value.code == 400
 
 
