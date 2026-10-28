@@ -11,6 +11,7 @@ ordinary EOS handling and report unprofiled and profiled rounds separately.
 """
 
 import argparse
+from contextlib import contextmanager
 from functools import partial
 import json
 from pathlib import Path
@@ -22,6 +23,51 @@ def read_tokens(path):
     if not tokens or any(type(token) is not int or token < 0 for token in tokens):
         raise ValueError('token_ids must contain nonnegative integer IDs')
     return tuple(tokens)
+
+
+@contextmanager
+def fence_operations(rank, enabled):
+    if not enabled:
+        yield
+        return
+    import torch
+    from ignition.preparation.compilation import _Invocation
+
+    original = _Invocation.run
+    sequence = 0
+
+    def run(operation, reads, writes, integers=()):
+        nonlocal sequence
+        sequence += 1
+        label = f'operation-fence rank={rank} sequence={sequence} target={operation.target}'
+        stage = 'capture-query'
+        try:
+            capturing = torch.cuda.is_current_stream_capturing()
+            if not capturing:
+                stage = 'before-fence'
+                print(f'{label} before-fence begin', flush=True)
+                torch.cuda.current_stream().synchronize()
+        except Exception as error:
+            print(f'{label} before-operation failure stage={stage}: {type(error).__name__}: {error}', flush=True)
+            raise
+        if capturing:
+            return original(operation, reads, writes, integers)
+        stage = 'call'
+        try:
+            result = original(operation, reads, writes, integers)
+            stage = 'after-fence'
+            torch.cuda.current_stream().synchronize()
+        except Exception as error:
+            print(f'{label} opaque-operation failure stage={stage}: {type(error).__name__}: {error}', flush=True)
+            raise
+        print(f'{label} after-fence complete', flush=True)
+        return result
+
+    _Invocation.run = run
+    try:
+        yield
+    finally:
+        _Invocation.run = original
 
 
 def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
@@ -149,7 +195,8 @@ def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
     return rows
 
 
-def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output, measure=False, profile=False):
+def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output,
+                     measure=False, profile=False, fence=False):
     import torch
     import torch.distributed as dist
 
@@ -157,8 +204,9 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
     from ignition.recipes.muse_spark.bootstrap import prepare_rank
     from ignition.recipes.muse_spark.pool import ContinuationPool
 
-    model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
-                         progress=progress)
+    with fence_operations(rank, fence):
+        model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
+                             progress=progress)
     if any(token >= model.server_config['model_contract']['vocabulary'] for token in tokens):
         raise ValueError('recorded token lies outside the model vocabulary')
     forwards = next(value for value in model.resources if isinstance(value, dict) and 'decode1' in value)
@@ -273,6 +321,8 @@ def main():
     parser.add_argument('--config', type=Path)
     parser.add_argument('--measure-replay', action='store_true', help='measure valid B1/B4 captured decode after correctness readback')
     parser.add_argument('--profile-replay', action='store_true', help='control profiler capture around measured B1/B4 regions')
+    parser.add_argument('--fence-operations', action='store_true',
+                        help='diagnose preparation faults by logging and synchronizing compiled storage operations outside capture')
     args = parser.parse_args()
     if args.profile_replay and not args.measure_replay:
         parser.error('--profile-replay requires --measure-replay')
@@ -302,7 +352,7 @@ def main():
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),
-                     measure=args.measure_replay, profile=args.profile_replay)
+                     measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations)
     with storage:
         prepared = prepare_group(args.snapshot.resolve(), config, runner, package_storage=storage,
                                  progress=lambda text: print(text, flush=True))
