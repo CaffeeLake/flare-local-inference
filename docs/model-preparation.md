@@ -75,7 +75,7 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-Ignition applies two bundled Inductor patches to the pinned PyTorch 2.14.1 and
+Ignition applies three bundled preparation patches to the pinned PyTorch 2.14.1 and
 Triton 3.8 preparation environment before importing preparation libraries in
 `export`, `debug-serve`, and `join`, including commands launched through `uv run`.
 `ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
@@ -83,16 +83,22 @@ Triton's 150-character physical cache filenames while retaining full CUDA symbol
 names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
 cooperative vision reductions in portable static kernels through Triton's CUDA
 launcher, including their cooperative launch attributes and frozen selections.
+`ignition/patches/triton-platform-key-pointer-width.patch` derives Triton's helper
+cache key from the interpreter's pointer width without launching `file`.
+Nsight Systems injection can conflict with `file`'s seccomp sandbox and hang
+startup ([NVIDIA known issues](https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html#general-issues)).
+The pointer-width key retains machine and operating-system identity and
+invalidates compiled helper caches that used executable linkage metadata.
 Patch application checks dependency versions and exact source context, accepts
 already applied hunks, and replaces installation files atomically without
 modifying uv's shared wheel cache. Each preparation host needs a writable,
-dedicated Flare environment. Reinstalling Torch restores its distribution files;
+dedicated Flare environment. Reinstalling Torch or Triton restores its distribution files;
 the preparation command reapplies the patches.
 
 `uv sync` installs dependencies without running the patches, and `uv build`
 includes the patch files in Ignition's wheel and source distribution without
 modifying its isolated build environment. For standalone Python tools and tests
-that import Inductor before invoking Ignition preparation, apply the bundled
+that import Inductor or Triton before invoking Ignition preparation, apply the bundled
 patches before starting their process:
 
 ```sh
@@ -100,7 +106,7 @@ uv run --locked --extra prepare python -m ignition.patches
 ```
 
 `python scripts/setup_preparation.py` runs the locked preparation/test sync,
-rebuilds FlashInfer and Heliopause, and applies both patches before exiting.
+rebuilds FlashInfer and Heliopause, and applies the bundled patches before exiting.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:

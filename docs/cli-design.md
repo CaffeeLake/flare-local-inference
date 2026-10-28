@@ -53,7 +53,7 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 The Python distribution and source package are named `ignition`. Install the
 preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
-Preparation commands apply the bundled, version-checked Inductor patches before
+Preparation commands apply the bundled, version-checked Inductor and Triton patches before
 importing preparation libraries; `uv run --locked --extra prepare ignition ...`
 uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
 for patch application in standalone Python tools.
