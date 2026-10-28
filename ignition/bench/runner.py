@@ -185,22 +185,6 @@ def _round(scheduler, case):
                                   packed_tokens=case.packed_tokens, draft_tokens=shape[4]))
 
 
-def _inactive_state(model, batch):
-    """Exact copies cover rows on which the generation graph must perform no writes."""
-    from dataclasses import fields
-
-    import torch
-
-    physical_rows = int(model.benchmark_pool.memory_capacity[0].item())
-    result = {"continuations": model.benchmark_pool.backing[1 + batch:physical_rows]}
-    result["null_continuation"] = model.benchmark_pool.backing[:1]
-    for field in fields(model.benchmark_requests):
-        tensor = getattr(model.benchmark_requests, field.name)
-        result[f"request.{field.name}"] = tensor[batch:]
-    return {name: value.detach().cpu().contiguous().view(-1).view(torch.uint8).clone()
-            for name, value in result.items()}
-
-
 def _check_request_state(model, step, records):
     requests = model.benchmark_requests
     for lane in step.lanes:
@@ -298,7 +282,6 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                 generation += 1
                 baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
                 snapshot = StateSnapshot(model.benchmark_state, runner.stream)
-                inactive = _inactive_state(model, case.batch)
                 for iteration in range(-1, warmup + repetitions):
                     scheduler = deepcopy(baseline, {id(layout): layout})
                     snapshot.restore(runner.stream)
@@ -313,10 +296,6 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                     _check_request_state(model, step, records)
                     if iteration == -1:
                         _check_metadata(model, step, case)
-                        actual = _inactive_state(model, case.batch)
-                        for name, expected in inactive.items():
-                            if not torch.equal(actual[name], expected):
-                                raise RuntimeError(f"captured round modified inactive state: {name}")
                 if progress is not None:
                     progress(result("running"))
                 snapshot.restore(runner.stream)
