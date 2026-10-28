@@ -64,3 +64,23 @@ class ContinuationPool(PagedStateStorage):
         _, heads = geometry.local(self.shard)
         dim = geometry.key_dim if kind == "key" else geometry.value_dim
         return self.pages[name].view(torch.bfloat16).view(-1, PAGE_TOKENS, heads, dim)
+
+    def window_page_stride(self, layer):
+        geometry = self.config.attention(layer)
+        _, heads = geometry.local(self.shard)
+        record = PAGE_TOKENS * heads * geometry.key_dim * 2
+        if self.layout.row_bytes % record:
+            raise ValueError("circular continuation rows must align to physical KV pages")
+        return self.layout.row_bytes // record
+
+    def window_pages(self, layer, kind):
+        """Expose circular regions as pages with the continuation row stride intact."""
+        geometry = self.config.attention(layer)
+        _, heads = geometry.local(self.shard)
+        dim = geometry.key_dim if kind == "key" else geometry.value_dim
+        region = self.layout.region(f"layer{layer}.{kind}")
+        row_pages = self.window_page_stride(layer)
+        pages = (self.reserved_backing.shape[0] - 1) * row_pages + geometry.window // PAGE_TOKENS
+        return self.reserved_backing.view(torch.bfloat16).as_strided(
+            (pages, PAGE_TOKENS, heads, dim), (PAGE_TOKENS * heads * dim, heads * dim, dim, 1),
+            storage_offset=region.offset // 2)

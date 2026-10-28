@@ -8,7 +8,7 @@ import torch
 
 from ignition.components.paged_batch import Metadata
 from ignition.components.parallel import TensorParallelShard
-from ignition.recipes.muse_spark.attention import AttentionScratch, PreparedAttention, head_norm
+from ignition.recipes.muse_spark.attention import AttentionScratch, PreparedAttention
 from ignition.recipes.muse_spark.pool import ContinuationPool, PAGE_TOKENS, page_bytes
 
 

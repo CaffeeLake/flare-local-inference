@@ -90,8 +90,12 @@ class PreparedAttention(torch.nn.Module):
                 self.pages = torch.arange(key.shape[0], dtype=torch.int32, device=source.device).view(rows, -1)
                 window = geometry.window - 1
             else:
-                key, value = self.key_cache, self.value_cache
-                self.pages = torch.zeros((metadata.lengths.numel(), 1), dtype=torch.int32, device=source.device)
+                key, value = pool.window_pages(layer, "key"), pool.window_pages(layer, "value")
+                self.window_row_stride = pool.window_page_stride(layer)
+                self.window_columns = torch.arange(geometry.window // PAGE_TOKENS,
+                    dtype=torch.int32, device=source.device)
+                self.pages = torch.zeros((metadata.lengths.numel(), self.window_columns.numel()),
+                    dtype=torch.int32, device=source.device)
         else:
             key, value, self.pages = self.key_cache, self.value_cache, metadata.page_table
         self.writer = None
@@ -133,10 +137,10 @@ class PreparedAttention(torch.nn.Module):
                                         + m.positions.remainder(PAGE_TOKENS), -1))
             self.lengths.copy_((m.starts + m.lengths).int())
         elif self.mode == "decode":
-            self.pages[:, 0].copy_(m.state_rows)
+            self.pages.copy_(m.state_rows[:, None] * self.window_row_stride + self.window_columns[None])
             self.lengths.copy_((m.starts + m.lengths).clamp(max=a.window).int())
             self.slots.copy_(torch.where(m.positions >= 0,
-                m.state_rows[m.requests] * a.window + m.positions.remainder(a.window), -1))
+                m.state_rows[m.requests] * self.window_row_stride * PAGE_TOKENS + m.positions.remainder(a.window), -1))
         elif self.mode == "prefill":
             stage_windows(self.key_cache, s.key, s.window_key, m)
             stage_windows(self.value_cache, s.value, s.window_value, m)
