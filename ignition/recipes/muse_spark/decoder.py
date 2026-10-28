@@ -174,10 +174,6 @@ class PreparedDecoder:
         logits = self.head(self.scratch.hidden)
         logits.copy_(torch.tanh(logits * self.output_multiplier / self.softcap) * self.softcap)
 
-    def commit(self, counts):
-        for layer in self.layers:
-            layer.self_attn.commit(counts)
-
     def scratch_tensors(self):
         return (self.head.gathered, *(layer.self_attn.scratch_tensors() for layer in self.layers))
 
