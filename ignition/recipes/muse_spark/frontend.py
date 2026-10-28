@@ -1,5 +1,6 @@
 """Recipient-header prompt syntax and ATEM tools for text-only Muse Spark."""
 
+import hashlib
 from pathlib import Path
 
 from tokenizers import Tokenizer
@@ -40,6 +41,9 @@ def prepare_frontend(snapshot, *, eos_token_ids):
 
 def runtime_assets(snapshot):
     snapshot = Path(snapshot)
-    return {"tokenizer": {"path": str(snapshot / "tokenizer.json")},
+    tokenizer = snapshot / "tokenizer.json"
+    with tokenizer.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return {"tokenizer": {"path": str(tokenizer), "sha256": digest},
             "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
                 Path(__file__).with_name("assets") / "chat_template.jinja")}

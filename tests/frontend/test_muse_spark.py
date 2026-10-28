@@ -139,8 +139,9 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
     for name in ['tokenizer.json', 'tokenizer_config.json']:
         (runtime / name).symlink_to(SNAPSHOT / name)
     (runtime / 'chat_template.jinja').symlink_to(assets['chat_template']['path'])
-    fingerprints = {name: hashlib.sha256((runtime / name).read_bytes()).hexdigest()
-                    for name in ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']}
+    fingerprints = {'tokenizer.json': assets['tokenizer']['sha256'],
+                    'chat_template.jinja': assets['chat_template']['sha256'],
+                    'tokenizer_config.json': hashlib.sha256((runtime / 'tokenizer_config.json').read_bytes()).hexdigest()}
     fixture = tmp_path / 'chat.json'
     fixture.write_text(json.dumps(dict(assets=fingerprints, cases=cases, encode_cases=encode_cases, decode_cases=decode_cases,
         template_defaults=dict(reasoning_effort='high', current_date='2026-10-27', add_generation_prompt=True),
