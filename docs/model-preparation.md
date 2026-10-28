@@ -56,8 +56,7 @@ Unsigned rank staging is private to preparation and cannot load in Helios.
 Flare loads the package files without Python. Helios is a Rust library;
 `flare_heliopause` is a CPython extension imported by Ignition.
 
-Muse Spark uses BF16 KV storage. Other recipes default to FP8 E4M3 KV storage,
-including learned draft-model caches. Qwen Flash retains BF16 selector keys;
+Recipes default to FP8 E4M3 KV storage, including learned draft-model caches. Qwen Flash retains BF16 selector keys;
 GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
@@ -887,7 +886,7 @@ flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safete
 The `muse-spark-open-nvfp4` alias selects
 [`meta-models/Muse-Spark-Open-816B-A42B-NVFP4`](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4)
 at revision `4239e4db19376904f2e82c167e78f70abb5455fe`. Text preparation uses
-eight SM120 GPUs, checkpoint NVFP4 experts, BF16 KV storage, a 262144-token
+eight SM120 GPUs, checkpoint NVFP4 experts, FP8 E4M3 KV storage, a 262144-token
 context, four concurrent requests, and 4096-token prefill chunks. Image,
 audio, video, and speculative execution are not prepared.
 
@@ -899,8 +898,8 @@ recommended inference default. Reasoning effort accepts `low`, `medium`,
 override it.
 
 Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
-routed-expert outputs, independent FC1 half gains, and BF16 head-dimension-64
-paged decode. The FlashInfer Git dependency pinned in `pyproject.toml` lacks
+routed-expert outputs, independent FC1 half gains, and head-dimension-64
+paged decode with BF16 queries and FP8 E4M3 caches. The FlashInfer Git dependency pinned in `pyproject.toml` lacks
 these operators. Complete the standard environment setup and install the local
 checkout's build and runtime requirements into `.venv` first. Build requirements
 include `setuptools>=77`, `packaging>=24`, and `apache-tvm-ffi>=0.1.11,<0.2`;

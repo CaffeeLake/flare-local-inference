@@ -1,4 +1,4 @@
-"""Normalized gated attention with paged BF16 and circular sliding histories."""
+"""Normalized gated attention with paged FP8 and circular sliding histories."""
 
 from dataclasses import dataclass
 
@@ -9,7 +9,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.window_attention import stage_windows, commit_window
 
-from .pool import PAGE_TOKENS
+from .pool import KV_DTYPE, PAGE_TOKENS
 
 
 @dataclass(frozen=True)
@@ -43,8 +43,8 @@ class AttentionScratch:
             zeros(tokens, kv_heads, geometry.value_dim), zeros(tokens, heads, geometry.value_dim),
             zeros(tokens, heads, geometry.value_dim),
             zeros(tokens, config.text["hidden_size"]), zeros(tokens, config.text["hidden_size"]),
-            zeros(pages, PAGE_TOKENS, kv_heads, geometry.key_dim, dtype=torch.bfloat16),
-            zeros(pages, PAGE_TOKENS, kv_heads, geometry.value_dim, dtype=torch.bfloat16))
+            zeros(pages, PAGE_TOKENS, kv_heads, geometry.key_dim, dtype=KV_DTYPE),
+            zeros(pages, PAGE_TOKENS, kv_heads, geometry.value_dim, dtype=KV_DTYPE))
 
     def rows(self, tokens):
         return type(self)(*(getattr(self, name) if name.startswith("window_") else getattr(self, name)[:tokens]

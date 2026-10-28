@@ -14,7 +14,7 @@ from ignition.recipes.muse_spark.pool import ContinuationPool
 from .test_muse_spark_attention import Geometry
 
 
-def test_text_contract_binds_complete_state_and_physical_bf16_page_bytes():
+def test_text_contract_binds_complete_state_and_physical_fp8_page_bytes():
     config = SimpleNamespace(layers=2, attention=lambda i: Geometry(2048 if i == 0 else -1),
                              text={"hidden_size": 128})
     pool = ContinuationPool.allocate(config, TensorParallelShard(0, 1), 3, 2, 'cpu')
@@ -30,7 +30,7 @@ def test_text_contract_binds_complete_state_and_physical_bf16_page_bytes():
     assert encoded.frontend.reasoning.kind == p.RECIPIENT_HEADERS
     histories = [r for r in encoded.cache.regions if r.kind == p.PAGED_KEY_VALUE]
     assert {r.storage.buffer for r in histories} == {'cache.layer1.key', 'cache.layer1.value'}
-    assert all(r.storage.stride == 128 * 2 * 64 * 2 for r in histories)
+    assert all(r.storage.stride == 128 * 2 * 64 for r in histories)
     for graph in encoded.graphs:
         assert not graph.HasField('draft_cursor')
         assert any(s.view.buffer == 'state_pool' and s.view.nbytes == pool.layout.row_bytes

@@ -1,4 +1,4 @@
-"""Muse Spark Open text preparation with standard decoding and BF16 attention caches."""
+"""Muse Spark Open text preparation with standard decoding and FP8 attention caches."""
 
 from types import MappingProxyType
 
@@ -39,4 +39,4 @@ RECIPE = Recipe(name="muse_spark", served_model_name="Muse-Spark-Open-816B-A42B"
         revision="4239e4db19376904f2e82c167e78f70abb5455fe", architecture="MuseSparkForConditionalGeneration",
         stored_bytes=533_010_718_720, device_bytes=532_632_518_656, expansion_bytes=1 << 30),),
     context=262144, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=0, prefill_chunk=4096,
-    verification_rows=0, ranks=MappingProxyType({8: RankCosts(49_807_360, 1_048_576, 8 << 30)}))
+    verification_rows=0, ranks=MappingProxyType({8: RankCosts(24_903_680, 524_288, 8 << 30)}))

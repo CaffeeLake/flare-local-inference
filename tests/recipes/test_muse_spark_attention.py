@@ -1,4 +1,4 @@
-"""Muse Spark paged attention preserves canonical normalization and BF16 histories."""
+"""Muse Spark paged attention preserves canonical normalization and FP8 histories."""
 
 import os
 from types import SimpleNamespace
@@ -27,12 +27,12 @@ def configuration(window, hidden=128):
         text=dict(hidden_size=hidden, rms_norm_eps=1e-5, qk_scale_factor=5.4730064863875))
 
 
-def test_bf16_page_storage_and_complete_continuation():
+def test_fp8_page_storage_and_complete_continuation():
     config, shard = configuration(-1), TensorParallelShard(0, 1)
     pool = ContinuationPool.allocate(config, shard, 3, 4, 'cpu')
-    assert page_bytes(config, shard) == 2 * PAGE_TOKENS * 2 * 64 * 2
+    assert page_bytes(config, shard) == 2 * PAGE_TOKENS * 2 * 64
     assert pool.cache(0, 'key').shape == (4, 128, 2, 64)
-    assert pool.layout.region('layer0.key').nbytes == PAGE_TOKENS * 2 * 64 * 2
+    assert pool.layout.region('layer0.key').nbytes == PAGE_TOKENS * 2 * 64
     assert pool.layout.region('last_hidden').shape == (128,)
     assert pool.layout.region('consumed_tokens').dtype == torch.int64
 
@@ -91,6 +91,7 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
         session.freeze()
         pool.clear_for_preparation()
         keys, values = [], []
+        stored = dict(key=[], value=[])
         norm = MuseSparkRMSNorm(eps=1e-5, with_scale=False)
         start = 0
         chunks = ((63, 1, 1, 62, 1, 1, *([64] * 29), 62, 1, 1, 0, 3) if capacity == 64 else
@@ -110,8 +111,8 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
                 cos, sin = torch.cat((freq, freq), -1).cos().bfloat16(), torch.cat((freq, freq), -1).sin().bfloat16()
                 q_ref, k_ref = apply_rotary_pos_emb(q.transpose(0, 1)[None], k.transpose(0, 1)[None], cos[None], sin[None])
                 q, k = q_ref[0].transpose(0, 1), k_ref[0].transpose(0, 1)
-            keys.append(k[:count].clone())
-            values.append(v[:count].clone())
+            keys.append(k[:count].clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16())
+            values.append(v[:count].clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16())
             full_k, full_v = torch.cat(keys), torch.cat(values)
             expected = None
             if count:
@@ -130,13 +131,19 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated(device) == allocated
+            for kind, produced in (('key', scratch.key), ('value', scratch.value)):
+                stored[kind].append(produced[:count].clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8).clone())
             if count:
                 torch.testing.assert_close(scratch.output[:count], expected, atol=.02, rtol=.04)
             if window > 0:
                 positions = torch.arange(max(0, start + count - window), start + count, device=device)
-                torch.testing.assert_close(pool.cache(0, 'key')[1, positions % window], full_k[-window:], rtol=0, atol=.03125)
+                for kind in stored:
+                    expected_history = torch.cat(stored[kind])[-window:]
+                    actual_history = pool.cache(0, kind)[1, positions % window].view(torch.uint8)
+                    assert torch.equal(actual_history, expected_history)
                 assert pool.cache(0, 'key')[0].count_nonzero() == pool.cache(0, 'key')[2].count_nonzero() == 0
             if count:
+                torch.testing.assert_close(scratch.key[:count], k[:count], rtol=0, atol=.03125)
                 slots = (torch.arange(start, start + count, device=device) % window if window > 0
                          else torch.arange(start, start + count, device=device))
                 actual_key = (pool.cache(0, 'key')[1, slots] if window > 0
@@ -144,8 +151,10 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
                 actual_value = (pool.cache(0, 'value')[1, slots] if window > 0
                                 else pool.cache(0, 'value').flatten(0, 1)[slots])
                 retained = min(count, window) if window > 0 else count
-                torch.testing.assert_close(actual_key[-retained:], scratch.key[count-retained:count], rtol=0, atol=0)
-                torch.testing.assert_close(actual_value[-retained:], scratch.value[count-retained:count], rtol=0, atol=0)
+                expected_key = scratch.key[count-retained:count].clamp(-448, 448).to(torch.float8_e4m3fn)
+                expected_value = scratch.value[count-retained:count].clamp(-448, 448).to(torch.float8_e4m3fn)
+                assert torch.equal(actual_key[-retained:].view(torch.uint8), expected_key.view(torch.uint8))
+                assert torch.equal(actual_value[-retained:].view(torch.uint8), expected_value.view(torch.uint8))
             start += count
         assert start > 2049
         graph.reset()
@@ -188,7 +197,8 @@ def test_decode_wrap_and_inactive_lanes(window):
             compiled()
         session.freeze()
         for kind in ('key', 'value'):
-            pool.cache(0, kind).normal_(std=.3)
+            cache = pool.cache(0, kind)
+            cache.copy_(torch.randn(cache.shape, device=device) * .3)
         norm = MuseSparkRMSNorm(eps=1e-5, with_scale=False)
         for counts in ([1, 0, 1, 1], [0, 1, 0, 1], [1, 1, 1, 1]):
             set_counts(counts)
@@ -215,7 +225,8 @@ def test_decode_wrap_and_inactive_lanes(window):
                     cache = pool.cache(0, kind)
                     history = cache[row + 1] if window > 0 else cache[row * 20:(row + 1) * 20].flatten(0, 1)
                     slot = int(starts[row]) % window if window > 0 else int(starts[row])
-                    torch.testing.assert_close(history[slot], produced[packed], rtol=0, atol=0)
+                    quantized = produced[packed].clamp(-448, 448).to(torch.float8_e4m3fn)
+                    assert torch.equal(history[slot].view(torch.uint8), quantized.view(torch.uint8))
                     caches.append(history[:length].repeat_interleave(8, 1).float())
                 ks, vs = caches
                 scores = torch.einsum('hd,thd->ht', scratch.query[packed].float(), ks) / 8

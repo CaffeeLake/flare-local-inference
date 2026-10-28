@@ -1,4 +1,4 @@
-"""BF16 partial pages and circular histories remain exact through snapshot forks."""
+"""FP8 partial pages and circular histories remain exact through snapshot forks."""
 
 import os
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @pytest.mark.parametrize("endpoint", [127, 128, 129, 2047, 2048, 2049])
 @torch.no_grad()
-def test_captured_snapshot_forks_preserve_bf16_histories(endpoint):
+def test_captured_snapshot_forks_preserve_fp8_histories(endpoint):
     config = SimpleNamespace(layers=2, attention=lambda i: Geometry(2048 if i == 0 else -1),
                              text={"hidden_size": 128})
     pool = ContinuationPool.allocate(config, TensorParallelShard(0, 1), 8, 5, "cuda:0")

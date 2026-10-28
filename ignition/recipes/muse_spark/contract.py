@@ -1,4 +1,4 @@
-"""Text graph bindings, complete continuation rows, and paged BF16 histories."""
+"""Text graph bindings, complete continuation rows, and paged attention histories."""
 
 from ignition.preparation import contract as c
 from ignition.preparation import runtime_package_pb2 as p

@@ -1,4 +1,4 @@
-"""Prepare tensor-parallel text graphs with complete BF16 cache continuations."""
+"""Prepare tensor-parallel text graphs with complete FP8 cache continuations."""
 
 import contextlib
 import hashlib
@@ -127,7 +127,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         preexpert_collective = create_all_gather_runtime(group, device, max_rows=min(tokens, 128),
             columns=expert_width, ipc=package_storage.peer_storage)
         identity = hashlib.sha256(json.dumps(dict(config=weights.config.text, headers=headers,
-            world_size=shard.world_size, contract="muse-spark.text.v1"), sort_keys=True).encode()).hexdigest()
+            kv_dtype="float8_e4m3fn", world_size=shard.world_size, contract="muse-spark.text.v1"), sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort,
             tuning_replica=config.tuning_replica, native_dense_activations=config.native_dense_activations,
@@ -226,7 +226,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         preparation_state_rows=int(pool.memory_capacity[0].item()),
         preparation_state_bytes=int(pool.memory_capacity[0].item()) * layout.row_bytes,
         pages=pages, page_bytes=page_bytes(weights.config, shard), page_tokens=PAGE_TOKENS,
-        kv_bytes=pages * page_bytes(weights.config, shard), kv_dtype="bfloat16", completion_output_bytes=completion.nbytes,
+        kv_bytes=pages * page_bytes(weights.config, shard), kv_dtype="float8_e4m3fn", completion_output_bytes=completion.nbytes,
         operator_scratch_bytes=arena.nbytes, graphs=len(graphs), graph_buffer_bytes=graph_buffers.nbytes,
         private_buffer_bytes=private_buffers.nbytes, prefill_capacities=prefills, free_device_bytes=free,
         total_device_bytes=total, headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
