@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+import json
 import math
 import random
 import statistics
@@ -145,9 +146,26 @@ def _prefill(model, runner, layout, case, tokenizer, seed, generation):
         if step is None or step.kind not in ("init", "prefill", "resume"):
             raise RuntimeError(f"benchmark prefill could not reach context {case.context_tokens}")
         elapsed = runner.run(_message(scheduler, step))
-        _complete(model, runner, scheduler, step, elapsed)
-        if any(lane.request.done for lane in step.lanes):
-            raise RuntimeError("benchmark prompt completed before its first speculative round")
+        records = _complete(model, runner, scheduler, step, elapsed)
+        completed = [lane.request for lane in step.lanes if lane.request.done]
+        if completed:
+            state = model.benchmark_requests
+            details = dict(case=asdict(case), seed=seed, graph=step.graph, kind=step.kind,
+                           sequence=step.sequence, eos_token_ids=list(layout.eos), requests=[])
+            for request in completed:
+                slot = request.slot
+                details["requests"].append(dict(
+                    id=request.ident, slot=slot, generation=request.generation,
+                    consumed=request.consumed, generated=request.generated,
+                    max_new_tokens=request.max_new_tokens, finish_reason=request.finish_reason,
+                    completion=records[slot].tolist(),
+                    device_status=int(state.status[slot].item()),
+                    device_max_new_tokens=int(state.max_new_tokens[slot].item()),
+                    device_pending_token=int(state.pending_token[slot].item()),
+                    device_eos_count=int(state.eos_count[slot].item()),
+                    device_eos_token_ids=state.eos_token_ids[slot].cpu().tolist()))
+            raise RuntimeError("benchmark prompt completed before its first speculative round: "
+                               + json.dumps(details, sort_keys=True))
     if len(scheduler.active) != case.batch or any(request.consumed != case.context_tokens
                                                  for request in scheduler.active):
         raise RuntimeError("real prefill did not produce the requested fixed context")
