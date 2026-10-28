@@ -229,6 +229,13 @@ that capacity from the concurrency requested through configuration or flags.
 Each case starts from a real tokenized and prefilled context. Context length
 counts consumed positions before the pending token. Complete cache and
 speculative state restoration occurs outside CUDA timing before every round.
+A same-device snapshot retains one additional complete mutable-state copy
+(about 3.8 GiB for the default matrix); weights and disposable scratch are not
+duplicated. Snapshot allocation and copies occur outside the measured interval.
+Benchmark requests use the supported `ignore_eos` stop policy to preserve fixed
+round widths: sampled EOS tokens remain real pending and accepted tokens, while
+EOS does not end the request. Sampling, proposal probabilities, and acceptance
+are unchanged. JSON records `ignore_eos: true`.
 Timing includes draft proposals, target verification, vocabulary projection,
 sampling, and state commit. Preparation, context prefill, state restoration,
 native scheduling, and HTTP are outside the measured interval.
@@ -236,7 +243,11 @@ native scheduling, and HTTP are outside the measured interval.
 The table reports each case's median and interquartile range in milliseconds.
 The aggregate is the equal-weight arithmetic mean of case medians, with lower
 values better. Equal weights describe matrix coverage rather than production
-traffic. JSON retains every sample by seed. Scores from different GPU classes
+traffic. JSON retains every sample by seed. Progress prints after each seed and
+updates `--output` with device identity, preparation configuration, and available
+raw samples. Successful results have `status: complete`. A failed run preserves
+partial samples with `status: incomplete`, its failure, and per-case completion
+flags; it has no aggregate score. Scores from different GPU classes
 remain separate. These measurements support graph optimization; serving
 throughput and comparisons against other runtimes still require exported
 packages running through `flare run`.

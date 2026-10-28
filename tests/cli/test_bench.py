@@ -118,3 +118,17 @@ def test_json_write_failure_reports_destination(tmp_path):
     result = {"device": {"name": "NVIDIA GB10", "capability": [12, 1]}, "aggregate_ms": 1.0, "cases": []}
     with pytest.raises(UsageError, match="cannot write benchmark JSON"):
         write_result(result, tmp_path / "missing" / "rounds.json")
+
+
+def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys):
+    from ignition.cli.bench import save_result
+
+    result = {"status": "incomplete", "ignore_eos": True, "failure": "invalid completion",
+              "device": {"name": "NVIDIA GB10", "capability": [12, 1]},
+              "configuration": {"compiled_forwards": True},
+              "cases": [{"complete": False, "samples": [{"seed": 0, "times_ms": [1.2]}]}]}
+    output = tmp_path / "rounds.json"
+    save_result(result, output)
+    assert json.loads(output.read_text()) == result
+    assert "aggregate_ms" not in json.loads(output.read_text())
+    assert capsys.readouterr().out == ""

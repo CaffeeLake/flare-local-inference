@@ -74,7 +74,7 @@ def prompt_tokens(tokenizer, length, *, seed, lane):
 
 
 class StateSnapshot:
-    """Pinned host copies of explicitly declared persistent device tensors."""
+    """Same-device copies of explicitly declared persistent tensors, outside replay timing."""
 
     def __init__(self, tensors, stream):
         import torch
@@ -89,7 +89,7 @@ class StateSnapshot:
                 if key in seen:
                     continue
                 seen.add(key)
-                saved = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                saved = torch.empty_like(tensor)
                 saved.copy_(tensor, non_blocking=True)
                 self.entries[name] = (tensor, saved)
         stream.synchronize()
@@ -131,7 +131,7 @@ def _prefill(model, runner, layout, case, tokenizer, seed, generation):
         sampling = SamplingParameters(seed=(seed + lane) % (1 << 64),
                                       **{key: defaults[key] for key in fields if key in defaults})
         request = Request(lane + 1, prompt_tokens(tokenizer, case.context_tokens, seed=seed, lane=lane),
-                          2 * case.width, sampling)
+                          2 * case.width, sampling, ignore_eos=True)
         scheduler.submit(request)
     while (scheduler.queue or any(request.phase != "decode" for request in scheduler.active)):
         prefilling = [request for request in scheduler.active if request.phase == "prefill"]
@@ -239,7 +239,29 @@ def _check_metadata(model, step, case):
             raise RuntimeError("speculative sampling streams did not consume their declared draw reservations")
 
 
-def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2)):
+def measurement_result(cases, measurements, *, warmup, repetitions, seeds, status, failure=None):
+    results = []
+    for case, samples in zip(cases, measurements):
+        if not samples:
+            continue
+        complete = len(samples) == len(seeds) and all(len(sample["times_ms"]) == repetitions for sample in samples)
+        summary = (summarize_case(case, samples) if any(sample["times_ms"] for sample in samples)
+                   else dict(asdict(case), samples=samples))
+        results.append(dict(summary, complete=complete))
+    result = dict(metric="cuda_graph_round_latency_ms", status=status, ignore_eos=True,
+                  warmup=warmup, repetitions=repetitions, seeds=list(seeds), cases=results)
+    if status == "complete":
+        if len(results) != len(cases) or not all(case["complete"] for case in results):
+            raise ValueError("complete benchmark results require every case, seed and repetition")
+        result["aggregate_ms"] = statistics.mean(case["median_ms"] for case in results)
+    if failure is not None:
+        if results:
+            results[-1]["complete"] = False
+        result["failure"] = failure
+    return result
+
+
+def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seeds=(0, 1, 2), progress=None):
     """Measure full captured rounds after real prefill, restoring state before every replay."""
     import torch
 
@@ -261,23 +283,30 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
         if sum(shape[:4] == _round_shape for shape in layout.packed_shapes) != 1:
             raise ValueError(f"benchmark case has no unique prepared round: {case}")
     runner = StepRunner(model, eager=False)
-    results = []
+    measurements = [[] for _ in cases]
+
+    def result(status, failure=None):
+        return measurement_result(cases, measurements, warmup=warmup, repetitions=repetitions,
+                                  seeds=seeds, status=status, failure=failure)
+
     generation = int(model.benchmark_requests.generation.max().item())
     try:
-        for case in cases:
-            samples = []
+        for case, samples in zip(cases, measurements):
             for seed in seeds:
+                times = []
+                samples.append(dict(seed=seed, times_ms=times))
                 generation += 1
                 baseline = _prefill(model, runner, layout, case, tokenizer, seed, generation)
                 snapshot = StateSnapshot(model.benchmark_state, runner.stream)
                 inactive = _inactive_state(model, case.batch)
-                times = []
                 for iteration in range(-1, warmup + repetitions):
                     scheduler = deepcopy(baseline, {id(layout): layout})
                     snapshot.restore(runner.stream)
                     step = _round(scheduler, case)
                     allocated = torch.cuda.memory_allocated(runner.device)
                     elapsed = runner.run(_message(scheduler, step))
+                    if iteration >= warmup:
+                        times.append(elapsed / 1e6)
                     if torch.cuda.memory_allocated(runner.device) != allocated:
                         raise RuntimeError("captured benchmark replay changed allocated CUDA memory")
                     records = _complete(model, runner, scheduler, step, elapsed)
@@ -288,15 +317,18 @@ def run_benchmark(model, tokenizer, *, scenarios, warmup=5, repetitions=20, seed
                         for name, expected in inactive.items():
                             if not torch.equal(actual[name], expected):
                                 raise RuntimeError(f"captured round modified inactive state: {name}")
-                    if iteration >= warmup:
-                        times.append(elapsed / 1e6)
-                samples.append(dict(seed=seed, times_ms=times))
+                if progress is not None:
+                    progress(result("running"))
                 snapshot.restore(runner.stream)
                 runner.stream.synchronize()
                 del snapshot
-            results.append(summarize_case(case, samples))
+    except BaseException as error:
+        if progress is not None:
+            try:
+                progress(result("incomplete", failure=f"{type(error).__name__}: {error}"))
+            except Exception as output_error:
+                error.add_note(f"could not save incomplete benchmark measurements: {output_error}")
+        raise
     finally:
         runner.close()
-    return dict(metric="cuda_graph_round_latency_ms", aggregate_ms=statistics.mean(
-        result["median_ms"] for result in results), warmup=warmup, repetitions=repetitions,
-        seeds=list(seeds), cases=results)
+    return result("complete")

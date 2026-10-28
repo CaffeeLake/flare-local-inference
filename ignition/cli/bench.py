@@ -132,13 +132,17 @@ def run(args):
             fetch(model, hub_cache, progress_bars=False)
             model.verify(hub_cache)
     environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
-    result = _measure(model, plan, configuration, settings, progress, compile_forwards=not args.no_compile)
+    result = _measure(model, plan, configuration, settings, progress, compile_forwards=not args.no_compile, output=args.output)
     write_result(result, args.output)
     return 0
 
 
 def write_result(result, output):
     print(table(result), flush=True)
+    save_result(result, output)
+
+
+def save_result(result, output):
     if output is not None:
         try:
             output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
@@ -158,7 +162,7 @@ def _progress(verbose):
     return Progress()
 
 
-def _measure(model, plan, configuration, settings, progress, *, compile_forwards):
+def _measure(model, plan, configuration, settings, progress, *, compile_forwards, output=None):
     import torch
     from tokenizers import Tokenizer
     from ignition.bench.runner import BenchmarkCase, run_benchmark
@@ -166,6 +170,30 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
     from ignition.preparation.tuning_replicas import prepare_recipe
 
     snapshot = model.snapshot(configuration.directory("hub_cache"))
+    details = {}
+    gpu = plan.gpus[0]
+    details["device"] = {"name": gpu.name, "uuid": gpu.uuid, "capability": list(gpu.capability),
+                        "total_bytes": gpu.total_bytes}
+    preparation = plan.to_dict()
+    details["configuration"] = {"model": model.model_id, "checkpoint_directory": str(snapshot),
+        "repository": model.checkpoint.repository, "revision": model.checkpoint.revision,
+        "compiled_forwards": compile_forwards, "torch_version": torch.__version__,
+        "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
+        "preparation": {key: preparation[key] for key in (
+            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
+            "native_dense_activations", "autotune_effort", "collective_tuning", "compile_workers",
+            "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
+            "online_mxfp8", "language_model_only")}}
+
+    def record(result):
+        result.update(details)
+        save_result(result, output)
+        if result["status"] == "running":
+            case = result["cases"][-1]
+            print(f"Measured B={case['batch']} W={case['width']} P={case['packed_tokens']} "
+                  f"context={case['context_tokens']} seed={case['samples'][-1]['seed']} "
+                  f"({len(case['samples'])}/{len(settings.seeds)} seeds)", file=sys.stderr, flush=True)
+
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
     try:
@@ -177,7 +205,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
             scenarios = tuple(BenchmarkCase(batch=batch, width=settings.width, packed_tokens=batch * settings.width,
                 context_tokens=context) for batch in settings.batches for context in settings.contexts)
             result = run_benchmark(prepared, tokenizer, scenarios=scenarios, warmup=settings.warmup,
-                repetitions=settings.repetitions, seeds=settings.seeds)
+                repetitions=settings.repetitions, seeds=settings.seeds, progress=record)
     except FlareError:
         raise
     except Exception as error:
@@ -186,17 +214,5 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         torch.cuda.synchronize()
         for region in storage.host_regions:
             region.close()
-    gpu = plan.gpus[0]
-    result["device"] = {"name": gpu.name, "uuid": gpu.uuid, "capability": list(gpu.capability),
-                        "total_bytes": gpu.total_bytes}
-    preparation = plan.to_dict()
-    result["configuration"] = {"model": model.model_id, "checkpoint_directory": str(snapshot),
-        "repository": model.checkpoint.repository, "revision": model.checkpoint.revision,
-        "compiled_forwards": compile_forwards, "torch_version": torch.__version__,
-        "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
-        "preparation": {key: preparation[key] for key in (
-            "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
-            "native_dense_activations", "autotune_effort", "collective_tuning", "compile_workers",
-            "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
-            "online_mxfp8", "language_model_only")}}
+    result.update(details)
     return result
