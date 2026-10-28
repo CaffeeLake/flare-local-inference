@@ -464,7 +464,7 @@ def debug_serve(args) -> int:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):
             raise UsageError("--history-drafts requires enabled learned speculation")
         options["history_drafts"] = args.history_drafts
-    preparation_options = {} if args.direct else {"retain_graphs": True}
+    preparation_options = {}
     storage = None
     if rendezvous is None:
         import torch

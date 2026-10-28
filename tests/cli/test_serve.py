@@ -89,10 +89,10 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setattr(module_images, "ModuleImages", Scope)
     monkeypatch.setattr(package_storage, "PackageStorage", Scope)
 
-    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs, package_storage):
-        assert retain_graphs and isinstance(package_storage, Scope)
+    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage):
+        assert isinstance(package_storage, Scope)
         calls.update(snapshot=snapshot, plan=plan, compile_forwards=compile_forwards,
-                     kernel_cache=kernel_cache, storage=package_storage)
+                     kernel_cache=kernel_cache, storage=package_storage, retain_graphs=retain_graphs)
         behavior = dict(calls["behavior"])
         if "raises" in behavior:
             raise behavior["raises"]
@@ -140,6 +140,7 @@ def export(*arguments):
 def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert export("qwen3.8-flash", "--no-compile") == 0
     assert host["compile_forwards"] is False and host["exports"] == 1
+    assert host["retain_graphs"]
     assert [gpu.index for gpu in host["gpus"]] == [0]
     assert host["plan"].speculation == host["plan"].recipe.speculation
     assert not host["plan"].mixed_prefill and host["plan"].mixed_shapes == ()
@@ -235,6 +236,7 @@ def test_diagnostic_serving_retains_storage_until_native_shutdown(host, monkeypa
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0",
                  "--port", str(free_port())]) == 0
     assert host["exports"] == 0 and closed == [True]
+    assert not host["retain_graphs"]
 
 
 def test_diagnostic_startup_failure_retains_undrained_host_storage(host, monkeypatch):
