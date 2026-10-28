@@ -257,7 +257,7 @@ def test_prompt_logprob_scores_align_with_actual_checkpoint_tokens(service, prot
     if protocol == 'completions':
         tokens = service.expected_prompt(service.body(prompt))
         body = dict(model=service.model, prompt=tokens, max_tokens=0,
-                    prompt_logprobs=2, return_token_ids=True)
+                    prompt_logprobs=2)
         result = service.request('/v1/completions', body)
         scores = result['choices'][0]['prompt_logprobs']
         assert result['usage']['completion_tokens'] == 0
