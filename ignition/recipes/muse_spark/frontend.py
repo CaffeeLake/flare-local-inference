@@ -32,6 +32,7 @@ def prepare_frontend(snapshot, *, eos_token_ids):
                              "<|eot|>": 200008}.items():
         if tokenizer.token_to_id(marker) != expected:
             raise ValueError(f"Muse Spark requires {marker} token ID {expected}")
+    eos_token_ids = [eos_token_ids] if isinstance(eos_token_ids, int) else list(eos_token_ids)
     if 200007 in eos_token_ids:
         raise ValueError("Muse Spark <|eom|> is an internal message boundary")
     return _prepare_frontend(snapshot, eos_token_ids=list(dict.fromkeys([*eos_token_ids, 200001, 200008])))

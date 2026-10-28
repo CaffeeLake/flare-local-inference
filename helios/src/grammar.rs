@@ -308,9 +308,20 @@ impl GrammarCompiler {
             marker(" to=self"), marker(" to=commentary"), marker(" to=user")));
         let mut ending = "answer".to_owned();
         if !envelope.tools.is_empty() {
-            let names = envelope.tools.iter().map(|name| marker(&format!(" to={name}"))).collect::<Vec<_>>().join(" | ");
-            rules.push_str(&format!("tool_header: {names}\ntool: tool_header {message} {} tool_body\n", marker("<atem:function_calls>")));
-            rules.push_str(&self.region("tool_body", "</atem:function_calls>"));
+            rules.push_str("ws: /[ \\t\\r\\n]*/\n");
+            rules.push_str(&self.region("parameters", "</atem:invoke>"));
+            let open = marker("<atem:function_calls>");
+            let close = marker("</atem:function_calls>");
+            let mut names = Vec::new();
+            let mut invocations = Vec::new();
+            for (index, name) in envelope.tools.iter().enumerate() {
+                let attr = name.replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&#39;").replace('<', "&lt;").replace('>', "&gt;");
+                let invoke = marker(&format!("<atem:invoke name=\"{attr}\">"));
+                rules.push_str(&format!("invoke_{index}: {invoke} parameters\nnamed_tool_{index}: {} {message} {open} ws invoke_{index} (ws invoke_{index})* ws {close}\n", marker(&format!(" to={name}"))));
+                names.push(format!("named_tool_{index}"));
+                invocations.push(format!("invoke_{index}"));
+            }
+            rules.push_str(&format!("invocation: {}\ntool_body: {open} ws invocation (ws invocation)* ws {close}\ntool: {} | {} {message} tool_body\n", invocations.join(" | "), names.join(" | "), marker(" to=tool")));
             rules.push_str("tools: tool (resume (reasoning | commentary)* tool)* (resume (reasoning | commentary)* answer)?\n");
             ending = "(answer | tools)".into();
         }
@@ -321,7 +332,7 @@ impl GrammarCompiler {
             OutputStart::Content => rules.push_str("start: @answer\n"),
             OutputStart::ToolBody => {
                 if envelope.tools.is_empty() { return Err("tool continuation requires registered tools".into()); }
-                rules.push_str(&format!("start: {} tool_body (resume tail)?\n", marker("<atem:function_calls>")));
+                rules.push_str("start: tool_body (resume tail)?\n");
             }
         }
         grammar.grammars[0].name = Some("answer".into());
@@ -1709,6 +1720,9 @@ mod recipient_tests {
             (OutputStart::RecipientHeader,vec!["lookup".into()],tool.into(),true),
             (OutputStart::RecipientHeader,vec!["lookup".into()],format!("{reasoning}{tool}{resume}{commentary}{tool}"),true),
             (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup","to=other"),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into(),"other".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup", "to=tool"),true),
             (OutputStart::Reasoning,vec![],format!("Plan{resume} to=user<|message|>{answer}"),true),
             (OutputStart::Content,vec![],answer.into(),true),
         ] {

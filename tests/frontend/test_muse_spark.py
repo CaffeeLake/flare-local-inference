@@ -23,6 +23,8 @@ def test_native_muse_chat_matches_checkpoint(tmp_path):
         pytest.skip('requires pinned Muse Spark checkpoint frontend assets')
     assets = runtime_assets(SNAPSHOT)
     special = prepare_frontend(SNAPSHOT, eos_token_ids=[200001, 200008])['tokenizer']
+    configured_eos = json.loads((SNAPSHOT / 'config.json').read_text())['text_config']['eos_token_id']
+    assert prepare_frontend(SNAPSHOT, eos_token_ids=configured_eos) == prepare_frontend(SNAPSHOT, eos_token_ids=[200001, 200008])
     tokenizer = Tokenizer.from_file(str(SNAPSHOT / 'tokenizer.json'))
     hf_tokenizer = PreTrainedTokenizerFast.from_pretrained(SNAPSHOT)
     source = (SNAPSHOT / 'chat_template.jinja').read_text()

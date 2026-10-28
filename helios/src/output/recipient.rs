@@ -25,6 +25,7 @@ pub struct RecipientOutput {
     state: State,
     tools: Vec<Value>,
     calls: usize,
+    recipient: Option<String>,
     received: usize,
     spans: Vec<Option<std::ops::Range<usize>>>,
     control_tokens: Vec<(u32, String)>,
@@ -58,6 +59,7 @@ impl RecipientOutput {
             },
             tools: config.tools,
             calls: 0,
+            recipient: None,
             received: 0,
             spans: vec![],
             control_tokens,
@@ -123,6 +125,21 @@ impl RecipientOutput {
                         .strip_prefix("assistant")
                         .ok_or("recipient frame requires assistant role")?;
                     let recipient = header.trim().strip_prefix("to=").unwrap_or("user").trim();
+                    self.recipient = None;
+                    if !matches!(recipient, "self" | "user" | "commentary") {
+                        if self.tools.is_empty()
+                            || (recipient != "tool"
+                                && !self
+                                    .tools
+                                    .iter()
+                                    .any(|tool| tool["function"]["name"] == recipient))
+                        {
+                            return Err("recipient names an unavailable tool".into());
+                        }
+                        if recipient != "tool" {
+                            self.recipient = Some(recipient.to_owned());
+                        }
+                    }
                     self.state = match recipient {
                         "self" => State::Reasoning,
                         "user" | "commentary" => State::Content,
@@ -139,7 +156,7 @@ impl RecipientOutput {
                     if matches!(self.state, State::Tool) {
                         let Some((at, marker)) = boundary else { break };
                         let body = unescape(&self.buffer[..at]);
-                        for (name, arguments) in parse_atem(&body, &self.tools)? {
+                        for (name, arguments) in self.parse_calls(&body)? {
                             let index = self.calls;
                             self.calls += 1;
                             events.extend([
@@ -205,6 +222,22 @@ impl RecipientOutput {
         }
         Ok(events)
     }
+    fn parse_calls(&self, body: &str) -> Result<Vec<(String, String)>> {
+        let calls = parse_atem(body, &self.tools)?;
+        if calls.iter().any(|(name, _)| {
+            self.recipient
+                .as_ref()
+                .is_some_and(|recipient| recipient != name)
+                || !self
+                    .tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == *name)
+        }) {
+            return Err("ATEM invocation does not match its registered tool recipient".into());
+        }
+        Ok(calls)
+    }
+
     pub fn finish(&mut self, cause: Termination) -> Result<Vec<Event>> {
         self.spans.clear();
         self.buffer
@@ -213,7 +246,7 @@ impl RecipientOutput {
         let mut events = self.drain(true)?;
         if matches!(self.state, State::Tool) && cause == Termination::Eos {
             // EOS is suppressed before presentation, so it closes the final tool frame.
-            for (name, arguments) in parse_atem(&unescape(&self.buffer), &self.tools)? {
+            for (name, arguments) in self.parse_calls(&unescape(&self.buffer))? {
                 let index = self.calls;
                 self.calls += 1;
                 events.extend([
@@ -496,5 +529,25 @@ mod tests {
             serde_json::from_str::<Value>(&calls[0].1).unwrap(),
             json!({"p&":"  3\n"})
         );
+    }
+    #[test]
+    fn recipient_and_invocation_must_name_the_selected_tool() {
+        for (recipient, invoke) in [("other", "lookup"), ("lookup", "other")] {
+            let text = format!(
+                " to={recipient}<|message|><atem:function_calls><atem:invoke name=\"{invoke}\"></atem:invoke></atem:function_calls>"
+            );
+            let mut parser = parser();
+            let (header, body) = text.split_once(MESSAGE).unwrap();
+            parser.push(Input::Text(header)).unwrap();
+            parser.push(Input::Token(2)).unwrap();
+            let header_result = parser.push(Input::Text(MESSAGE));
+            if recipient == "other" {
+                assert!(header_result.is_err());
+            } else {
+                header_result.unwrap();
+                parser.push(Input::Text(body)).unwrap();
+                assert!(parser.finish(Termination::Eos).is_err());
+            }
+        }
     }
 }
