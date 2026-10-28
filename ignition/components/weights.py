@@ -924,7 +924,8 @@ class DirectWeightLoader:
                     index_path=self.manifest.index_path,
                     skip=lambda name: name not in selected,
                     needs_values=lambda entry: entry.name.endswith((
-                        ".weight_scale_2", ".input_scale", ".weight_global_scale", ".input_global_scale")),
+                        ".weight_scale_2", ".input_scale", ".weight_global_scale", ".input_global_scale",
+                        "_weight_scale_2", "_input_scale")),
                 ))
             if self._sources.keys() != selected:
                 raise ValueError("direct loader tensor coverage differs from the inspected checkpoint")
@@ -1367,9 +1368,7 @@ class DirectWeightLoader:
                         raise ValueError(f"{prefix}.{projection}: per-token activation placeholder must be one")
             if format == "mxfp4":
                 continue
-            if scales[gate_name] != scales[up_name]:
-                raise ValueError(f"{prefix}: gate/up global scales differ")
-            globals13.append(scales[up_name])
+            globals13.append(tuple(scales[p] for p in projection_names[:2]))
             globals2.append(scales[down_name])
         if shared is not None:
             # Every rank copies its intermediate columns of each staged down projection.
@@ -1390,15 +1389,19 @@ class DirectWeightLoader:
                 raise ValueError("NVFP4 A4 experts require weight and activation scale vectors")
             vectors = scale_vectors
         elif format == "nvfp4":
-            vectors = (torch.tensor(globals13, dtype=torch.float32), torch.tensor(globals2, dtype=torch.float32))
+            first_scales = torch.tensor(globals13, dtype=torch.float32)
+            if bool((first_scales[:, 0] == first_scales[:, 1]).all()):
+                first_scales = first_scales[:, 0].contiguous()
+            vectors = (first_scales, torch.tensor(globals2, dtype=torch.float32))
         else:
             vectors = (torch.ones(count, dtype=torch.float32), torch.ones(count, dtype=torch.float32))
         device_scales = []
-        for values in vectors:
-            if (values.shape != (count,) or values.dtype != torch.float32
+        for index, values in enumerate(vectors):
+            shapes = ((count,), (count, 2)) if index == 0 else ((count,),)
+            if (values.shape not in shapes or values.dtype != torch.float32
                     or not bool((torch.isfinite(values) & (values > 0)).all())):
                 raise ValueError("expert scales must be positive finite FP32 vectors")
-            target = torch.empty(count, dtype=torch.float32, device=self.device)
+            target = torch.empty(values.shape, dtype=torch.float32, device=self.device)
             self._copy(target, values)
             device_scales.append(target)
         self._session.flush()
