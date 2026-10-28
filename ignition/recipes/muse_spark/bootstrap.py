@@ -67,8 +67,8 @@ class PreparationConfig:
         request_capacity(self.max_active)
         if not PAGE_TOKENS <= self.context <= 262144 or self.context % PAGE_TOKENS:
             raise ValueError("Muse Spark context must be 128-aligned in [128,262144]")
-        if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
-            raise ValueError("Muse Spark prefill chunk must be 128-aligned and fit the context")
+        if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
+            raise ValueError("Muse Spark prefill chunk must be 64-aligned and fit the context")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
@@ -97,7 +97,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         raise ValueError("snapshot budget must hold one complete Muse Spark continuation")
     slots, blocks = request_capacity(config.max_active), config.context // PAGE_TOKENS
     tokens = max(config.prefill_chunk_size, slots)
-    state_rows, pages = slots + snapshots, config.prefill_chunk_size // PAGE_TOKENS + 2 * slots
+    state_rows, pages = slots + snapshots, (config.prefill_chunk_size + PAGE_TOKENS - 1) // PAGE_TOKENS + 2 * slots
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.allocate(weights.config, shard, state_rows + 1, pages, device,

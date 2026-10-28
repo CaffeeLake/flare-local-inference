@@ -40,3 +40,9 @@ def test_text_contract_binds_complete_state_and_physical_bf16_page_bytes():
     assert all(b.source not in (p.PROMPT_TOKEN, p.PENDING_TOKEN) for b in decode.inputs)
     scored = next(g for g in encoded.graphs if g.kind == p.SCORED_PREFILL)
     assert any(b.source == p.PROMPT_TARGET_TOKEN for b in scored.inputs)
+
+
+def test_preparation_accepts_shared_64_token_chunk_geometry():
+    from ignition.recipes.muse_spark.bootstrap import PreparationConfig
+    assert PreparationConfig(prefill_chunk_size=64).prefill_chunk_size == 64
+    assert PreparationConfig(prefill_chunk_size=192).prefill_chunk_size == 192

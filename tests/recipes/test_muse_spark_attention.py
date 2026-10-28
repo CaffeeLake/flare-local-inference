@@ -39,7 +39,7 @@ def test_bf16_page_storage_and_complete_continuation():
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires assigned CUDA GPU')
 @pytest.mark.parametrize('window', [-1, 2048])
-@pytest.mark.parametrize('checkpoint,capacity', [(False, 129), (True, 129), (True, 4096)])
+@pytest.mark.parametrize('checkpoint,capacity', [(False, 64), (False, 129), (True, 129), (True, 4096)])
 def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint, capacity):
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.scratch import ScratchArena
@@ -93,7 +93,8 @@ def test_attention_matches_canonical_across_cache_boundaries(window, checkpoint,
         keys, values = [], []
         norm = MuseSparkRMSNorm(eps=1e-5, with_scale=False)
         start = 0
-        chunks = (127, 1, 1, *([129] * 14), 112, 1, 1, 0, 3) if capacity == 129 else (4096, 0, 3)
+        chunks = ((63, 1, 1, 62, 1, 1, *([64] * 29), 62, 1, 1, 0, 3) if capacity == 64 else
+                  (127, 1, 1, *([129] * 14), 112, 1, 1, 0, 3) if capacity == 129 else (4096, 0, 3))
         for count in chunks:
             source.normal_()
             metadata.set(torch.tensor([start], device=device), torch.tensor([count], dtype=torch.int32, device=device),
