@@ -196,21 +196,67 @@ def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
 
 
 def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output,
-                     measure=False, profile=False, fence=False):
+                     measure=False, profile=False, fence=False, layer_outputs=False):
     import torch
-    import torch.distributed as dist
-
-    from ignition.components.sampling import DeviceRequestState, RequestAdmission, RUNNING
     from ignition.recipes.muse_spark.bootstrap import prepare_rank
-    from ignition.recipes.muse_spark.pool import ContinuationPool
 
     with fence_operations(rank, fence):
         model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
                              progress=progress)
+    diagnostics = {}
+    try:
+        read_prepared(model, rank=rank, group=group, tokens=tokens, output=output,
+                      snapshot=snapshot, measure=measure, profile=profile,
+                      layer_outputs=layer_outputs, diagnostics=diagnostics)
+    finally:
+        torch.cuda.synchronize(model.device)
+        for graph, _, _ in diagnostics.values():
+            graph.reset()
+        diagnostics.clear()
+    return model
+
+
+def capture_layer_outputs(model, forward, rows, collective):
+    import torch
+    from ignition.preparation.startup_tuning import capture_consumers
+
+    layers = forward.decoder.layers
+    snapshots = torch.empty((len(layers), rows, forward.decoder.weights.config.hidden),
+                            device=model.device, dtype=torch.bfloat16)
+    stream = torch.cuda.Stream(device=model.device)
+    graph = torch.cuda.CUDAGraph()
+    handles = []
+    try:
+        for index, layer in enumerate(layers):
+            def copy_output(module, inputs, output, index=index):
+                snapshots[index].copy_(output[:rows])
+            handles.append(layer.register_forward_hook(copy_output))
+        stream.wait_stream(torch.cuda.current_stream(model.device))
+        with capture_consumers(model.session, graph), collective.capture(stream=stream), model.session.capture(), \
+                torch.cuda.graph(graph, stream=stream):
+            forward()
+        stream.synchronize()
+    except BaseException:
+        graph.reset()
+        raise
+    finally:
+        for handle in handles:
+            handle.remove()
+    return graph, snapshots, stream
+
+
+def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, profile,
+                  layer_outputs, diagnostics):
+    import torch
+    import torch.distributed as dist
+    from ignition.components.sampling import DeviceRequestState, RequestAdmission, RUNNING
+    from ignition.recipes.muse_spark.pool import ContinuationPool
+
     if any(token >= model.server_config['model_contract']['vocabulary'] for token in tokens):
         raise ValueError('recorded token lies outside the model vocabulary')
     forwards = next(value for value in model.resources if isinstance(value, dict) and 'decode1' in value)
     prefill, decode = (forwards[name] for name in ('prefill128', 'decode1'))
+    collective = decode.decoder.layers[0].self_attn.reduction.runtime
     pool = next(value for value in model.resources if isinstance(value, ContinuationPool))
     requests = next(value for value in model.resources if isinstance(value, DeviceRequestState))
     if prefill.decoder.pool is not pool or decode.decoder.pool is not pool:
@@ -255,12 +301,20 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
                    if signature.kind == 'prefill' and signature.token_capacity >= len(tokens))
     whole_name = f'prefill{capacity}'
     whole = forwards[whole_name]
+    def replay(name, forward, rows):
+        if not layer_outputs:
+            model.graphs[name].replay()
+            return
+        if name not in diagnostics:
+            diagnostics[name] = capture_layer_outputs(model, forward, rows, collective)
+        diagnostics[name][0].replay()
+
     buffers['query_lengths'][0] = len(tokens)
     buffers['token_ids'][:len(tokens)].copy_(torch.tensor(tokens, device=device))
     buffers['submission_sequence'].fill_(1)
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
-    model.graphs[whole_name].replay()
+    replay(whole_name, whole, min(4, len(tokens)))
     torch.cuda.synchronize(device)
     if int(requests.status[0]) != RUNNING or int(requests.consumed_tokens[0]) != len(tokens):
         raise RuntimeError('captured prefill rejected the complete recorded prompt')
@@ -268,8 +322,9 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
         raise AssertionError('captured prefill packed a different recorded prompt')
     prefill_logits = whole.decoder.scratch.logits[0].cpu().clone() if rank == 0 else None
     prefill_hidden = whole.decoder.scratch.hidden[0].cpu().clone() if rank == 0 else None
+    prefill_layers = diagnostics[whole_name][1].cpu().clone() if layer_outputs and rank == 0 else None
     reset()
-    logits, hidden = [], []
+    logits, hidden, layers = [], [], []
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
     for index, token in enumerate(tokens):
@@ -279,7 +334,7 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
         buffers['submission_sequence'].fill_(index + 1)
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
-        model.graphs[name].replay()
+        replay(name, forward, 1)
         torch.cuda.synchronize(device)
         if int(requests.status[0]) != RUNNING or int(requests.error_code[0]) != 0:
             raise RuntimeError(f'text graph rejected token endpoint {index + 1}: '
@@ -293,14 +348,19 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
         if rank == 0:
             logits.append(forward.decoder.scratch.logits[0].cpu().clone())
             hidden.append(forward.decoder.scratch.hidden[0].cpu().clone())
+            if layer_outputs:
+                layers.append(diagnostics[name][1][:, 0].cpu().clone())
             if (index + 1) % 16 == 0 or index + 1 == len(tokens):
                 print(f'captured teacher-forced endpoints: {index + 1}/{len(tokens)}', flush=True)
     dist.barrier(group=group)
     if rank == 0:
+        intermediate = dict(layer_outputs=torch.stack(layers), prefill_layer_outputs=prefill_layers,
+                            prefill_layer_token_indices=list(range(min(4, len(tokens))))) if layer_outputs else {}
         torch.save(dict(schema_version=1, prompt_tokens=list(tokens[:1]), teacher_tokens=list(tokens[1:]),
             logits=torch.stack(logits), hidden=torch.stack(hidden),
             prefill_logits=prefill_logits, prefill_hidden=prefill_hidden,
-            model_id='meta-models/Muse-Spark-Open-816B-A42B-NVFP4', revision=Path(snapshot).name), output)
+            model_id='meta-models/Muse-Spark-Open-816B-A42B-NVFP4', revision=Path(snapshot).name,
+            **intermediate), output)
     dist.barrier(group=group)
     if measure:
         measurements = measure_replay(model, pool, requests, tokens, group, rank, profile=False)
@@ -323,6 +383,8 @@ def main():
                         help='override preparation tuning effort')
     parser.add_argument('--no-compile', action='store_true',
                         help='capture prepared Python forwards without Torch compilation')
+    parser.add_argument('--layer-outputs', action='store_true',
+                        help='capture diagnostic layer-output copies; requires --no-compile')
     parser.add_argument('--measure-replay', action='store_true', help='measure valid B1/B4 captured decode after correctness readback')
     parser.add_argument('--profile-replay', action='store_true', help='control profiler capture around measured B1/B4 regions')
     parser.add_argument('--fence-operations', action='store_true',
@@ -330,6 +392,8 @@ def main():
     args = parser.parse_args()
     if args.profile_replay and not args.measure_replay:
         parser.error('--profile-replay requires --measure-replay')
+    if args.layer_outputs and not args.no_compile:
+        parser.error('--layer-outputs requires --no-compile')
     tokens = read_tokens(args.tokens)
     if args.output.exists():
         parser.error('output already exists')
@@ -357,7 +421,8 @@ def main():
     torch.cuda.set_device(0)
     storage = PackageStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),
-                     measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations)
+                     measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations,
+                     layer_outputs=args.layer_outputs)
     with storage:
         prepared = prepare_group(args.snapshot.resolve(), config, runner, package_storage=storage,
                                  progress=lambda text: print(text, flush=True))
