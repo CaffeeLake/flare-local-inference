@@ -875,6 +875,37 @@ weight budget for this encoding; loading reports its actual allocation.
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
 
+## Muse Spark Open
+
+The `muse-spark-open-nvfp4` alias selects
+[`meta-models/Muse-Spark-Open-816B-A42B-NVFP4`](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4)
+at revision `4239e4db19376904f2e82c167e78f70abb5455fe`. Text preparation uses
+eight SM120 GPUs, checkpoint NVFP4 experts, BF16 KV storage, a 262144-token
+context, four concurrent requests, and 4096-token prefill chunks. Image,
+audio, video, and speculative execution are not prepared.
+
+Sampling follows the checkpoint model card: temperature 1.0, top-p 1.0, and
+top-k disabled. The checkpoint generation configuration's top-k 64 is not the
+recommended inference default. Reasoning effort accepts `low`, `medium`,
+`high`, and `xhigh`, with `xhigh` as the template default. Set
+`reasoning_effort` or `chat_template_kwargs.reasoning_effort` explicitly to
+override it.
+
+The annotated template in `ignition/recipes/muse_spark/assets/chat_template.jinja`
+preserves the canonical checkpoint bytes when message marks are removed.
+Native recipient headers route `self` messages to reasoning, `commentary` and
+`user` messages to visible content, and tool recipients through ATEM function
+calls. `<|eom|>` separates messages within a generated turn; `<|eot|>` and
+`<|end_of_text|>` end generation. Tool arguments in request history are normalized
+to JSON objects before rendering. Caller content and header attributes retain
+the canonical control-sequence escaping.
+
+```sh
+.venv/bin/ignition export muse-spark-open-nvfp4 --gpus 0-7
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/muse-spark-tp8.safetensors
+flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
+```
+
 ## Storage and graph capacities
 
 Gemma 4 defaults to four concurrent requests; its speculative target-token capacity
