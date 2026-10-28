@@ -37,6 +37,6 @@ RECIPE = Recipe(name="muse_spark", served_model_name="Muse-Spark-Open-816B-A42B"
     prepare=prepare, usage=usage,
     checkpoints=(Checkpoint(alias="muse-spark-open-nvfp4", repository="meta-models/Muse-Spark-Open-816B-A42B-NVFP4",
         revision="4239e4db19376904f2e82c167e78f70abb5455fe", architecture="MuseSparkForConditionalGeneration",
-        stored_bytes=533_010_718_720, device_bytes=528_918_763_520, expansion_bytes=1 << 30),),
+        stored_bytes=533_010_718_720, device_bytes=532_632_518_656, expansion_bytes=1 << 30),),
     context=262144, page_tokens=128, concurrency=4, max_concurrency=4, max_draft_tokens=0, prefill_chunk=4096,
     verification_rows=0, ranks=MappingProxyType({8: RankCosts(49_807_360, 1_048_576, 8 << 30)}))
