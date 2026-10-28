@@ -328,6 +328,7 @@ impl GrammarCompiler {
         rules.push_str(&format!("tail: (reasoning | commentary)* {ending}\n"));
         match envelope.start {
             OutputStart::RecipientHeader => rules.push_str("start: tail\n"),
+            OutputStart::RecipientFrame => rules.push_str(&format!("start: {restart} tail\n")),
             OutputStart::Reasoning => rules.push_str(&format!("start: reasoning_body {restart} tail\n")),
             OutputStart::Content => rules.push_str("start: @answer\n"),
             OutputStart::ToolBody => {
@@ -1725,6 +1726,8 @@ mod recipient_tests {
             (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup", "to=tool"),true),
             (OutputStart::Reasoning,vec![],format!("Plan{resume} to=user<|message|>{answer}"),true),
             (OutputStart::Content,vec![],answer.into(),true),
+            (OutputStart::RecipientFrame,vec![],format!("<|start|>assistant{reasoning} to=user<|message|>{answer}"),true),
+            (OutputStart::RecipientFrame,vec![],format!(" to=user<|message|>{answer}"),false),
         ] {
             let mut request=compiler.compile_json_schema_in(&json!({"const":{"ok":true}}),Some(&envelope(start,tools))).unwrap();
             let tokens=tokenizer.encode(text.clone(),false).unwrap().get_ids().to_vec();

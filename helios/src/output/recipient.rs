@@ -50,9 +50,14 @@ impl RecipientOutput {
     pub fn new(config: OutputConfig, control_tokens: Vec<(u32, String)>) -> Self {
         Self {
             buffer: String::new(),
-            header: "assistant".into(),
+            header: if config.start == super::tagged::OutputStart::RecipientFrame {
+                String::new()
+            } else {
+                "assistant".into()
+            },
             state: match config.start {
-                super::tagged::OutputStart::RecipientHeader => State::Header,
+                super::tagged::OutputStart::RecipientHeader
+                | super::tagged::OutputStart::RecipientFrame => State::Header,
                 super::tagged::OutputStart::Reasoning => State::Reasoning,
                 super::tagged::OutputStart::Content => State::Content,
                 super::tagged::OutputStart::ToolBody => State::Tool,
@@ -358,10 +363,14 @@ mod tests {
     use serde_json::json;
 
     fn parser() -> RecipientOutput {
+        parser_with_start(OutputStart::RecipientHeader)
+    }
+
+    fn parser_with_start(start: OutputStart) -> RecipientOutput {
         RecipientOutput::new(
             OutputConfig {
                 structured: false,
-                start: OutputStart::RecipientHeader,
+                start,
                 tools: vec![
                     json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{
                 "text":{"type":"string"},"n":{"type":"integer"},"ok":{"type":"boolean"},"list":{"type":"array","items":{"type":"integer"}},"obj":{"type":"object","properties":{"n":{"type":"integer"}}},"maybe":{"type":["string","null"]}}}}}),
@@ -549,5 +558,21 @@ mod tests {
                 assert!(parser.finish(Termination::Eos).is_err());
             }
         }
+    }
+    #[test]
+    fn complete_assistant_frames_parse_after_a_closed_prompt() {
+        let mut parser = parser_with_start(OutputStart::RecipientFrame);
+        let events = feed(
+            &mut parser,
+            "<|start|>assistant to=self<|message|>Plan<|eom|><|start|>assistant to=user<|message|>Done",
+            0,
+        );
+        assert_eq!(
+            events,
+            vec![
+                Event::Reasoning("Plan".into()),
+                Event::Content("Done".into())
+            ]
+        );
     }
 }

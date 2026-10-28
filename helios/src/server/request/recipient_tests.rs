@@ -149,6 +149,16 @@ fn recipient_request_preparation_preserves_protocols_tools_and_continuation() {
         .unwrap();
         assert_eq!(request.output.unwrap().content.start, start);
     }
+    let closed = prepare(
+        Protocol::Chat,
+        json!({"messages":[{"role":"user","content":"Hello"}],
+        "chat_template_kwargs":{"add_generation_prompt":false}}),
+    )
+    .unwrap();
+    assert_eq!(
+        closed.output.unwrap().content.start,
+        OutputStart::RecipientFrame
+    );
     let image = prepare(
         Protocol::Chat,
         json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}),

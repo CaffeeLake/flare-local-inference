@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputStart {
     RecipientHeader,
+    RecipientFrame,
     Content,
     Reasoning,
     ToolBody,
@@ -333,7 +334,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             reasoning_enabled: true,
             initial_close: false,
             mode: match config.start {
-                OutputStart::Content | OutputStart::RecipientHeader => Mode::Content,
+                OutputStart::Content | OutputStart::RecipientHeader | OutputStart::RecipientFrame => Mode::Content,
                 OutputStart::Reasoning => Mode::Reasoning,
                 OutputStart::ToolBody => Mode::Tool,
             },

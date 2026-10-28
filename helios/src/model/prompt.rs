@@ -295,7 +295,9 @@ pub fn prepare_output(
     if recipient {
         reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
     }
-    let start = if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
+    let start = if recipient && !open_assistant {
+        crate::output::tagged::OutputStart::RecipientFrame
+    } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
         crate::output::tagged::OutputStart::RecipientHeader
     } else if recipient && prefix.is_some_and(|p| {
         p.starts_with(" to=") && ![" to=self<|message|>", " to=user<|message|>", " to=commentary<|message|>"].iter().any(|m|p.starts_with(m))
