@@ -9,8 +9,9 @@
   "dtype": "bfloat16",
   "inplace": false,
   "cache_policy": "cold",
-  "min_bytes": 1024,
+  "min_bytes": 16,
   "buckets": [
+    {"max_bytes": 1008,"implementation": "joint_latency","threads": 64,"blocks": 64,"profiles": {"full": [1]}},
     {"max_bytes": 1024,"implementation": "joint_latency","threads": 256,"blocks": 64,"profiles": {"full": [8,32,36]}},
     {"max_bytes": 1072,"implementation": "joint_latency","threads": 128,"blocks": 64,"profiles": {"full": [4,16,32,64]}},
     {"max_bytes": 1120,"implementation": "joint_latency","threads": 512,"blocks": 64,"profiles": {"full": [2,32,36]}},

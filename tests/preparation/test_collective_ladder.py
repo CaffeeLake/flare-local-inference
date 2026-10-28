@@ -18,8 +18,8 @@ def choose(data, size, **changes):
 def test_supplied_ladder_covers_every_interval():
     data = load(LADDER)
     assert data["name"] == "gb202_pcie_tp4"
-    assert len(data["buckets"]) == 209
-    assert data["min_bytes"] == 1024
+    assert len(data["buckets"]) == 210
+    assert data["min_bytes"] == 16
     assert data["buckets"][-1]["max_bytes"] == 8 << 20
     lower = data["min_bytes"]
     for row in data["buckets"]:
@@ -29,7 +29,7 @@ def test_supplied_ladder_covers_every_interval():
         lower = row["max_bytes"] + 16
 
 
-@pytest.mark.parametrize("size", [0, 1008, 1025, (8 << 20) + 16, True])
+@pytest.mark.parametrize("size", [0, 8, 1025, (8 << 20) + 16, True])
 def test_no_extrapolation_or_unaligned_payload(size):
     with pytest.raises(UsageError, match="no bucket"):
         choose(load(LADDER), size)
@@ -48,7 +48,7 @@ def test_invalid_contract(changes):
         validate(load(LADDER) | changes)
 
 
-@pytest.mark.parametrize("changes", [dict(max_bytes=1008), dict(implementation="oneshot"),
+@pytest.mark.parametrize("changes", [dict(max_bytes=0), dict(implementation="oneshot"),
     dict(threads=96), dict(blocks=0), dict(profiles={}), dict(profiles={"full": [0]}),
     dict(profiles={"full": [65]}), dict(profiles={"full": [1, 1]}), dict(profiles={"bulk_push": [1]})])
 def test_invalid_bucket(changes):

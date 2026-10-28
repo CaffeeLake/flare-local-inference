@@ -8,7 +8,7 @@ import sys
 import pytest
 
 
-def _rank(rank, directory):
+def _rank(rank, directory, readiness):
     import torch
     import torch.distributed as dist
 
@@ -42,10 +42,20 @@ def _rank(rank, directory):
                     workload_schema="tp4-bf16-hidden", numerical_policy="fp32-single-rounding",
                     coordinator=coordinator, collective_tuning="runtime", compile_workers=4,
                     collective_ladder=load(Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json"))
-                source = torch.full((13, 2560), rank + 1, dtype=torch.bfloat16, device=device)
-                output = torch.empty_like(source)
-                operation = PreparedAllReduce(source, output, runtime=runtime, session=session,
-                    coordinator=coordinator, name="shared-reduction")
+                if readiness:
+                    from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings
+
+                    timings = ReadinessTimings(torch.zeros(1, dtype=torch.int32, device=device), 1)
+                    wait = PreparedReadinessWait(timings, 0, runtime=runtime, session=session,
+                        coordinator=coordinator, name="readiness-barrier")
+                    source, output, operation = wait.input, wait.output, wait.barrier
+                    assert source.numel() * source.element_size() == 16
+                    assert operation.runtime_profiles == (("full", 1),)
+                else:
+                    source = torch.full((13, 2560), rank + 1, dtype=torch.bfloat16, device=device)
+                    output = torch.empty_like(source)
+                    operation = PreparedAllReduce(source, output, runtime=runtime, session=session,
+                        coordinator=coordinator, name="shared-reduction")
                 session.tune(show_progress=False)
                 signatures = {name: GraphSignature(name, 1, 1) for name in ("init", "decode")}
                 stream = torch.cuda.Stream(device=device)
@@ -53,6 +63,12 @@ def _rank(rank, directory):
                     session=session, device=device, stream=stream, pool=storage.graph_pool.id,
                     collective=runtime, coordinator=coordinator, compile_decoder=False, retain_graphs=True)
                 session.freeze()
+                source.fill_(rank + 1)
+                torch.cuda.synchronize(device)
+                dist.barrier()
+                graphs["decode"].replay()
+                torch.cuda.synchronize(device)
+                torch.testing.assert_close(output, torch.full_like(output, 10), rtol=0, atol=0)
                 registry = session._startup_collectives
                 assert len(registry.groups) == 1
                 producer = next(iter(registry.groups.values()))
@@ -107,10 +123,11 @@ def _rank(rank, directory):
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
                    reason="requires four assigned CUDA devices and FLARE_RUN_TP_CUDA_TESTS=1")
-def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path):
+@pytest.mark.parametrize("readiness", [False, True], ids=["activation", "readiness-16b"])
+def test_prepared_model_exports_automatic_collective_startup_storage(tmp_path, readiness):
     import torch
     import torch.multiprocessing as mp
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
-    mp.spawn(_rank, args=(tmp_path,), nprocs=4, join=True)
+    mp.spawn(_rank, args=(tmp_path, readiness), nprocs=4, join=True)

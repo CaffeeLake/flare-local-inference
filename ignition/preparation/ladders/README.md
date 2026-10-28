@@ -56,9 +56,13 @@ cannot change the compiled family, threads, or physical grid.
 
 ## GB202 PCIe TP4 recommendations
 
-`gb202_pcie_tp4.json` contains 209 buckets from 1 KiB through 8 MiB, sampled at
-16 intervals per doubling. It targets out-of-place BF16 reductions on four
-SM120 GPUs. The measurements cover a same-switch group (GPUs 0,1,2,3) and a
+`gb202_pcie_tp4.json` contains 210 buckets from 16 bytes through 8 MiB.
+The 16–1008-byte bucket uses one active CTA of the 64-thread latency kernel
+in `full` mode for readiness barriers and small validation reductions; this
+profile has correctness coverage but no measured performance ranking. The
+remaining 209 buckets cover 1 KiB through 8 MiB at 16 intervals per doubling.
+The ladder targets out-of-place BF16 reductions on four SM120 GPUs. The
+measurements cover a same-switch group (GPUs 0,1,2,3) and a
 separate-switch group (GPUs 0,5,7,9) on Pulsar, plus same-switch GPUs 12,13,14,15
 and host-bridge GPUs 0,4,8,12 on Frank2. Frank2's same-switch group is classified
 by its physical wiring; its OS topology report does not describe that wiring

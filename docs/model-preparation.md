@@ -184,7 +184,7 @@ among the supplied submode and active-CTA profiles when the package loads,
 including with autotune effort `off`; geometry stays fixed and no search runs
 during requests. Other collective paths retain their preparation policy. The
 [GB202 PCIe TP4 ladder](../ignition/preparation/ladders/README.md) covers four
-SM120 GPUs with out-of-place BF16 reductions from 1 KiB through 8 MiB:
+SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 
 ```sh
 --collective-tuning runtime \
