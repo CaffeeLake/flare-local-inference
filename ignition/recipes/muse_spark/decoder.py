@@ -145,12 +145,16 @@ class PreparedDecoder:
             prefix = f"{name}.layer{index}"
             attention = PreparedAttention(index, w, weights.config, weights.shard, scratch.normalized,
                 scratch.attention, metadata, pool, mode=mode, runtime=runtime, coordinator=coordinator,
-                session=session, name=prefix + ".attention", workspace=workspace)
+                session=session, name=prefix + ".attention", workspace=workspace, buffers=buffers)
             feedforward = PreparedFeedForward(w, weights.config, scratch, metadata, runtime=runtime,
                 preexpert_runtime=preexpert_runtime, embedding_runtime=embedding_runtime, coordinator=coordinator,
                 session=session, name=prefix + ".mlp", workspace=workspace, buffers=buffers)
             self.layers.append(decoder_layer(weights.config, w, attention, feedforward))
         self.norm = norm("rms", weights.norm, dimension=c["hidden_size"], eps=c["rms_norm_eps"])
+        self.target_layers = () if weights.draft is None else weights.config.draft.target_layers
+        shape = (scratch.embedding.shape[0], len(self.target_layers) * c["hidden_size"])
+        self.auxiliary = (torch.zeros(shape, dtype=torch.bfloat16, device=scratch.embedding.device)
+                          if buffers is None else buffers.zeros(shape, torch.bfloat16))
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=weights.config.vocabulary, session=session, coordinator=coordinator,
             name=name + ".prompt", copy_source=True)
@@ -163,8 +167,11 @@ class PreparedDecoder:
 
     def __call__(self):
         hidden = self.embedding_norm(self.embedding())
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             hidden = layer(hidden)
+            if index in self.target_layers:
+                column = self.target_layers.index(index) * hidden.shape[-1]
+                self.auxiliary[:, column:column + hidden.shape[-1]].copy_(hidden)
         if self.scoring is not None:
             self.scoring.source.copy_(self.norm(hidden))
             self.scoring()
@@ -174,8 +181,12 @@ class PreparedDecoder:
         logits = self.head(self.scratch.hidden)
         logits.copy_(torch.tanh(logits * self.output_multiplier / self.softcap) * self.softcap)
 
+    def commit(self, counts):
+        for layer in self.layers:
+            layer.self_attn.commit(counts)
+
     def scratch_tensors(self):
-        return (self.head.gathered, *(layer.self_attn.scratch_tensors() for layer in self.layers))
+        return (self.head.gathered, self.auxiliary, *(layer.self_attn.scratch_tensors() for layer in self.layers))
 
 
 class SoftcappedProjection:

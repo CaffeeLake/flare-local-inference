@@ -1,8 +1,15 @@
 """Muse Spark text geometry and checkpoint-declared projection precision."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 import json
 from pathlib import Path
+
+
+if TYPE_CHECKING:
+    from .draft_config import DraftConfig
 
 
 @dataclass(frozen=True)
@@ -25,10 +32,15 @@ class AttentionGeometry:
 class ModelConfig:
     text: dict
     quantization: dict
+    draft: DraftConfig | None = None
 
     @classmethod
-    def load(cls, snapshot):
-        return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()))
+    def load(cls, snapshot, *, draft_snapshot=None):
+        config = cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()))
+        if draft_snapshot is not None:
+            from .draft_config import DraftConfig
+            config = replace(config, draft=DraftConfig.load(draft_snapshot, config))
+        return config
 
     @classmethod
     def from_dict(cls, config):

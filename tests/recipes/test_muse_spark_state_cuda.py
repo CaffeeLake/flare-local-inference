@@ -18,11 +18,18 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("endpoint", [127, 128, 129, 2047, 2048, 2049])
+@pytest.mark.parametrize("dflash", [False, True])
 @torch.no_grad()
-def test_captured_snapshot_forks_preserve_fp8_histories(endpoint):
+def test_captured_snapshot_forks_preserve_fp8_histories(endpoint, dflash):
     config = SimpleNamespace(layers=2, attention=lambda i: Geometry(2048 if i == 0 else -1),
-                             text={"hidden_size": 128})
+                             text={"hidden_size": 128},
+                             draft=SimpleNamespace(layers=5, attention=Geometry(2048)) if dflash else None)
     pool = ContinuationPool.allocate(config, TensorParallelShard(0, 1), 8, 5, "cuda:0")
+    if dflash:
+        for layer in range(5):
+            for kind in ('key', 'value'):
+                region = pool.layout.region(f'draft{layer}.{kind}')
+                assert region.dtype == torch.float8_e4m3fn and region.shape == (2048, 2, 64)
     commands = StateCommands.allocate("cuda:0", capacity=4)
     tables = torch.full((4, 17), -1, dtype=torch.int32, device="cuda:0")
     consumed = pool.region("consumed_tokens")

@@ -23,7 +23,8 @@ def config():
 def test_text_metadata_partitions_and_cache_costs(config):
     recipe = resolve("muse-spark-open-nvfp4").recipe
     assert (recipe.context, recipe.concurrency, recipe.prefill_chunk) == (262144, 4, 4096)
-    assert recipe.max_images == recipe.max_draft_tokens == 0
+    assert recipe.max_images == 0
+    assert recipe.max_draft_tokens == 7
     assert recipe.sampling_defaults.temperature == recipe.sampling_defaults.top_p == 1
     assert recipe.sampling_defaults.top_k == -1
     shard = TensorParallelShard(0, 8)

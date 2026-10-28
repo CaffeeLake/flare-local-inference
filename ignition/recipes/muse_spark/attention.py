@@ -1,4 +1,4 @@
-"""Normalized gated attention with paged FP8 and circular sliding histories."""
+"""Normalized gated attention with paged FP8 and accepted circular histories."""
 
 from dataclasses import dataclass
 
@@ -61,7 +61,7 @@ class PreparedAttention(torch.nn.Module):
                  runtime, coordinator, session, name, workspace, buffers=None):
         super().__init__()
         self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
-        if mode not in ("prefill", "decode"):
+        if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Muse Spark attention mode: {mode}")
         self.mode, self.pool, self.layer = mode, pool, layer
         self.projection = UnquantizedProjection(source, weights.qkv, scratch.projected,
@@ -81,11 +81,21 @@ class PreparedAttention(torch.nn.Module):
         self.slots = (torch.full_like(metadata.positions, -1) if buffers is None
                       else buffers.zeros(metadata.positions.shape, metadata.positions.dtype).fill_(-1))
         self.key_cache, self.value_cache = pool.cache(layer, "key"), pool.cache(layer, "value")
+        self.commit_writer = None
         window = -1
         if geometry.window > 0:
-            if mode == "prefill":
+            if mode in ("prefill", "verify"):
                 key, value = scratch.window_key, scratch.window_value
                 rows = metadata.lengths.numel()
+                if mode == "verify":
+                    pages = (geometry.window + metadata.max_query_tokens + PAGE_TOKENS - 1) // PAGE_TOKENS
+                    key, value = key[:rows * pages], value[:rows * pages]
+                    self.retained_key = (torch.zeros_like(scratch.key) if buffers is None
+                                         else buffers.zeros(scratch.key.shape, scratch.key.dtype))
+                    self.retained_value = (torch.zeros_like(scratch.value) if buffers is None
+                                           else buffers.zeros(scratch.value.shape, scratch.value.dtype))
+                    self.commit_writer = PreparedPagedKVWriter(self.retained_key, self.retained_value,
+                        self.key_cache, self.value_cache, self.slots, session=session, name=name + ".commit")
                 self.staged_key, self.staged_value = key, value
                 self.pages = torch.arange(key.shape[0], dtype=torch.int32, device=source.device).view(rows, -1)
                 window = geometry.window - 1
@@ -145,6 +155,12 @@ class PreparedAttention(torch.nn.Module):
             stage_windows(self.key_cache, s.key, s.window_key, m)
             stage_windows(self.value_cache, s.value, s.window_value, m)
             self.lengths.copy_(m.starts.clamp(max=a.window).int() + m.lengths)
+        else:
+            self.retained_key.copy_(s.key)
+            self.retained_value.copy_(s.value)
+            stage_windows(self.key_cache, s.key, self.staged_key, m)
+            stage_windows(self.value_cache, s.value, self.staged_value, m)
+            self.lengths.copy_(m.starts.clamp(max=a.window).int() + m.lengths)
         if self.writer is not None:
             self.writer()
         self.attention()
@@ -155,5 +171,14 @@ class PreparedAttention(torch.nn.Module):
         s.partial.copy_(self.output_projection(s.gated.flatten(1)))
         return self.reduction(s.partial).view_as(hidden_states), None
 
+    def commit(self, counts):
+        if self.commit_writer is not None:
+            m, window = self.metadata, self.geometry.window
+            offset = m.positions - m.starts[m.requests]
+            self.slots.copy_(torch.where((m.positions >= 0) & (offset >= 0) & (offset < counts[m.requests]),
+                m.state_rows[m.requests] * window + m.positions.remainder(window), -1))
+            self.commit_writer()
+
     def scratch_tensors(self):
-        return self.slots, self.lengths
+        retained = () if self.commit_writer is None else (self.retained_key, self.retained_value)
+        return self.slots, self.lengths, *retained

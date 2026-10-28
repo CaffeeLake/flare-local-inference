@@ -1,7 +1,7 @@
 """Rank-local direct transfers of stacked Muse Spark checkpoint weights."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 
 import torch
@@ -50,11 +50,14 @@ class ModelWeights:
     scale_scratch: tuple = ()
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, package_storage=None):
+    def load(cls, manifest, device, *, shard, progress=None, package_storage=None, draft_snapshot=None):
         before = torch.cuda.memory_allocated(device)
         loading = nullcontext if package_storage is None else package_storage.transient
         with loading(), MuseSparkWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
             config = loader.config
+            if draft_snapshot is not None:
+                from .draft_config import DraftConfig
+                config = replace(config, draft=DraftConfig.load(draft_snapshot, config))
             first, last = shard.partition(config.hidden)
             embedding = loader.load_tensor(PREFIX + ".embed_tokens.weight", extent=(slice(None), slice(first, last)))
             norm = loader.load_tensor(PREFIX + ".norm.weight")
@@ -63,7 +66,12 @@ class ModelWeights:
             loader._copy(head[:last-first], loader._sources["lm_head.weight"][first:last])
             loader._session.flush()
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
-        return cls(config, shard, embedding, norm, head, layers, torch.cuda.memory_allocated(device) - before)
+        draft = None
+        if draft_snapshot is not None:
+            from .draft_weights import DraftWeights
+            with loading():
+                draft = DraftWeights.load(draft_snapshot, config.draft, device, shard, progress=progress)
+        return cls(config, shard, embedding, norm, head, layers, torch.cuda.memory_allocated(device) - before, draft=draft)
 
 
 class MuseSparkWeightLoader(DirectWeightLoader):

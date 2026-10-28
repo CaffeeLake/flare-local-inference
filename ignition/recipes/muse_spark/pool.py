@@ -1,4 +1,4 @@
-"""FP8 paged full-attention histories and bounded sliding-attention continuation rows."""
+"""FP8 paged histories and bounded target and draft circular continuation rows."""
 
 from dataclasses import dataclass
 import math
@@ -25,7 +25,7 @@ def page_bytes(config, shard):
     return sum(shape[0] for _, shape in page_specs(config, shard))
 
 
-def continuation_layout(config, shard):
+def continuation_layout(config, shard, *, dflash=True):
     regions = []
     for layer in range(config.layers):
         geometry = config.attention(layer)
@@ -34,6 +34,13 @@ def continuation_layout(config, shard):
             for kind, dim in (("key", geometry.key_dim), ("value", geometry.value_dim)):
                 regions.append((f"layer{layer}.{kind}", (geometry.window, heads, dim), KV_DTYPE))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, shard))
+    draft = getattr(config, "draft", None)
+    if dflash and draft is not None:
+        a = draft.attention
+        _, heads = a.local(shard)
+        for layer in range(draft.layers):
+            for kind, dim in (("key", a.key_dim), ("value", a.value_dim)):
+                regions.append((f"draft{layer}.{kind}", (a.window, heads, dim), KV_DTYPE))
     regions.extend((("last_hidden", (config.text["hidden_size"],), torch.bfloat16),
                     ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
@@ -50,8 +57,8 @@ class ContinuationPool(PagedStateStorage):
 
     @classmethod
     def allocate(cls, config, shard, slots, pages, device, *, storage=None, maximum_pages=None, maximum_rows=None,
-                 backed_slots=None):
-        layout = continuation_layout(config, shard)
+                 backed_slots=None, dflash=True):
+        layout = continuation_layout(config, shard, dflash=dflash)
         backing = PagedStateStorage.allocate(layout, page_specs(config, shard), slots, pages, device,
             storage=storage, maximum_pages=maximum_pages, maximum_rows=maximum_rows, backed_slots=backed_slots)
         return cls(backing.backing, backing.layout, backing.memory_capacity,

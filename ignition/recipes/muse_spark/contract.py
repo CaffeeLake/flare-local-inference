@@ -7,10 +7,15 @@ from .frontend import FRONTEND
 from .pool import PAGE_TOKENS
 
 
-def prepare(signatures, buffers, pool, *, vocabulary):
+def prepare(signatures, buffers, pool, *, vocabulary, draft_lag=None):
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()}}
-    inputs["decode"].pop("token_ids", None)
+    for kind in ("decode", "speculative"):
+        if kind in inputs:
+            inputs[kind].pop("token_ids", None)
     continuation = c.state_view("state_pool", pool.layout.row_bytes)
+    consumed = pool.layout.region("consumed_tokens")
+    cursor = None if draft_lag is None else dict(state=c.state_view("state_pool", pool.layout.row_bytes,
+        offset=consumed.offset, nbytes=consumed.nbytes), lag_tokens=draft_lag)
     regions = [c.history_region(buffers, f"cache.{name}", tensor, p.PAGED_KEY_VALUE)
                for name, tensor in pool.pages.items()]
     return c.model_contract(vocabulary=vocabulary, page_tokens=PAGE_TOKENS,
@@ -18,4 +23,4 @@ def prepare(signatures, buffers, pool, *, vocabulary):
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation,
                       tokens_per_record=1, window_tokens=0), *regions],
         graphs=c.graph_contracts(signatures, inputs, continuation=continuation,
-                                 pending=c.state_view("request_pending_token", 8)), frontend=FRONTEND)
+                                 pending=c.state_view("request_pending_token", 8), cursor=cursor), frontend=FRONTEND)

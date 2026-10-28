@@ -887,8 +887,27 @@ The `muse-spark-open-nvfp4` alias selects
 [`meta-models/Muse-Spark-Open-816B-A42B-NVFP4`](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4)
 at revision `4239e4db19376904f2e82c167e78f70abb5455fe`. Text preparation uses
 eight SM120 GPUs, checkpoint NVFP4 experts, FP8 E4M3 KV storage, a 262144-token
-context, four concurrent requests, and 4096-token prefill chunks. Image,
-audio, video, and speculative execution are not prepared.
+context, four concurrent requests, and 4096-token prefill chunks. Target and draft
+queries and attention outputs use BF16. Image, audio, and video are not prepared.
+
+DFlash2 drafting uses
+[`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2)
+at revision `fbec887a79866e9ecff6c57adfd9fd02aa3cadea`. Preparation downloads
+its configuration and weights into the configured Hugging Face hub cache. The
+five-layer BF16 draft uses eight-token blocks with seven proposed tokens, target
+features from layers 3, 19, 31, 47, and 59, and 2048-token sliding attention.
+Target and draft histories use unit-scale FP8 E4M3 storage. The default adaptive
+verification catalog uses width-one and width-eight graphs with per-request
+prefixes of one through eight tokens and 32 packed target-token rows.
+`--mtp-draft-tokens N` selects zero through seven proposals;
+`--no-mtp-adaptive-verification` fixes the verification width. `--no-mtp` skips
+the draft download, weights, state, and speculative graphs.
+
+At tensor parallelism eight, draft weights occupy 1,596,065,024 bytes per rank,
+including replicated convolution and candidate-selection tensors and fused context
+projections. Each continuation row occupies 27,525,120 bytes with draft history
+or 24,903,680 bytes with `--no-mtp`; each 128-token paged KV block occupies
+524,288 bytes. These cache sizes exclude transient graph scratch.
 
 Sampling follows the checkpoint model card: temperature 1.0, top-p 1.0, and
 top-k disabled. The checkpoint generation configuration's top-k 64 is not the
@@ -898,9 +917,10 @@ recommended inference default. Reasoning effort accepts `low`, `medium`,
 override it.
 
 Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
-routed-expert outputs, independent FC1 half gains, and head-dimension-64
-paged decode with BF16 queries and FP8 E4M3 caches. The FlashInfer Git dependency pinned in `pyproject.toml` lacks
-these operators. Complete the standard environment setup and install the local
+routed-expert outputs, independent FC1 half gains, and head-dimension-64 paged
+decode with BF16 queries and FP8 E4M3 caches, including quantized sliding-cache
+verification and rollback. The FlashInfer Git dependency pinned in
+`pyproject.toml` lacks these operators. Complete the standard environment setup and install the local
 checkout's build and runtime requirements into `.venv` first. Build requirements
 include `setuptools>=77`, `packaging>=24`, and `apache-tvm-ffi>=0.1.11,<0.2`;
 the CUDA 13 checkout's NCCL-EP dependency requires `nvidia-nccl-cu13>=2.30.7`.
@@ -938,9 +958,9 @@ flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --
 
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
 target-token capacity is the larger of padded concurrency and draft count plus
-one, giving six rows at its default settings. Muse Spark prepares ordinary
-execution without speculative rows. Other recipes default to 32 concurrent
-requests, with speculative recipes declaring 128 target-token rows independently
+one, giving six rows at its default settings. Muse Spark declares 32 packed
+target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
+default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
 of concurrency.
 Explicit flags and configuration override these defaults; existing packages retain their
 captured capacities. Memory planning rejects capacities that do not fit the
@@ -953,6 +973,7 @@ selected GPUs.
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
+| Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
 
 The 128-row rectangular catalogs cover full draft depth through batch 16.
 Gemma 4's six-row default covers five drafts at batch 1 and two at batch 2,

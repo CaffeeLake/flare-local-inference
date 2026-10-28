@@ -284,7 +284,8 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     path.write_text(configuration_text.format(alias=model.checkpoint.alias))
     configuration = Configuration.load(path)
     if expected is None:
-        expected = (4, 4096, 6) if model.recipe.name == "gemma4" else (32, 4096, 128)
+        expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
+                    (4, 4096, 32) if model.recipe.name == "muse_spark" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -293,6 +294,11 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     if model.recipe.name != "mimo_v2":
         devices = tuple(replace(device, total_bytes=256 * GIB, free_bytes=255 * GIB) for device in devices)
     host = preparation.Host(devices, None)
+    if expected[0] > model.recipe.max_concurrency:
+        with pytest.raises(UsageError, match="concurrency"):
+            preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
+                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
+        return
     plan = preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
     assert plan.world_size == world_size
