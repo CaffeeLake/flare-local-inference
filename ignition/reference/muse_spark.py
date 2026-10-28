@@ -4,6 +4,8 @@ Attention, rotary positions, normalization, routing and residual gates use the
 installed Transformers forwards. Experts read one checkpoint expert at a time;
 NVFP4 projections independently decode checkpoint weights and quantize activations
 with their calibrated scales. No prepared Flare operators execute in this path.
+Attention defaults to SDPA with FlashAttention as its sole enabled backend.
+Explicit eager selection retains BF16 attention score and probability rounding.
 
 Run ``python -m ignition.reference.muse_spark SNAPSHOT INPUT_JSON OUTPUT_PT``
 with an assigned CUDA device. The JSON input contains ``token_ids``; the output
@@ -12,6 +14,7 @@ predicts the token after input positions zero through j.
 """
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -93,7 +96,9 @@ class StreamingExperts(torch.nn.Module):
 
 
 @torch.no_grad()
-def text_logits(snapshot, token_ids, *, device="cuda:0", scale_math="dynamic_fast", progress=None):
+def text_logits(snapshot, token_ids, *, device="cuda:0", scale_math="dynamic_fast", progress=None,
+                attention_implementation="sdpa"):
+    from torch.nn.attention import SDPBackend, sdpa_kernel
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     from transformers.models.muse_spark.configuration_muse_spark import MuseSparkConfig
     from transformers.models.muse_spark.modeling_muse_spark import (
@@ -102,6 +107,8 @@ def text_logits(snapshot, token_ids, *, device="cuda:0", scale_math="dynamic_fas
 
     if not isinstance(token_ids, (list, tuple)) or not token_ids or any(type(token) is not int for token in token_ids):
         raise ValueError("reference token IDs must be a nonempty integer sequence")
+    if attention_implementation not in ("sdpa", "eager"):
+        raise ValueError("reference attention implementation must be sdpa or eager")
     snapshot, device = Path(snapshot), torch.device(device)
     if device.type != "cuda":
         raise ValueError("Muse Spark text reference requires an NVIDIA CUDA device")
@@ -111,7 +118,7 @@ def text_logits(snapshot, token_ids, *, device="cuda:0", scale_math="dynamic_fas
     config = MuseSparkConfig.from_dict(configuration).text_config
     if config.moe_hidden_size != 4096 or config.moe_intermediate_size != 4096:
         raise ValueError("text reference requires 4096-channel Muse Spark experts")
-    config._attn_implementation = "eager"
+    config._attn_implementation = attention_implementation
     manifest = inspect_indexed_checkpoint(snapshot)
     ids = torch.as_tensor(token_ids, dtype=torch.long, device=device).reshape(1, -1)
     if ids.numel() == 0 or bool(((ids < 0) | (ids >= config.vocab_size)).any()):
@@ -138,9 +145,12 @@ def text_logits(snapshot, token_ids, *, device="cuda:0", scale_math="dynamic_fas
         quantized = not any(expert_prefix == p or expert_prefix.startswith(p + ".") for p in excluded)
         layer.mlp.experts = StreamingExperts(layer.mlp.experts, reader, expert_prefix,
                                              quantized=quantized, scale_math=scale_math)
-        hidden = layer.eval()(hidden, attention_mask=masks[config.layer_types[index]],
-            position_embeddings=position_embeddings if config.layer_rope_theta[index] else None,
-            position_ids=position_ids)
+        attention = (sdpa_kernel([SDPBackend.FLASH_ATTENTION])
+                     if attention_implementation == "sdpa" else nullcontext())
+        with attention:
+            hidden = layer.eval()(hidden, attention_mask=masks[config.layer_types[index]],
+                position_embeddings=position_embeddings if config.layer_rope_theta[index] else None,
+                position_ids=position_ids)
         if progress is not None:
             progress(index, hidden)
         del layer
@@ -168,6 +178,8 @@ def main():
     parser.add_argument("output", type=Path, help="PyTorch token_ids, hidden states and logits fixture")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--scale-math", choices=("dynamic_fast", "dynamic_precise", "micro"), default="dynamic_fast")
+    parser.add_argument("--attention-implementation", choices=("sdpa", "eager"), default="sdpa",
+                        help="sdpa requires the FlashAttention backend; eager retains BF16 score/probability rounding")
     args = parser.parse_args()
     value = json.loads(args.input.read_text())
     ids = value["token_ids"]
@@ -175,8 +187,12 @@ def main():
     def progress(layer, hidden):
         torch.cuda.synchronize(args.device)
         print(f"layer={layer} tokens={hidden.shape[1]} elapsed_seconds={time.monotonic() - started:.3f}", flush=True)
-    hidden, logits = text_logits(args.snapshot, ids, device=args.device, scale_math=args.scale_math, progress=progress)
-    torch.save(dict(token_ids=torch.tensor(ids), hidden=hidden, logits=logits), args.output)
+    hidden, logits = text_logits(args.snapshot, ids, device=args.device, scale_math=args.scale_math, progress=progress,
+                                 attention_implementation=args.attention_implementation)
+    torch.save(dict(token_ids=torch.tensor(ids), hidden=hidden, logits=logits,
+                    attention_implementation=args.attention_implementation,
+                    attention_backend="FLASH_ATTENTION" if args.attention_implementation == "sdpa" else "eager"),
+               args.output)
     scores, tokens = logits[-1].float().topk(10)
     print(dict(output=str(args.output), top_tokens=tokens.tolist(), top_logits=scores.tolist(),
         elapsed_seconds=time.monotonic() - started, peak_tensor_bytes=torch.cuda.max_memory_allocated()), flush=True)

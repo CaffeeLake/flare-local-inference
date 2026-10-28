@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--tokens', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--attention-implementation', choices=('sdpa', 'eager'), default='sdpa',
+                        help='sdpa requires the FlashAttention backend; eager retains BF16 score/probability rounding')
     args = parser.parse_args()
     if args.output.exists():
         parser.error('output already exists')
@@ -30,9 +32,11 @@ def main():
         print(f'layer={index} tokens={hidden.shape[1]} '
               f'elapsed_seconds={time.monotonic() - started:.3f}', flush=True)
 
-    hidden, logits = text_logits(args.snapshot, tokens, device=args.device, progress=record)
+    hidden, logits = text_logits(args.snapshot, tokens, device=args.device, progress=record,
+                                 attention_implementation=args.attention_implementation)
     torch.save(dict(token_ids=torch.tensor(tokens), layers=torch.stack(layers),
-                    hidden=hidden, logits=logits), args.output)
+                    hidden=hidden, logits=logits, attention_implementation=args.attention_implementation,
+                    attention_backend='FLASH_ATTENTION' if args.attention_implementation == 'sdpa' else 'eager'), args.output)
     print(f'output={args.output} layers={len(layers)} '
           f'peak_tensor_bytes={torch.cuda.max_memory_allocated(args.device)}', flush=True)
 

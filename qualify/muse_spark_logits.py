@@ -70,6 +70,63 @@ def fence_operations(rank, enabled):
         _Invocation.run = original
 
 
+@contextmanager
+def log_warmup_errors(rank, enabled):
+    if not enabled:
+        yield
+        return
+    import sys
+    import traceback
+    import torch
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+    from ignition.preparation.compilation import _Invocation
+
+    state = dict(opaque_sequence=0, last_returned_opaque=None, last_autotuner=None)
+    originals = []
+
+    def wrap(original, kind):
+        def run(*args, **kwargs):
+            key = 'active_' + kind
+            previous = state.get(key)
+            if kind == 'opaque':
+                state['opaque_sequence'] += 1
+                detail = str(args[0].target)
+            elif kind in ('autotuner', 'benchmark'):
+                detail = args[0].inductor_meta.get('kernel_name', type(args[0]).__name__)
+                state['last_autotuner'] = detail
+                if kind == 'benchmark':
+                    detail += ' ' + repr(args[1].config)
+            else:
+                detail = 'current-stream synchronization'
+            state[key] = detail
+            try:
+                result = original(*args, **kwargs)
+                if kind == 'opaque':
+                    state['last_returned_opaque'] = detail
+                return result
+            except Exception as error:
+                print(json.dumps(dict(warmup_exception=dict(rank=rank, source=kind,
+                    error=f'{type(error).__name__}: {error}', **state))), file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+                raise
+            finally:
+                state[key] = previous
+        return run
+
+    try:
+        for owner, name, kind in ((_Invocation, 'run', 'opaque'),
+                                 (CachingAutotuner, 'run', 'autotuner'),
+                                 (CachingAutotuner, 'bench', 'benchmark'),
+                                 (torch.cuda.Stream, 'synchronize', 'synchronize')):
+            original = getattr(owner, name)
+            originals.append((owner, name, original))
+            setattr(owner, name, wrap(original, kind))
+        yield
+    finally:
+        for owner, name, original in reversed(originals):
+            setattr(owner, name, original)
+
+
 def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
     import time
     import torch
@@ -196,18 +253,49 @@ def measure_replay(model, pool, requests, tokens, group, rank, *, profile):
 
 
 def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress=None, tokens, output,
-                     measure=False, profile=False, fence=False, layer_outputs=False):
+                     measure=False, profile=False, fence=False, layer_outputs=False, repeat=False,
+                     log_errors=False, check_compiled=False, cache_outputs=False):
     import torch
+    import torch.distributed as dist
     from ignition.recipes.muse_spark.bootstrap import prepare_rank
 
-    with fence_operations(rank, fence):
+    with log_warmup_errors(rank, log_errors), fence_operations(rank, fence):
         model = prepare_rank(snapshot, config, rank=rank, group=group, package_storage=package_storage,
                              progress=progress)
     diagnostics = {}
     try:
-        read_prepared(model, rank=rank, group=group, tokens=tokens, output=output,
-                      snapshot=snapshot, measure=measure, profile=profile,
-                      layer_outputs=layer_outputs, diagnostics=diagnostics)
+        pool, requests = read_prepared(model, rank=rank, group=group, tokens=tokens, output=output,
+                      snapshot=snapshot,
+                      layer_outputs=layer_outputs, diagnostics=diagnostics, cache_outputs=cache_outputs)
+        if repeat:
+            read_prepared(model, rank=rank, group=group, tokens=tokens,
+                          output=output.with_name(output.stem + '.repeat' + output.suffix),
+                          snapshot=snapshot,
+                          layer_outputs=layer_outputs, diagnostics=diagnostics, cache_outputs=cache_outputs)
+        if check_compiled:
+            raw_output = output.with_name(output.stem + '.uncompiled' + output.suffix)
+            read_prepared(model, rank=rank, group=group, tokens=tokens, output=raw_output,
+                          snapshot=snapshot, layer_outputs=False, diagnostics=diagnostics, uncompiled=True,
+                          cache_outputs=cache_outputs)
+            comparison = [None]
+            if rank == 0:
+                try:
+                    comparison[0] = compare_readbacks(torch.load(output, weights_only=True, map_location='cpu'),
+                                                      torch.load(raw_output, weights_only=True, map_location='cpu'))
+                except Exception as error:
+                    comparison[0] = dict(equal=False, error=f'{type(error).__name__}: {error}')
+                print(json.dumps(dict(compiled_uncompiled_comparison=comparison[0])), flush=True)
+            dist.broadcast_object_list(comparison, src=0, group=group)
+            if not comparison[0]['equal']:
+                raise AssertionError(f'compiled/raw readback differs; tensors retained in {output} and {raw_output}: '
+                                     f'{comparison[0]}')
+        if measure:
+            measurements = measure_replay(model, pool, requests, tokens, group, rank, profile=False)
+            if profile:
+                measurements.extend(measure_replay(model, pool, requests, tokens, group, rank, profile=True))
+            if rank == 0:
+                output.with_suffix('.replay.json').write_text(json.dumps(measurements, indent=2) + '\n')
+        dist.barrier(group=group)
     finally:
         torch.cuda.synchronize(model.device)
         for graph, _, _ in diagnostics.values():
@@ -216,18 +304,68 @@ def prepare_and_read(snapshot, config, *, rank, group, package_storage, progress
     return model
 
 
-def capture_layer_outputs(model, forward, rows, collective):
+def compare_readbacks(compiled, uncompiled):
+    import torch
+
+    if compiled['prompt_tokens'] != uncompiled['prompt_tokens'] or compiled['teacher_tokens'] != uncompiled['teacher_tokens']:
+        raise ValueError('compiled/raw token inputs differ')
+    differences = {}
+    tokens = len(compiled['prompt_tokens']) + len(compiled['teacher_tokens'])
+    for name in ('logits', 'hidden', 'prefill_logits', 'prefill_hidden'):
+        a, b = compiled[name], uncompiled[name]
+        if a.shape != b.shape or a.dtype != b.dtype:
+            raise ValueError(f'compiled/raw {name} tensor contracts differ')
+        if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+            raise ValueError(f'compiled/raw {name} contains nonfinite values')
+        changed = (a.contiguous().view(torch.uint8) != b.contiguous().view(torch.uint8))
+        if bool(changed.any()):
+            rows = changed.reshape(a.shape[0], -1).any(-1) if a.ndim == 2 else changed.any().reshape(1)
+            first = int(rows.nonzero()[0])
+            differences[name] = dict(first_differing_endpoint=first + 1 if a.ndim == 2 else tokens,
+                                     changed_elements=int(changed.reshape(-1, a.element_size()).any(-1).sum()),
+                                     max_absolute_error=(a.double() - b.double()).abs().max().item())
+    if ('cache_outputs' in compiled) != ('cache_outputs' in uncompiled):
+        raise ValueError('compiled/raw cache readback contracts differ')
+    if 'cache_outputs' in compiled:
+        if len(compiled['cache_outputs']) != len(uncompiled['cache_outputs']):
+            raise ValueError('compiled/raw cache rank counts differ')
+        cache_differences = []
+        for rank, (left, right) in enumerate(zip(compiled['cache_outputs'], uncompiled['cache_outputs'], strict=True)):
+            if left.keys() != right.keys():
+                raise ValueError('compiled/raw cache endpoints differ')
+            for endpoint, a in left.items():
+                b = right[endpoint]
+                if a.shape != b.shape or a.dtype != b.dtype:
+                    raise ValueError('compiled/raw cache tensor contracts differ')
+                if not bool(torch.isfinite(a.float()).all() and torch.isfinite(b.float()).all()):
+                    raise ValueError('compiled/raw cache contains nonfinite values')
+                changed = (a.contiguous().view(torch.uint8) != b.contiguous().view(torch.uint8))
+                changed = changed.reshape(*a.shape, a.element_size()).any(-1)
+                if bool(changed.any()):
+                    layer, kind, token, head, channel = changed.nonzero()[0].tolist()
+                    cache_differences.append(dict(rank=rank, endpoint=endpoint,
+                        first_difference=dict(layer=layer, kind=('key', 'value')[kind], token=token,
+                                              head=head, channel=channel),
+                        changed_elements=int(changed.sum()),
+                        max_absolute_error=(a.double() - b.double()).abs().max().item()))
+        if cache_differences:
+            differences['cache_outputs'] = cache_differences
+    return dict(equal=not differences, differences=differences)
+
+
+def capture_raw_forward(model, forward, rows, collective, *, stream=None):
     import torch
     from ignition.preparation.startup_tuning import capture_consumers
 
     layers = forward.decoder.layers
-    snapshots = torch.empty((len(layers), rows, forward.decoder.weights.config.hidden),
-                            device=model.device, dtype=torch.bfloat16)
-    stream = torch.cuda.Stream(device=model.device)
+    snapshots = (torch.empty((len(layers), rows, forward.decoder.weights.config.hidden),
+                            device=model.device, dtype=torch.bfloat16) if rows is not None else None)
+    if stream is None:
+        stream = torch.cuda.Stream(device=model.device)
     graph = torch.cuda.CUDAGraph()
     handles = []
     try:
-        for index, layer in enumerate(layers):
+        for index, layer in enumerate(layers if rows is not None else ()):
             def copy_output(module, inputs, output, index=index):
                 snapshots[index].copy_(output[:rows])
             handles.append(layer.register_forward_hook(copy_output))
@@ -245,8 +383,8 @@ def capture_layer_outputs(model, forward, rows, collective):
     return graph, snapshots, stream
 
 
-def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, profile,
-                  layer_outputs, diagnostics):
+def read_prepared(model, *, rank, group, tokens, output, snapshot,
+                  layer_outputs, diagnostics, uncompiled=False, cache_outputs=False):
     import torch
     import torch.distributed as dist
     from ignition.components.sampling import DeviceRequestState, RequestAdmission, RUNNING
@@ -269,7 +407,24 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
         raise AssertionError('diagnostic requires the complete 62-layer decoder')
     if len(tokens) > int(pool.memory_capacity[1]) * 128:
         raise ValueError('recorded context exceeds the physically backed preparation pages')
+    if cache_outputs and any(0 < pool.config.attention(layer).window < len(tokens)
+                             for layer in range(pool.config.layers)):
+        raise ValueError('cache readback requires the complete prompt to fit every circular history')
     buffers, device = model.buffers, pool.backing.device
+    cache_readback = {}
+    def read_cache(name, length):
+        if not cache_outputs:
+            return
+        layers = []
+        for layer in range(pool.config.layers):
+            histories = []
+            for kind in ('key', 'value'):
+                cache = pool.cache(layer, kind)
+                values = (cache[1, :length] if pool.config.attention(layer).window > 0
+                          else cache.flatten(0, 1)[:length])
+                histories.append(values.cpu().clone())
+            layers.append(torch.stack(histories))
+        cache_readback[name] = torch.stack(layers)
     def reset():
         pool.clear_for_preparation()
         requests.generation.zero_()
@@ -301,12 +456,28 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
                    if signature.kind == 'prefill' and signature.token_capacity >= len(tokens))
     whole_name = f'prefill{capacity}'
     whole = forwards[whole_name]
+    raw_stream = None
+    if uncompiled:
+        raw_stream = torch.cuda.Stream(device=device)
+        for name in dict.fromkeys((whole_name, 'prefill128', 'decode1')):
+            reset()
+            buffers['live_rows'].zero_()
+            buffers['query_lengths'].zero_()
+            buffers['row_slot_ids'].fill_(-1)
+            buffers['sample_enabled'].zero_()
+            raw_stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(raw_stream):
+                forwards[name]()
+            raw_stream.synchronize()
+            dist.barrier(group=group)
+        reset()
     def replay(name, forward, rows):
-        if not layer_outputs:
+        if not layer_outputs and not uncompiled:
             model.graphs[name].replay()
             return
         if name not in diagnostics:
-            diagnostics[name] = capture_layer_outputs(model, forward, rows, collective)
+            diagnostics[name] = capture_raw_forward(model, forward, rows if layer_outputs else None,
+                                                    collective, stream=raw_stream)
         diagnostics[name][0].replay()
 
     buffers['query_lengths'][0] = len(tokens)
@@ -323,6 +494,7 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
     prefill_logits = whole.decoder.scratch.logits[0].cpu().clone() if rank == 0 else None
     prefill_hidden = whole.decoder.scratch.hidden[0].cpu().clone() if rank == 0 else None
     prefill_layers = diagnostics[whole_name][1].cpu().clone() if layer_outputs and rank == 0 else None
+    read_cache('whole_prefill', len(tokens))
     reset()
     logits, hidden, layers = [], [], []
     torch.cuda.synchronize(device)
@@ -345,6 +517,8 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
             raise AssertionError('captured text graph packed a different recorded token')
         if int(forward.batch.metadata.positions[0]) != index:
             raise AssertionError('captured text graph packed a different token position')
+        if index < 2:
+            read_cache(f'endpoint{index + 1}', index + 1)
         if rank == 0:
             logits.append(forward.decoder.scratch.logits[0].cpu().clone())
             hidden.append(forward.decoder.scratch.hidden[0].cpu().clone())
@@ -353,6 +527,9 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
             if (index + 1) % 16 == 0 or index + 1 == len(tokens):
                 print(f'captured teacher-forced endpoints: {index + 1}/{len(tokens)}', flush=True)
     dist.barrier(group=group)
+    cache_ranks = [None] * dist.get_world_size(group) if cache_outputs and rank == 0 else None
+    if cache_outputs:
+        dist.gather_object(cache_readback, cache_ranks, dst=0, group=group)
     if rank == 0:
         intermediate = dict(layer_outputs=torch.stack(layers), prefill_layer_outputs=prefill_layers,
                             prefill_layer_token_indices=list(range(min(4, len(tokens))))) if layer_outputs else {}
@@ -360,16 +537,9 @@ def read_prepared(model, *, rank, group, tokens, output, snapshot, measure, prof
             logits=torch.stack(logits), hidden=torch.stack(hidden),
             prefill_logits=prefill_logits, prefill_hidden=prefill_hidden,
             model_id='meta-models/Muse-Spark-Open-816B-A42B-NVFP4', revision=Path(snapshot).name,
-            **intermediate), output)
+            **intermediate, **(dict(cache_outputs=cache_ranks) if cache_outputs else {})), output)
     dist.barrier(group=group)
-    if measure:
-        measurements = measure_replay(model, pool, requests, tokens, group, rank, profile=False)
-        if profile:
-            measurements.extend(measure_replay(model, pool, requests, tokens, group, rank, profile=True))
-        if rank == 0:
-            output.with_suffix('.replay.json').write_text(json.dumps(measurements, indent=2) + '\n')
-    dist.barrier(group=group)
-    return model
+    return pool, requests
 
 
 def main():
@@ -385,18 +555,36 @@ def main():
                         help='capture prepared Python forwards without Torch compilation')
     parser.add_argument('--layer-outputs', action='store_true',
                         help='capture diagnostic layer-output copies; requires --no-compile')
+    parser.add_argument('--repeat-readback', action='store_true',
+                        help='repeat reset/readback through the same graphs into OUTPUT.repeat.pt')
+    parser.add_argument('--check-compiled', action='store_true',
+                        help='capture the same prepared raw forwards into OUTPUT.uncompiled.pt and require bitwise equality')
+    parser.add_argument('--cache-outputs', action='store_true',
+                        help='read valid per-layer K/V on every rank after endpoints 1, 2 and complete prefill')
     parser.add_argument('--measure-replay', action='store_true', help='measure valid B1/B4 captured decode after correctness readback')
     parser.add_argument('--profile-replay', action='store_true', help='control profiler capture around measured B1/B4 regions')
     parser.add_argument('--fence-operations', action='store_true',
                         help='diagnose preparation faults by logging and synchronizing compiled storage operations outside capture')
+    parser.add_argument('--log-warmup-errors', action='store_true',
+                        help='log rank-local compiled warmup exceptions and operation context without adding CUDA synchronization')
     args = parser.parse_args()
     if args.profile_replay and not args.measure_replay:
         parser.error('--profile-replay requires --measure-replay')
     if args.layer_outputs and not args.no_compile:
         parser.error('--layer-outputs requires --no-compile')
+    if args.check_compiled and args.no_compile:
+        parser.error('--check-compiled requires compiled forwards')
+    if args.cache_outputs and not args.check_compiled:
+        parser.error('--cache-outputs requires --check-compiled')
+    if args.log_warmup_errors and (args.fence_operations or args.no_compile):
+        parser.error('--log-warmup-errors requires compiled forwards without --fence-operations')
     tokens = read_tokens(args.tokens)
     if args.output.exists():
         parser.error('output already exists')
+    if args.repeat_readback and args.output.with_name(args.output.stem + '.repeat' + args.output.suffix).exists():
+        parser.error('repeat output already exists')
+    if args.check_compiled and args.output.with_name(args.output.stem + '.uncompiled' + args.output.suffix).exists():
+        parser.error('uncompiled output already exists')
     from ignition.cli import environment
     from ignition.cli.config import Configuration, Setting
     from ignition.cli.preparation import Host, derive, resolve_model
@@ -422,7 +610,9 @@ def main():
     storage = PackageStorage(world=plan.world_size)
     runner = partial(prepare_and_read, tokens=tokens, output=args.output.resolve(),
                      measure=args.measure_replay, profile=args.profile_replay, fence=args.fence_operations,
-                     layer_outputs=args.layer_outputs)
+                     layer_outputs=args.layer_outputs, repeat=args.repeat_readback,
+                     log_errors=args.log_warmup_errors, check_compiled=args.check_compiled,
+                     cache_outputs=args.cache_outputs)
     with storage:
         prepared = prepare_group(args.snapshot.resolve(), config, runner, package_storage=storage,
                                  progress=lambda text: print(text, flush=True))
