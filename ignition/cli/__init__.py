@@ -194,9 +194,11 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"
                                " check that pruning drops no winners (default: default)")
+    advanced.add_argument("--collective-ladder", type=Path,
+                          help="JSON file of final joint collective choices; required for runtime tuning")
     advanced.add_argument("--collective-tuning", choices=("static", "runtime"),
-                          help="collective selection: static autotunes during preparation; runtime also"
-                               " captures startup submode selection (default: recipe, currently static)")
+                          help="collective selection: static autotunes during preparation; runtime uses the supplied"
+                               " ladder and captures runtime profile selection (default: recipe, currently static)")
     advanced.add_argument("--shard-hyperconnections", action="store_true",
                           help="shard Qwen3.8 Flash hyperconnection bottlenecks across TP ranks with"
                                " BF16 gate-logit reduction (default: replicated)")

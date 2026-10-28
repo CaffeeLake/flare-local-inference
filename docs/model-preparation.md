@@ -177,13 +177,19 @@ declared tuning axes.
 `static` uses ordinary preparation-time autotuning and emits no collective startup
 tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
 overrides the recipe default; the command-line option overrides configuration.
-`runtime` uses joint kernels for eligible plain BF16 direct PCIe reductions.
-With autotune effort `default` or `audit`, preparation tunes the compiled launcher
-and retains the best measured CTA count for each of its submodes. A captured
-startup tuner selects among those prepared profiles when the package loads;
-geometry stays fixed and no search runs during requests. Effort `off` disables
-races in either mode: runtime mode retains the heuristic joint profile and emits
-no startup tuner. Other collective paths are unchanged.
+`runtime` requires `--collective-ladder PATH` and uses the file's final joint
+kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
+compiles that geometry without racing alternatives. A captured tuner selects
+among the supplied submode and active-CTA profiles when the package loads,
+including with autotune effort `off`; geometry stays fixed and no search runs
+during requests. Other collective paths retain their preparation policy. The
+[GB202 PCIe TP4 ladder](../ignition/preparation/ladders/README.md) covers four
+SM120 GPUs with out-of-place BF16 reductions from 1 KiB through 8 MiB:
+
+```sh
+--collective-tuning runtime \
+--collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
+```
 
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning

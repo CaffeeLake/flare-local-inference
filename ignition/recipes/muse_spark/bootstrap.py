@@ -44,6 +44,7 @@ from .weights import ModelWeights
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
@@ -164,7 +165,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             draft_headers=draft_headers, kv_dtype="float8_e4m3fn",
             world_size=shard.world_size, contract="muse-spark.text.v1"), sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
-            collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort,
+            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort,
             tuning_replica=config.tuning_replica, native_dense_activations=config.native_dense_activations,
             lock_gpu_clocks=config.lock_gpu_clocks, device=device, checkpoint=identity,
             workload_schema="muse_spark", numerical_policy="default", coordinator=coordinator,

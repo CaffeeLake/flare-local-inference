@@ -662,3 +662,10 @@ def test_lock_gpu_clocks_reaches_preparation_plan(host):
     assert export("qwen3.8-flash", "--lock-gpu-clocks") == 0
     assert host["plan"].lock_gpu_clocks is True
     assert host["plan"].to_dict()["lock_gpu_clocks"] is True
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_runtime_collective_policy_requires_ladder_before_preparation(host, capsys, command):
+    assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
+    assert "requires --collective-ladder PATH" in capsys.readouterr().err
+    assert "prepared" not in host and host["exports"] == 0

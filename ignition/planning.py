@@ -182,6 +182,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    collective_ladder: dict | None = None
     collective_tuning: str | None = None
     joint_tuning: bool = False
     shard_hyperconnections: bool = False
@@ -218,6 +219,15 @@ class Plan:
             object.__setattr__(self, "collective_tuning", self.recipe.collective_tuning)
         if self.collective_tuning not in ("static", "runtime"):
             raise UsageError("--collective-tuning must be static or runtime")
+        if self.collective_ladder is not None:
+            from ignition.preparation.collective_ladder import validate
+
+            ladder = validate(self.collective_ladder)
+            if self.collective_tuning != "runtime":
+                raise UsageError("--collective-ladder requires --collective-tuning runtime")
+            if self.world_size != ladder["world_size"] or any(
+                    tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
+                raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
         if self.shard_hyperconnections:
             if self.recipe.name != "qwen38":
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
@@ -335,6 +345,7 @@ class Plan:
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
             "collective_tuning": self.collective_tuning,
+            "collective_ladder": self.collective_ladder,
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,

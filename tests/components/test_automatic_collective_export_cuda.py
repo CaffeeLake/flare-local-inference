@@ -14,6 +14,7 @@ def _rank(rank, directory):
 
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.capture import capture_forwards
+    from ignition.preparation.collective_ladder import load
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature
     from ignition.preparation.model import PreparedModel
@@ -39,7 +40,8 @@ def _rank(rank, directory):
                     hidden_size=2560, ipc=storage.peer_storage, collective_tuning="runtime")
                 session = RecordedPreparationSession(device=device, checkpoint="collective-startup-export",
                     workload_schema="tp4-bf16-hidden", numerical_policy="fp32-single-rounding",
-                    coordinator=coordinator, collective_tuning="runtime", compile_workers=4)
+                    coordinator=coordinator, collective_tuning="runtime", compile_workers=4,
+                    collective_ladder=load(Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json"))
                 source = torch.full((13, 2560), rank + 1, dtype=torch.bfloat16, device=device)
                 output = torch.empty_like(source)
                 operation = PreparedAllReduce(source, output, runtime=runtime, session=session,

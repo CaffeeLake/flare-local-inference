@@ -104,6 +104,8 @@ message RebuildManifest {
   bool shard_hyperconnections = 24;
   // Preparation-time collective selection policy: static or runtime.
   string collective_tuning = 25;
+  // Preparation-only offline geometry and runtime profile recommendations.
+  string collective_ladder_json = 26;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
