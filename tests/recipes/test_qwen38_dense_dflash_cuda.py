@@ -329,7 +329,7 @@ def test_checkpoint_five_layer_operator_arithmetic_and_raw_head(weights):
         for position in range(1, 8):
             logits = scratch.logits[position:position + 1].clone()
             top, indices = logits.topk(16, -1, sorted=False)
-            coded = weights.draft.selector["predecessor"][predecessor] * projected[:, position]
+            coded = weights.draft.selector["predecessor"][predecessor] * prepared.selector.projected[:, position]
             correction = torch.bmm(weights.draft.selector["successor"][indices], coded.unsqueeze(-1)).squeeze(-1)
             expected_logits = torch.full_like(logits, -torch.inf).scatter_(1, indices, top + correction.float())
             prepared.selector(logits, predecessor, position)
