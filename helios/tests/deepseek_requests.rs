@@ -420,7 +420,6 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
             json!({"chat_template_kwargs":{"drop_thinking":true}}),
             json!({"chat_template_kwargs":{"continue_final_message":true}}),
             json!({"chat_template_kwargs":{"add_generation_prompt":false}}),
-            json!({"tool_choice":"required","tools":[{"type":"function","function":{"name":"lookup"}}]}),
         ] {
             assert!(f.prepare(extra.clone()).is_err(), "{extra}");
         }
@@ -678,5 +677,29 @@ fn added_non_special_dsml_token_produces_tool_calls() {
         assert!(events.iter().any(|event| matches!(event,
             flare_helios::output::Event::ToolArguments { text, .. } if serde_json::from_str::<Value>(text).unwrap() == json!({"location":"Berlin"}))));
         assert!(events.iter().any(|event| matches!(event, flare_helios::output::Event::ToolEnd { .. })));
+    }
+}
+
+#[test]
+fn required_and_named_tools_keep_the_thinking_prompt() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let fixture = Fixture::new(encoder);
+        let tools = json!([
+            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"other","parameters":{"type":"object"}}}
+        ]);
+        for thinking in [json!({}), json!({"enable_thinking":true}), json!({"thinking_mode":"thinking"})] {
+            let required = fixture.prepare(json!({"tools":tools,"tool_choice":"required", "chat_template_kwargs":thinking})).unwrap();
+            let automatic = fixture.prepare(json!({"tools":tools,"tool_choice":"auto", "chat_template_kwargs":thinking})).unwrap();
+            assert_eq!(required.rendered_prompt, automatic.rendered_prompt, "{encoder:?} {thinking}");
+            assert_eq!(required.prompt.tokens, automatic.prompt.tokens);
+            assert_eq!(required.output.content.start, OutputStart::Reasoning);
+            assert!(required.rendered_prompt.ends_with("<｜Assistant｜><think>"));
+            let named = fixture.prepare(json!({"tools":tools,"tool_choice":{"type":"function","function":{"name":"lookup"}},"chat_template_kwargs":thinking})).unwrap();
+            assert_eq!(named.output.content.start, OutputStart::Reasoning);
+            assert_eq!(named.output.content.tools.len(), 1);
+            assert_eq!(named.output.content.tools[0]["function"]["name"], "lookup");
+        }
+        assert!(fixture.prepare(json!({"tool_choice":"required","tools":[]})).is_err());
     }
 }

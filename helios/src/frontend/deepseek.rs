@@ -266,11 +266,12 @@ fn conversation(
     if tool_choice == ToolChoice::Required && tools.is_empty() {
         return Err(invalid("required tool choice needs at least one tool"));
     }
-    if tool_choice == ToolChoice::Required && thinking_mode {
-        return Err(invalid(
-            "thinking mode does not support required tool choice",
-        ));
-    }
+    // Required calls are checked at completion; thinking starts before the tool block.
+    let tool_choice = if tool_choice == ToolChoice::Required && thinking_mode {
+        ToolChoice::Auto
+    } else {
+        tool_choice
+    };
     let response_format = match options.get("response_format").filter(|v| !v.is_null()) {
         None => ResponseFormat::Text,
         Some(value) if value == "text" || value["type"] == "text" => ResponseFormat::Text,
