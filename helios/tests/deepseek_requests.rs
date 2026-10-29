@@ -59,13 +59,12 @@ fn tokenizer_asset() -> Asset {
                 "<｜Assistant｜>",
                 "<think>",
                 "</think>",
-                "<｜DSML｜ calls>",
-                "</｜DSML｜ calls>",
                 "<｜deepseek_image｜>",
             ]
             .map(|s| AddedToken::from(s, true)),
         )
         .unwrap();
+    tokenizer.add_tokens([AddedToken::from("｜DSML｜", false)]).unwrap();
     let bytes = tokenizer.to_string(false).unwrap();
     let path = std::env::temp_dir().join(format!(
         "flare-deepseek-request-{}-{}.json",
@@ -370,11 +369,24 @@ fn required_tools_in_chat_mode_start_inside_the_dsml_envelope() {
         assert!(request.prompt.grammar.is_some());
         assert!(!f.accepts(options.clone(), "{\"ok\":true}"));
         let completion = format!("{invoke}\n{close}{{\"ok\":true}}");
-        assert!(f.accepts(options, &completion));
+        assert!(f.accepts(options.clone(), &completion));
+        assert!(!f.accepts(options.clone(), &format!("{invoke}{{\"ok\":true}}")));
+        let mut automatic = options.clone();
+        automatic["tool_choice"] = json!("auto");
+        assert!(f.accepts(automatic, &format!("{open}{invoke}{close}{{\"ok\":true}}")));
         let mut output = flare_helios::output::OutputPipeline::new(request.output);
-        let mut events = output
-            .push(flare_helios::output::Input::Text(&completion))
-            .unwrap();
+        let mut events = Vec::new();
+        let mut decoder = f.frontend.incremental_decoder(false);
+        for token in f.frontend.encode(&completion, false).unwrap() {
+            events.extend(output.push(flare_helios::output::Input::Token(token)).unwrap());
+            if let Some(text) = decoder.push(&[token]).unwrap() {
+                events.extend(output.push(flare_helios::output::Input::Text(&text)).unwrap());
+            }
+        }
+        let remaining = decoder.finish().unwrap();
+        if !remaining.is_empty() {
+            events.extend(output.push(flare_helios::output::Input::Text(&remaining)).unwrap());
+        }
         events.extend(
             output
                 .finish(flare_helios::output::Termination::Eos)
@@ -628,5 +640,43 @@ fn decision_generation_prompt_prepares_a_nonthinking_first_assistant_token() {
                 .unwrap()
         );
         assert_eq!(prepared.output.content.start, OutputStart::Content);
+    }
+}
+
+#[test]
+fn added_non_special_dsml_token_produces_tool_calls() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let f = Fixture::new(encoder);
+        let token = f.frontend.tokenizer().token_to_id("｜DSML｜").unwrap();
+        assert!(!f.frontend.tokenizer().get_added_vocabulary().is_special_token("｜DSML｜"));
+        let request = f.prepare(json!({"tools":[{"type":"function","function":{
+            "name":"get_weather","parameters":{"type":"object"}
+        }}]})).unwrap();
+        assert!(request.output.control_tokens.contains(&(token, "｜DSML｜".to_owned())));
+        let (block, invoke, parameter) = if encoder == PromptEncoder::DeepseekV4 {
+            ("tool_calls", "invoke", "parameter")
+        } else {
+            (" calls", " invoke", " parameter")
+        };
+        let completion = format!("</think>I'll check.\n\n<｜DSML｜{block}>\n<｜DSML｜{invoke} name=\"get_weather\">\n<｜DSML｜{parameter} name=\"location\" string=\"true\">Berlin</｜DSML｜{parameter}>\n</｜DSML｜{invoke}>\n</｜DSML｜{block}>");
+        let mut output = flare_helios::output::OutputPipeline::new(request.output);
+        let mut decoder = f.frontend.incremental_decoder(false);
+        let mut events = Vec::new();
+        for id in f.frontend.encode(&completion, false).unwrap() {
+            events.extend(output.push(flare_helios::output::Input::Token(id)).unwrap());
+            if let Some(text) = decoder.push(&[id]).unwrap() {
+                events.extend(output.push(flare_helios::output::Input::Text(&text)).unwrap());
+            }
+        }
+        let rest = decoder.finish().unwrap();
+        if !rest.is_empty() {
+            events.extend(output.push(flare_helios::output::Input::Text(&rest)).unwrap());
+        }
+        events.extend(output.finish(flare_helios::output::Termination::Eos).unwrap());
+        assert!(events.iter().any(|event| matches!(event,
+            flare_helios::output::Event::ToolBegin { name, .. } if name == "get_weather")));
+        assert!(events.iter().any(|event| matches!(event,
+            flare_helios::output::Event::ToolArguments { text, .. } if serde_json::from_str::<Value>(text).unwrap() == json!({"location":"Berlin"}))));
+        assert!(events.iter().any(|event| matches!(event, flare_helios::output::Event::ToolEnd { .. })));
     }
 }

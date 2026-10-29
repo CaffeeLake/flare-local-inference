@@ -616,7 +616,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "deepseek-recipe"
 version = "0.2.0"
-source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f#50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f"
+source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270#6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -638,7 +638,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-core"
 version = "0.2.0"
-source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f#50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f"
+source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270#6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270"
 dependencies = [
  "deepseek-recipe-macros",
  "serde",
@@ -648,7 +648,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-encoding"
 version = "0.2.0"
-source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f#50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f"
+source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270#6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270"
 dependencies = [
  "aho-corasick",
  "deepseek-recipe-core",
@@ -662,7 +662,7 @@ dependencies = [
 [[package]]
 name = "deepseek-recipe-macros"
 version = "0.2.0"
-source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f#50f9f48c6f02ca6b74004d8a68d3dcf2b4145a3f"
+source = "git+https://github.com/local-inference-lab/deepseek-recipe?rev=6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270#6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270"
 dependencies = [
  "proc-macro2",
  "quote",
