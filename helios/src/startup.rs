@@ -48,6 +48,16 @@ impl StartupProgress {
         }
     }
 
+    /// Whether phases write anything at all.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether stderr is a terminal that can redraw in place.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     fn animate_banner(&mut self) {
         if !self.terminal {
             return;

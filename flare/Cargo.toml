@@ -24,6 +24,10 @@ sha2 = "0.10.9"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 # Fetches each publisher's key file from its official source; TLS features unify with hf-hub's.
 ureq = "3"
+# Parses the untrusted Retry-After date form without arithmetic of our own.
+httpdate = "1"
+# Resolves untrusted redirect targets with a standards-compliant URL join.
+url = "2"
 libloading = "0.8.9"
 # Fleet control signs grants and encrypts agent sessions with the ring Helios already links.
 ring = "0.17.14"

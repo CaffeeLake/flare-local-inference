@@ -48,6 +48,11 @@ pub struct Hello {
     /// The node's installed Flare, used when RUN omits a cached binary name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
+    /// The sender accepts live DOWNLOAD progress frames. The field is optional
+    /// so protocol-6 peers that predate it keep the previous request/response
+    /// behavior instead of receiving frames they do not expect.
+    #[serde(default)]
+    pub download_progress: bool,
 }
 
 impl Hello {
@@ -71,8 +76,39 @@ pub struct DownloadRequest {
     pub profiles: Vec<flare_helios::runtime_package::Publisher>,
 }
 
+/// Advisory free bytes for an acquisition's transport parent and model cache.
+/// It is reported for sizing only; acquisition never rejects on these values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+struct StorageEstimate {
+    /// `None` when the node cannot query that filesystem.
+    transport_free: Option<u64>,
+    model_cache_free: Option<u64>,
+}
+
+/// Replace any controller-supplied value with this node's configured hub cache.
+/// The field is host-local and serde-skipped on the wire.
+fn node_download_options(
+    hub_cache: Option<&Path>,
+    mut options: crate::cli::HubOptions,
+) -> crate::cli::HubOptions {
+    options.hub_cache = hub_cache.map(Path::to_owned);
+    options
+}
+
+fn storage_estimate(options: &crate::cli::HubOptions) -> StorageEstimate {
+    let Ok(model_root) = crate::cache_support::model_root(options.model_cache.as_deref()) else {
+        return StorageEstimate::default();
+    };
+    let transport = crate::hub::transport_root(&model_root, options.cache_dir.as_deref());
+    StorageEstimate {
+        transport_free: crate::hub::available_bytes(&transport),
+        model_cache_free: crate::hub::available_bytes(&model_root),
+    }
+}
+
 fn download(
     request: DownloadRequest,
+    counters: Option<flare_helios::package::progress::AcquisitionProgress>,
 ) -> Result<(Vec<u8>, flare_helios::package::cache::Entry), Failure> {
     if request.options.revision.is_none() || request.options.token_file.is_some() {
         return Err(
@@ -80,7 +116,7 @@ fn download(
                 .into(),
         );
     }
-    let path = crate::hub::download_with_token(
+    let path = crate::hub::download_watched(
         &request.source,
         &request.options,
         0,
@@ -88,12 +124,49 @@ fn download(
         &[],
         None,
         &request.profiles,
+        counters,
     )
     .map_err(|e| e.to_string())?;
     // The response names a cache entry the controller will transfer from, so the
     // lease must outlive this request rather than dropping with the Entry.
     let directory = path.directory().to_path_buf();
     Ok((serde_json::to_vec(&json!({"path": directory}))?, path))
+}
+
+/// How often a watched download samples its counters. Progress is advisory and
+/// must never slow the acquisition it observes.
+const DOWNLOAD_REPORT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Run `work` while sampling its counters for a progress observer. A failed
+/// report stops further reports but never cancels the work: the acquisition
+/// owns durable cache state, not the controller connection observing it.
+fn watch_download<T: Send>(
+    counters: &flare_helios::package::progress::AcquisitionProgress,
+    work: impl FnOnce() -> Result<T, Failure> + Send,
+    mut report: impl FnMut(&flare_helios::package::progress::AcquisitionSnapshot) -> Result<(), Failure>,
+) -> Result<T, Failure> {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(work);
+        let mut previous = counters.snapshot();
+        let mut reporting = true;
+        while !worker.is_finished() {
+            thread::sleep(DOWNLOAD_REPORT_INTERVAL);
+            let snapshot = counters.snapshot();
+            if reporting
+                && (snapshot.network_bytes != previous.network_bytes
+                    || snapshot.network_total != previous.network_total
+                    || snapshot.verification_bytes != previous.verification_bytes)
+            {
+                previous = snapshot;
+                if report(&snapshot).is_err() {
+                    reporting = false;
+                }
+            }
+        }
+        worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Exchange HELLO frames: the initiator sends first. The peer's HELLO must name the key that
@@ -349,6 +422,8 @@ pub struct Agent {
     pub key: Key,
     pub cache: PathBuf,
     pub name: String,
+    /// Host-local Hugging Face cache from this agent's configuration; never from a controller.
+    hub_cache: Option<PathBuf>,
     /// The executable running this agent, also used for serving unless RUN overrides it.
     executable: PathBuf,
     pins: Pins,
@@ -392,6 +467,7 @@ impl Agent {
             key,
             cache,
             name: super::hostname(),
+            hub_cache: None,
             executable: std::env::current_exe()?,
             pins: Pins::default(),
             groups: Mutex::new(Vec::new()),
@@ -401,6 +477,12 @@ impl Agent {
             #[cfg(test)]
             fabric_endpoints: None,
         })
+    }
+
+    /// Select the host-local Hugging Face cache from the agent process's own configuration.
+    fn with_hub_cache(mut self, hub_cache: Option<PathBuf>) -> Self {
+        self.hub_cache = hub_cache;
+        self
     }
 
     /// Read the GPUs and every running rank zero's metrics once.
@@ -472,6 +554,7 @@ impl Agent {
             controllers_revision: self.dir.controllers()?.map_or(0, |(_, set)| set.revision),
             free_bytes: free_bytes(&self.cache),
             executable: Some(self.executable.clone()),
+            download_progress: true,
         })
     }
 
@@ -574,10 +657,15 @@ impl Agent {
 }
 
 /// Serve sessions on `listen` until killed.
-pub fn serve(listen: &str, dir: AgentDir, cache: PathBuf) -> Result<(), Failure> {
+pub fn serve(
+    listen: &str,
+    dir: AgentDir,
+    cache: PathBuf,
+    hub_cache: PathBuf,
+) -> Result<(), Failure> {
     let listener =
         TcpListener::bind(listen).map_err(|e| format!("cannot listen on {listen}: {e}"))?;
-    let agent = Arc::new(Agent::new(dir, cache)?);
+    let agent = Arc::new(Agent::new(dir, cache)?.with_hub_cache(Some(hub_cache)));
     eprintln!(
         "flare agent {} ({}) listening on {}; cache {}; {}",
         agent.name,
@@ -725,13 +813,49 @@ fn session(agent: &Arc<Agent>, stream: TcpStream) -> Result<(), Failure> {
                 stat(&request)
             }
             frame::DOWNLOAD => {
-                let request = serde_json::from_value(json_body(&mut session, length)?)?;
-                match download(request) {
-                    Ok((reply, entry)) => {
-                        downloads.push(entry);
-                        Ok(reply)
+                let mut request: DownloadRequest =
+                    serde_json::from_value(json_body(&mut session, length)?)?;
+                request.options =
+                    node_download_options(agent.hub_cache.as_deref(), request.options);
+                if hello.download_progress {
+                    let storage = storage_estimate(&request.options);
+                    let counters = flare_helios::package::progress::AcquisitionProgress::new();
+                    let observed = counters.clone();
+                    let result = watch_download(
+                        &observed,
+                        move || download(request, Some(counters)),
+                        |snapshot| {
+                            let body = json!({
+                                "downloaded": snapshot.network_bytes,
+                                "total": snapshot.network_total,
+                                "verified": snapshot.verification_bytes,
+                                "storage": storage,
+                            });
+                            session
+                                .write_frame(frame::DOWNLOAD_PROGRESS, &serde_json::to_vec(&body)?)
+                        },
+                    );
+                    match result {
+                        Ok((reply, entry)) => {
+                            let mut reply: Value = serde_json::from_slice(&reply)?;
+                            let snapshot = observed.snapshot();
+                            reply["downloaded"] = snapshot.network_bytes.into();
+                            reply["total"] = snapshot.network_total.into();
+                            reply["verified"] = snapshot.verification_bytes.into();
+                            reply["storage"] = serde_json::to_value(storage)?;
+                            downloads.push(entry);
+                            Ok(serde_json::to_vec(&reply)?)
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
+                } else {
+                    match download(request, None) {
+                        Ok((reply, entry)) => {
+                            downloads.push(entry);
+                            Ok(reply)
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
             }
             _ => Err(format!("unknown request {tag}").into()),
@@ -1761,6 +1885,22 @@ pub mod tests {
         let reply: Value =
             serde_json::from_slice(&session.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
         assert_eq!(reply["path"], entry.directory().to_str().unwrap());
+        assert!(reply["downloaded"].is_u64());
+        assert!(reply["verified"].is_u64());
+        assert!(reply["total"].is_null());
+        assert!(reply["storage"]["transport_free"].is_u64());
+        assert!(reply["storage"]["model_cache_free"].is_u64());
+
+        // A controller that does not negotiate progress receives the original
+        // reply shape and no progress frames.
+        let mut hello = controller_hello(&harness.controller);
+        hello.download_progress = false;
+        let mut legacy = Session::connect(&harness.address, &harness.controller).unwrap();
+        exchange_hello(&mut legacy, &hello).unwrap();
+        let old: Value =
+            serde_json::from_slice(&legacy.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
+        assert_eq!(old["path"], entry.directory().to_str().unwrap());
+        assert!(old.get("downloaded").is_none());
     }
 
     #[test]
@@ -1889,6 +2029,7 @@ pub mod tests {
             controllers_revision: 0,
             free_bytes: 0,
             executable: None,
+            download_progress: true,
         }
     }
 
@@ -2053,6 +2194,134 @@ pub mod tests {
             .to_string();
         assert!(error.contains("flare agent install"), "{error}");
         assert!(error.contains("--executable PATH"), "{error}");
+    }
+
+    #[test]
+    fn download_options_use_the_nodes_hub_cache_without_wire_paths() {
+        let controller = Path::new("/controller/hf");
+        let node = Path::new("/node/hf");
+        let options = crate::cli::HubOptions {
+            hub_cache: Some(controller.to_owned()),
+            ..Default::default()
+        };
+        let options = node_download_options(Some(node), options);
+        assert_eq!(options.hub_cache.as_deref(), Some(node));
+        let wire = serde_json::to_value(&options).unwrap();
+        assert!(wire.get("hub_cache").is_none(), "{wire}");
+        assert!(!wire.to_string().contains("/node/hf"), "{wire}");
+        assert!(!wire.to_string().contains("/controller/hf"), "{wire}");
+
+        let cleared = node_download_options(
+            None,
+            crate::cli::HubOptions {
+                hub_cache: Some(controller.to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(cleared.hub_cache.is_none());
+    }
+
+    #[test]
+    fn storage_estimate_reports_free_space_without_creating_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_root = temp.path().join("missing/model");
+        let cache_parent = temp.path().join("missing/transport");
+        let options = crate::cli::HubOptions {
+            model_cache: Some(model_root.clone()),
+            cache_dir: Some(cache_parent.clone()),
+            ..Default::default()
+        };
+        let estimate = storage_estimate(&options);
+        assert!(
+            estimate.transport_free.is_some_and(|free| free > 0),
+            "{estimate:?}"
+        );
+        assert!(
+            estimate.model_cache_free.is_some_and(|free| free > 0),
+            "{estimate:?}"
+        );
+        assert!(!temp.path().join("missing").exists());
+    }
+
+    #[test]
+    fn download_progress_is_negotiated_within_protocol_six() {
+        let harness = harness(46);
+        let hello = harness.agent.hello().unwrap();
+        assert_eq!(hello.version, PROTOCOL_VERSION);
+        assert!(hello.download_progress);
+        let mut value = serde_json::to_value(&hello).unwrap();
+        value.as_object_mut().unwrap().remove("download_progress");
+        let old: Hello = serde_json::from_value(value).unwrap();
+        assert!(!old.download_progress);
+    }
+
+    #[test]
+    fn a_failed_progress_report_stops_reporting_but_not_the_download() {
+        use flare_helios::package::progress::AcquisitionProgress;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counters = AcquisitionProgress::new();
+        let worker = counters.clone();
+        let reports = Arc::new(AtomicUsize::new(0));
+        let observed = reports.clone();
+        let result = watch_download(
+            &counters,
+            move || {
+                for _ in 0..7 {
+                    worker.record_network_bytes(1 << 20);
+                    thread::sleep(Duration::from_millis(60));
+                }
+                Ok::<_, Failure>(42)
+            },
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Err("controller disconnected".into())
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(counters.snapshot().network_bytes, 7 << 20);
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_controller_disconnect_stops_reports_but_not_the_download() {
+        use flare_helios::package::progress::AcquisitionProgress;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer_key = Key::from_seed(&[71; 32]).unwrap();
+        let accept = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            Session::accept(stream, &peer_key).unwrap()
+        });
+        let mut session = Session::connect(&address, &Key::from_seed(&[72; 32]).unwrap()).unwrap();
+        let _peer = accept.join().unwrap();
+
+        let counters = AcquisitionProgress::new();
+        let worker = counters.clone();
+        let reports = Arc::new(AtomicUsize::new(0));
+        let observed = reports.clone();
+        let result = watch_download(
+            &counters,
+            move || {
+                for _ in 0..7 {
+                    worker.record_network_bytes(1 << 20);
+                    thread::sleep(Duration::from_millis(60));
+                }
+                Ok::<_, Failure>(42)
+            },
+            move |_| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                session
+                    .try_clone_stream()?
+                    .shutdown(std::net::Shutdown::Both)?;
+                session.write_frame(frame::DOWNLOAD_PROGRESS, b"{}")
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(counters.snapshot().network_bytes, 7 << 20);
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
     }
 
     #[test]

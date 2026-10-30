@@ -540,6 +540,25 @@ resharding, verification, and cache installation before reporting it ready.
 source, but reports that work as download/acquisition before native model loading.
 Startup of a ready cache entry performs no resharding.
 
+Download transport keeps a shared tree per download parent at
+`<parent>/transport/hub/v1`, marked by a `version` file and holding
+content-addressed complete blobs, resumable `.part` files, quarantined suspect
+bytes, transient adoption copies, per-content transfer locks, and repository
+refs and snapshot hardlinks.
+Blob content is scoped by endpoint and repository so Hub ETags are never shared
+across repositories; revisions of one repository share content. An acquisition
+lease excludes reclamation for the lifetime of every acquisition. The tree is
+separate from the model cache and survives across acquisitions for
+cross-revision reuse.
+A successful installation reclaims its resolved commit's snapshot entries and
+the consumed complete blobs whose last hardlink they held. Failed partials,
+quarantined suspect bytes, and content referenced by another commit remain.
+`flare models downloads` inspects the tree and `flare models gc --downloads`
+reclaims remaining unused content under the per-content locks. Model-cache collection preserves unlocked
+staging trees that contain the older Hugging Face layout so their resumable
+partials survive until download-cache reclamation. [The CLI design](cli-design.md#download-cache)
+defines the command interface and reclamation rules.
+
 Selecting TP1 and TP2 produces one primary with both selected deployments and
 the union of their required payloads. Identical and directly referenced bytes are
 shared; distinct materialized layouts consume additional storage. Adding TP2

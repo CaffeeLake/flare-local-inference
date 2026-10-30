@@ -34,6 +34,24 @@ pub(crate) fn model_root_from(
     Ok(home.join(".cache/flare/packages"))
 }
 
+/// User Hugging Face cache that prepared-package acquisition may borrow from.
+///
+/// A `[paths].hub_cache` value reaches acquisition already resolved, through this
+/// process's selected configuration, so `--config` is honored and no configuration
+/// is reloaded. Without that value the location is the one the Hugging Face
+/// library uses by default. The tree is a read-only source: Flare never creates,
+/// renames, links into, or changes permissions under it.
+pub fn hub_cache_root(explicit: Option<&Path>) -> Result<PathBuf, Failure> {
+    if let Some(path) = explicit {
+        return Ok(path.to_owned());
+    }
+    Ok(hub_cache_default(&crate::environment::home_directory()?))
+}
+
+pub fn hub_cache_default(home: &Path) -> PathBuf {
+    home.join(".cache/huggingface/hub")
+}
+
 fn cache_key(input: &str) -> Result<String, Failure> {
     flare_helios::package::cache::model_key(input).map_err(|error| error.to_string().into())
 }
@@ -180,4 +198,25 @@ pub fn select_deployments(
     )
     .map_err(|error| error.to_string())?;
     Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_cache_root_prefers_the_selected_value() {
+        assert_eq!(
+            hub_cache_root(Some(Path::new("/checkpoints"))).unwrap(),
+            PathBuf::from("/checkpoints")
+        );
+    }
+
+    #[test]
+    fn hub_cache_default_is_the_hub_library_layout() {
+        assert_eq!(
+            hub_cache_default(Path::new("/home/test")),
+            Path::new("/home/test").join(".cache/huggingface/hub")
+        );
+    }
 }

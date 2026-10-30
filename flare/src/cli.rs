@@ -88,6 +88,8 @@ pub enum CacheCommand {
     Inspect(Inspect),
     /// Download a prepared model from Hugging Face.
     Download(Download),
+    /// Inspect Hugging Face download transport data.
+    Downloads(CacheDownloads),
     /// Choose the default version of a model.
     Select(CacheSpec),
     /// Remove a local model version.
@@ -126,10 +128,34 @@ pub struct CacheRemove {
 }
 
 #[derive(Debug, Args)]
+pub struct CacheDownloads {
+    /// Download cache parent [default: the model storage directory].
+    #[arg(long, value_name = "PATH", help_heading = "Download cache")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Print the inspection as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct CacheGc {
     /// Print the cleanup results as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Reclaim unused Hugging Face download transport data.
+    #[arg(long, help_heading = "Download cache")]
+    pub downloads: bool,
+
+    /// Download cache parent; requires --downloads [default: the model storage directory].
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "downloads",
+        help_heading = "Download cache"
+    )]
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -142,9 +168,9 @@ pub struct HubOptions {
     #[arg(long, value_name = "FILE", help_heading = "Download options")]
     pub filename: Option<String>,
 
-    /// Parent directory for operation-scoped transport staging of prepared
-    /// packages. The tree is cleaned when the acquisition ends; source checkpoint
-    /// and publisher-profile caches are configured separately.
+    /// Parent directory for the shared Hugging Face download transport cache
+    /// [default: the model storage directory]. Source checkpoint and
+    /// publisher-profile caches are configured separately.
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub cache_dir: Option<PathBuf>,
 
@@ -168,6 +194,13 @@ pub struct HubOptions {
     /// Prepared-model cache root [default: paths.package_cache, else ~/.cache/flare/packages].
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub model_cache: Option<PathBuf>,
+
+    /// Host-local Hugging Face cache that acquisition may reuse prepared-package
+    /// files from. Resolved from this process's configuration; never a flag and
+    /// never part of an Orbit request, because it is local to the acquiring host.
+    #[arg(skip)]
+    #[serde(skip)]
+    pub hub_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2150,9 +2183,41 @@ mod cache_cli_tests {
             parse(&["flare", "models", "select", "model@v1"]).command,
             CacheCommand::Select(CacheSpec { spec }) if spec == "model@v1"
         ));
-        assert!(matches!(
-            parse(&["flare", "models", "gc", "--json"]).command,
-            CacheCommand::Gc(CacheGc { json: true })
-        ));
+        let downloads = parse(&[
+            "flare",
+            "models",
+            "downloads",
+            "--cache-dir",
+            "/downloads",
+            "--json",
+        ]);
+        match downloads.command {
+            CacheCommand::Downloads(CacheDownloads {
+                cache_dir: Some(cache_dir),
+                json: true,
+            }) => assert_eq!(cache_dir, PathBuf::from("/downloads")),
+            other => panic!("unexpected downloads command: {other:?}"),
+        }
+        let gc = parse(&[
+            "flare",
+            "models",
+            "gc",
+            "--json",
+            "--downloads",
+            "--cache-dir",
+            "/downloads",
+        ]);
+        match gc.command {
+            CacheCommand::Gc(CacheGc {
+                json: true,
+                downloads: true,
+                cache_dir: Some(cache_dir),
+            }) => assert_eq!(cache_dir, PathBuf::from("/downloads")),
+            other => panic!("unexpected gc command: {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["flare", "models", "gc", "--cache-dir", "/downloads"]).is_err(),
+            "download cache selection requires --downloads"
+        );
     }
 }

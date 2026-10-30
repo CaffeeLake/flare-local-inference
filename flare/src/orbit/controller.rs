@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use flare_helios::package::progress::{self, Rate};
 use flare_helios::runtime_package::{self, AuthorizedPackage, Publisher};
 use flare_helios::startup::StartupProgress;
 use serde::Deserialize;
@@ -306,6 +307,147 @@ fn download_request(
         access_token,
         profiles,
     })
+}
+
+/// One node's live DOWNLOAD row. On a terminal it redraws in place; redirected
+/// output prints one line at a time, matching the acquisition's own cadence.
+struct DownloadLine {
+    node: String,
+    tty: bool,
+    started: Instant,
+    rate: Rate,
+    last: u64,
+    total: Option<u64>,
+    storage: Option<StorageEstimate>,
+    drawn: bool,
+    logged: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StorageEstimate {
+    /// `None` when the node reports the value as unknown.
+    transport_free: Option<u64>,
+    model_cache_free: Option<u64>,
+}
+
+fn storage_estimate(value: &Value) -> Option<StorageEstimate> {
+    let storage = value.get("storage")?;
+    Some(StorageEstimate {
+        transport_free: storage.get("transport_free").and_then(Value::as_u64),
+        model_cache_free: storage.get("model_cache_free").and_then(Value::as_u64),
+    })
+}
+
+fn download_row(
+    node: &str,
+    downloaded: u64,
+    verified: u64,
+    total: Option<u64>,
+    rate: f64,
+) -> String {
+    let mut body = if downloaded > 0 {
+        progress::format_progress(downloaded, total, Some(rate))
+    } else {
+        progress::format_bytes(verified)
+    };
+    if downloaded > 0 && verified > 0 {
+        body.push_str(&format!("  verified {}", progress::format_bytes(verified)));
+    }
+    format!("{node}: {body}")
+}
+
+impl DownloadLine {
+    fn new(node: &str) -> Self {
+        let tty =
+            io::stderr().is_terminal() && !std::env::var("TERM").is_ok_and(|term| term == "dumb");
+        Self {
+            node: node.to_owned(),
+            tty,
+            started: Instant::now(),
+            rate: Rate::start(0),
+            last: 0,
+            total: None,
+            storage: None,
+            drawn: false,
+            logged: None,
+        }
+    }
+
+    fn update(&mut self, body: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return;
+        };
+        let Some(downloaded) = value["downloaded"].as_u64() else {
+            return;
+        };
+        let verified = value["verified"].as_u64().unwrap_or(0);
+        self.last = downloaded;
+        self.total = value["total"].as_u64();
+        if let Some(storage) = storage_estimate(&value) {
+            self.storage = Some(storage);
+        }
+        let rate = self.rate.bytes_per_second(downloaded);
+        let line = download_row(&self.node, downloaded, verified, self.total, rate);
+        if self.tty {
+            let mut stderr = io::stderr().lock();
+            let _ = write!(stderr, "\r\x1b[2K{line}");
+            let _ = stderr.flush();
+            self.drawn = true;
+        } else if self
+            .logged
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
+            eprintln!("{line}");
+            self.logged = Some(Instant::now());
+        }
+    }
+
+    /// Finish the row. `reply` is the DOWNLOAD reply when the request succeeded,
+    /// so final counters can replace the last observed sample.
+    fn finish(&mut self, reply: Option<&Value>) {
+        if reply.is_none() && !self.drawn && self.logged.is_none() {
+            return;
+        }
+        let downloaded = reply
+            .and_then(|reply| reply["downloaded"].as_u64())
+            .unwrap_or(self.last);
+        let verified = reply.and_then(|reply| reply["verified"].as_u64());
+        if let Some(storage) = reply.and_then(storage_estimate) {
+            self.storage = Some(storage);
+        }
+        let state = if reply.is_some() {
+            "downloaded"
+        } else {
+            "download stopped after"
+        };
+        let mut text = format!(
+            "{}: {state} {}",
+            self.node,
+            progress::format_bytes(downloaded)
+        );
+        if let Some(verified) = verified.filter(|verified| *verified > 0) {
+            text.push_str(&format!(", verified {}", progress::format_bytes(verified)));
+        }
+        text.push_str(&format!(" in {:.1}s", self.started.elapsed().as_secs_f64()));
+        if let Some(storage) = self.storage {
+            let free = |bytes: Option<u64>| match bytes {
+                Some(bytes) => progress::format_bytes(bytes),
+                None => "unknown".to_owned(),
+            };
+            text.push_str(&format!(
+                "; storage advisory: transport {} free, model cache {} free",
+                free(storage.transport_free),
+                free(storage.model_cache_free)
+            ));
+        }
+        if self.tty && self.drawn {
+            let mut stderr = io::stderr().lock();
+            let _ = write!(stderr, "\r\x1b[2K{text}\n");
+            let _ = stderr.flush();
+        } else {
+            eprintln!("{text}");
+        }
+    }
 }
 
 pub struct Controller(crate::agent_client::Client);
@@ -942,12 +1084,29 @@ impl Controller {
             "{}: resolving and downloading {source} at revision {revision}",
             node.name
         );
-        let (mut session, _) = self.node_session(node)?;
-        let reply: Value = serde_json::from_slice(
-            &session
-                .request(frame::DOWNLOAD, &serde_json::to_value(request)?)
-                .map_err(|e| at(&node.name, e))?,
-        )?;
+        let (mut session, hello) = self.node_session(node)?;
+        let request = serde_json::to_value(request)?;
+        let reply = if hello.download_progress {
+            let mut line = DownloadLine::new(&node.name);
+            let result = session
+                .request_with_progress(
+                    frame::DOWNLOAD,
+                    &request,
+                    frame::DOWNLOAD_PROGRESS,
+                    |body| line.update(body),
+                )
+                .map_err(|e| at(&node.name, e));
+            let parsed: Result<Value, Failure> =
+                result.and_then(|body| Ok(serde_json::from_slice(&body)?));
+            line.finish(parsed.as_ref().ok());
+            parsed?
+        } else {
+            serde_json::from_slice(
+                &session
+                    .request(frame::DOWNLOAD, &request)
+                    .map_err(|e| at(&node.name, e))?,
+            )?
+        };
         let path = reply["path"]
             .as_str()
             .ok_or("DOWNLOAD reply lacks a path")?;
@@ -2429,6 +2588,60 @@ mod tests {
     use super::*;
     use crate::orbit::agent::tests::{harness, pair_accept_first};
     use std::sync::Arc;
+
+    #[test]
+    fn download_rows_carry_the_node_and_honest_counters() {
+        let rate = 2.0 * (1u64 << 20) as f64;
+        let row = download_row("maxwell", 4 << 20, 0, None, rate);
+        assert_eq!(row, "maxwell: 4.0 MiB  2.0 MiB/s");
+        let row = download_row("maxwell", 4 << 20, 0, Some(8 << 20), rate);
+        assert_eq!(row, "maxwell: 4.0 / 8.0 MiB  2.0 MiB/s  ETA 2s");
+        let row = download_row("hertz", 0, 1 << 20, None, 0.0);
+        assert_eq!(row, "hertz: 1.0 MiB");
+        let row = download_row("maxwell", 8 << 20, 8 << 20, Some(8 << 20), rate);
+        assert_eq!(row, "maxwell: 8.0 / 8.0 MiB  2.0 MiB/s  verified 8.0 MiB");
+    }
+
+    #[test]
+    fn download_storage_advisory_keeps_unknown_values_distinct() {
+        let storage = json!({
+            "storage": {"transport_free": 3u64 << 30, "model_cache_free": 5u64 << 30}
+        });
+        assert_eq!(
+            storage_estimate(&storage),
+            Some(StorageEstimate {
+                transport_free: Some(3u64 << 30),
+                model_cache_free: Some(5u64 << 30),
+            })
+        );
+        assert_eq!(
+            storage_estimate(&json!({"storage": {"transport_free": 1, "model_cache_free": null}})),
+            Some(StorageEstimate {
+                transport_free: Some(1),
+                model_cache_free: None,
+            })
+        );
+        assert_eq!(storage_estimate(&json!({})), None);
+    }
+
+    #[test]
+    fn staging_rejects_more_bytes_than_the_node_reports_free() {
+        let status = NodeStatus {
+            fingerprint: String::new(),
+            free_bytes: 2 << 30,
+            controllers_revision: 0,
+            group: None,
+            groups: Vec::new(),
+            gpus: Vec::new(),
+            gpus_error: None,
+            packages: Vec::new(),
+            address_toward: None,
+        };
+        assert!(check_space(&status, 2 << 30).is_ok());
+        let error = check_space(&status, 3 << 30).unwrap_err().to_string();
+        assert!(error.contains("2.0 GiB free"), "{error}");
+        assert!(error.contains("stores 3.0 GiB"), "{error}");
+    }
 
     #[test]
     fn download_requests_carry_public_profiles_not_controller_paths() {

@@ -54,6 +54,8 @@ pub mod frame {
     pub const DOWNLOAD: u8 = 20;
     pub const FABRIC: u8 = 21;
     pub const FETCH_FABRIC: u8 = 22;
+    /// Live DOWNLOAD progress from a node that negotiated `download_progress`.
+    pub const DOWNLOAD_PROGRESS: u8 = 23;
 }
 
 pub fn hex(bytes: &[u8]) -> String {

@@ -969,6 +969,7 @@ dependencies = [
  "clap",
  "flare-helios",
  "hf-hub 0.5.0",
+ "httpdate",
  "libc",
  "libloading",
  "prost",
@@ -980,6 +981,7 @@ dependencies = [
  "tempfile",
  "toml",
  "ureq 3.4.2",
+ "url",
  "windows-sys 0.61.2",
 ]
 

@@ -734,25 +734,78 @@ Both commands accept these download options:
 |---|---|---|
 | `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
-| `--cache-dir PATH` | Parent for temporary prepared-package transport staging | Flare model cache |
+| `--cache-dir PATH` | Parent for the shared Hugging Face download transport cache | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
 | `--offline` | Resolve prepared packages only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local package path | Off |
 | `--model-cache PATH` | Flare prepared-model cache directory | `paths.package_cache`, otherwise `~/.cache/flare/packages` |
 
-Online acquisition uses Hugging Face's `refs`, `snapshots`, and `blobs` as a
-transport cache, then installs the selected prepared deployments in the Flare
-model cache. Snapshot symlinks are resolved through temporary acquisition trees
-under the Flare cache, using hardlinks or cross-filesystem copies. The returned
-package is a leased Flare cache entry.
+Online acquisition uses the shared Hugging Face transport tree described under
+[download cache](#download-cache), then installs the selected prepared
+deployments in the Flare model cache. Repository snapshots are hardlinks into the
+shared blob store, so resolved package files are directly readable and identical
+bytes are stored once. The returned package is a leased Flare cache entry.
 
 When a file is absent from a snapshot, Flare checks its Hub ETag and size against
-the repository's blob cache. An existing blob is hardlinked into the snapshot
-without downloading its body. Identical files therefore share disk storage across
-revisions of the same repository. Concurrent Flare downloads serialize the blob
-lookup and transfer to preserve that sharing. Reuse operates on complete files;
-downloads use resumable HTTP transfers through `hf-hub`, without Xet chunk
-reconstruction. A cached blob with an unexpected size or file type reports an
-error. Package signature verification still occurs when serving.
+the blob namespace for that endpoint and repository. An existing blob is
+hardlinked into the snapshot without downloading its body, so revisions of one
+repository share disk storage. Concurrent Flare downloads serialize the content
+lookup and transfer on the content's lock file to preserve that sharing.
+
+Transfers resume a partial file with an open-ended HTTP range request and accept
+only a response that describes exactly the bytes it appends: a `206` with
+`Content-Range` starting at the saved offset and naming the file's declared
+length, or a `200` carrying the complete body for an empty partial. A response
+that cannot be appended reports the retained offset instead of replacing the
+saved bytes. Each body response has a five-minute deadline; a deadline that
+interrupts received bytes resumes from the new offset, and a transfer stops after
+five consecutive attempts that add nothing. Revision resolution and file
+identity requests use the same bounded backoff; authentication, missing
+repository or file, and malformed-response failures are returned immediately.
+A file's identity is taken from the repository response and never from a content
+host, so a CDN ETag cannot change the cache identity. Redirect targets are
+resolved with standard URL reference resolution, followed only for `http` or
+`https` without embedded credentials, at most six hops, and the access token is
+sent only to the original scheme, host, and port.
+Retries use bounded exponential backoff from 250 ms up to 10 s, extended to the
+pause a `429` or `503` names in `Retry-After`, in either delta-seconds or
+HTTP-date form, up to 60 s. A streaming response syncs its partial every 64 MiB or
+five seconds. When the Hub ETag carries a SHA-256, the appended content is
+verified against it; mismatched content is quarantined beside the partial and the
+source is retried once before the acquisition fails. Content already retained in
+the transport is hashed against the ETag's stated SHA-256 before it is reused; a
+mismatch quarantines that file and downloads it again. An opaque ETag cannot
+certify retained bytes, so signed package verification remains the authority: if
+it fails, every transport byte is left intact and the error names the transport
+root and how to inspect and reclaim it. Once the remote file set is
+known, acquisition prints one advisory stderr line with the free space of the
+transport parent and the model cache and the known remaining transfer size. A
+filesystem whose free space cannot be queried prints `unknown`, which is distinct
+from zero. Estimates never reject an acquisition.
+A cached blob with an unexpected size or file type reports an error. Reuse
+operates on complete files, without Xet chunk reconstruction. Package signature
+verification still occurs when serving.
+
+A complete package file already present in the user Hugging Face cache is reused
+without a transfer. The cache is `[paths].hub_cache` when configured and
+`~/.cache/huggingface/hub` otherwise. Only the pinned commit's snapshot entry
+qualifies: it must have the size the Hub reports and hash to the identity its
+ETag states, which is the LFS SHA-256 (bare or `sha256:`-prefixed) for large files
+and the Git blob identity for repository files tracked by Git; the verified bytes
+are copied into the transport as an ordinary blob, so repository snapshots,
+`models downloads`, and `gc --downloads` behave exactly as for a downloaded file.
+Flare never creates, renames, links, locks, or changes permissions under the user
+cache, and an abandoned copy is removed from the transport tree. A file with an opaque ETag or mismatched size or
+identity is skipped with a warning and downloaded from the authoritative source.
+`--offline` resolves Flare model-cache entries
+only: it returns before a transport exists and never reads the user cache.
+
+The download row's fraction and ETA describe only bytes the network must still
+deliver: completed blobs, saved resume prefixes, certified user-cache files, and
+content shared by several paths count once. While any of those could still be
+rejected and fetched instead — an unvalidated user-cache file, a content blob
+whose stated SHA-256 has not been checked, or one identity naming two lengths —
+the row shows transferred bytes and rate without a fraction or ETA, and a
+completed acquisition reports the bytes it actually pulled as its total.
 
 `flare run MODEL` leases the selected local default first. Locally exported
 versions have no download origin and do not trigger repository lookup. A
@@ -987,7 +1040,8 @@ Configured concurrency must fit the package's prepared capacities.
 `[publishing]`, `[preparation]`, `defaults.model`, image concurrency, speculative
 graph preparation settings, and the checkpoint, kernel, staging, and toolkit paths
 remain preparation settings. `flare run` requires a package; it does not interpret
-an Ignition recipe alias as a prepared package. `paths.hub_cache` does not select
+an Ignition recipe alias as a prepared package. `paths.hub_cache` selects only
+the user Hugging Face cache that acquisition reads read-only; it does not select
 prepared-package transport staging or the model cache.
 
 Each Orbit node reads its own host configuration when its rank starts; saved group
@@ -1442,7 +1496,8 @@ flare models inspect PACKAGE|MODEL[@VERSION] [inspection flags]
 flare models download REPOSITORY [download flags]
 flare models select MODEL@VERSION
 flare models remove MODEL@VERSION [--clear-default]
-flare models gc [--json]
+flare models downloads [--cache-dir PATH] [--json]
+flare models gc [--json] [--downloads [--cache-dir PATH]]
 ```
 
 `flare models download` is an alias for `flare download`, with identical flags,
@@ -1458,6 +1513,142 @@ not evict published entries, selected refs, or leased objects. A failed export
 leaves only an abandoned staging tree, which `gc` reclaims; an entry that was
 already published under `models/` is removed only by `models remove`. There is no
 automatic reclamation of published entries.
+
+An unlocked staging tree that holds recognizable Hugging Face transport data is
+a resumable download partial, not abandoned export work. `gc` preserves it and
+reports the count as `preserved_transport_trees`; `gc --downloads` is the only
+reclamation path for those trees. Recognition requires a top-level directory
+named `models--*`, `datasets--*`, or `spaces--*` that contains a `blobs`
+directory, which is the layout older Flare releases used for download staging.
+
+### Download cache
+
+`flare models downloads` inspects the Hugging Face transport cache without
+modifying it. `--cache-dir PATH` selects the download parent and defaults to the
+model storage directory; it does not change the model cache. The transport root
+is `<parent>/transport/hub/v1`:
+
+```text
+<parent>/transport/hub/v1/
+  version                                                "flare-hub-transport 1\n"
+  acquisition.lock                                       shared acquisition/exclusive reclamation lease
+  blobs/<scope>/<key>                                    complete, content-addressed file
+  blobs/<scope>/<key>.part                               resumable partial file
+  blobs/<scope>/<key>.lock                               per-content transfer lock inode
+  blobs/<scope>/.<key>.part.corrupt-<pid>-<n>            quarantined suspect bytes
+  blobs/<scope>/.<key>.adopt-<pid>-<n>                   transient adoption copy
+  repos/<scope>/<folder>/refs/<revision>                 commit text; informational
+  repos/<scope>/<folder>/snapshots/<commit>/<path>       hardlink to blobs/<scope>/<key>
+  repos/<scope>/<folder>/installed/<commit>              deferred cleanup marker
+```
+
+`acquisition.lock` is a stable inode. An acquisition holds it shared for its
+whole lifetime; `gc --downloads` holds it exclusively and non-blockingly for the
+entire new-root pass. `<scope>` is the lowercase SHA-256 hex of the endpoint, a
+NUL byte, and the Hugging Face repository folder. Content is shared across revisions of one
+endpoint and repository but not across repositories, because Hub ETags are
+repository-local. `<folder>` is the repository folder such as
+`models--ORG--NAME`. `<key>` is a lossless file name for the Hub ETag: `_` becomes `_5F`, `.`
+becomes `_2E`, and every other byte outside `[A-Za-z0-9-]` becomes `_XX`; `/`,
+`\`, and NUL are rejected before encoding. For example `sha256:<hex>` becomes
+`sha256_3A<hex>`. The alphabet excludes `.`, so keys cannot collide with the
+`.part`, `.lock`, `.corrupt-*`, or `.adopt-*` suffixes. Complete files are
+content-verified before publication; `.part` files hold resumable bytes and are
+renamed into place after a successful transfer.
+Quarantined files retain suspect bytes from a rejected response without
+truncating them. `.<key>.adopt-<pid>-<n>` is a transient copy used while
+adopting read-only Hugging Face cache content; it exists only while `<key>.lock`
+is held, and a crash can leave one behind.
+
+Older releases created transport trees as `.flare-hub-staging-*` directories
+under `--cache-dir` and under the model cache's `staging/trees`. Those trees use
+the Hugging Face layout directly: top-level `models--*` folders containing
+`blobs/<etag>`, `<etag>.part`, and `<etag>.lock`, with optional `refs` and
+`snapshots`. They have no version marker. The command reports them separately
+from the shared root.
+
+Inspection reports the marker state (`valid`, `missing`, or `foreign`), whether
+an acquisition lease is held, complete, partial, and quarantined file counts and apparent byte totals, active transfer
+counts, per-scope totals, repository refs and snapshots, and apparent bytes of
+unique inodes retained below the root. `--json` prints one document with
+`parent`, `transport`, and `legacy` objects. `transport` contains `root`,
+`present`, `marker`, `acquisition_active`, aggregate `blobs`, `scopes`,
+`repositories`, and `retained_bytes`. Each scope reports its `scope`, `blobs`, and
+`retained_bytes`. A blob summary contains `complete_files`, `complete_bytes`,
+`partial_files`, `partial_bytes`, `quarantined_files`, `quarantined_bytes`,
+`adopted_files`, `adopted_bytes`, `lock_files`, `unknown_files`,
+`active_files`, and `active_bytes`. Each
+repository reports its `scope`, `folder`, `refs` with `revision` and parsed
+`commit`, and `snapshots` with `commit`, `files`, and `bytes`. `legacy` contains
+`trees`, `complete_bytes`, `partial_bytes`, and `active_trees`; each tree reports
+`path`, `kind` (`cache_staging` or `explicit_staging`), `active`, and its
+complete, partial, and unknown file counts. Snapshot bytes are apparent sizes of
+hardlinks, so they duplicate blob bytes rather than adding disk usage. A missing
+or foreign marker is reported but never reclaimed.
+
+A successful installation reclaims its own transport copies. After the
+acquisition releases its shared lease, it removes the resolved commit's snapshot
+entries and each complete blob whose last hardlink they held. Blobs still
+referenced by another commit, failed `.part` files, quarantined files, unknown
+files, and lock inodes remain. Cleanup takes the exclusive acquisition lease. If
+another acquisition is active, it records the installed commit under
+`repos/<scope>/<folder>/installed/` and removes nothing; the next successful
+cleanup processes every recorded commit for that repository, and an explicit
+`gc --downloads` removes the records with the rest of the repository metadata.
+A cleanup failure is reported but does not undo the installed package.
+
+`gc --downloads` reclaims the shared root and legacy trees in addition to the
+ordinary model-cache pass. `--cache-dir` requires `--downloads`. It acquires the
+transport's exclusive acquisition lease before touching repository metadata or
+blobs; when any acquisition holds the lease shared, the whole new-root pass is
+skipped and reported as active. Reclamation:
+
+- Never removes the transport root, its `version` marker, `acquisition.lock`,
+  any scope directory, or any `blobs/<scope>/<key>.lock` inode.
+- Acquires each content's lock exclusively and non-blockingly before removing
+  its complete `<key>`, `<key>.part`, quarantined file, or transient adoption
+  copy. A held lock marks the file active and preserves it.
+- Removes `repos/<scope>/<folder>` refs, snapshots, and deferred-cleanup
+  records as disposable metadata.
+  Snapshot entries are hardlinks, so removing them does not free blob bytes
+  until the blob file itself is removed under its lock.
+- Leaves unknown file names, foreign markers, and missing roots untouched.
+- Reclaims a legacy `staging/trees/<txn>` tree only when the cache's
+  `locks/staging/<txn>.lock` lease and every `<etag>.lock` or
+  `<etag>.flare.lock` inside the tree are free.
+- Preserves a legacy tree containing a file outside `blobs/`, `refs/`, and
+  `snapshots/` rather than deleting data this command does not recognize.
+- Holds the cache staging lease and every transfer lock in a legacy
+  `staging/trees` tree until its deletion finishes. A cache staging tree with a
+  live lease or transfer lock is preserved as active.
+- Never removes a `.flare-hub-staging-*` directory. These directories have no
+  operation lease, so an old writer could start a new transfer after any
+  per-file lock check; safe inactivity cannot be established. They are reported
+  as unverified legacy staging.
+
+`gc --json` adds `preserved_transport_trees` to the ordinary result and, with
+`--downloads`, a `downloads` object containing `present`, `marker`,
+`acquisition_active`, `repository_refs`, `snapshot_files`, `complete_files`, `complete_bytes`,
+`partial_files`, `partial_bytes`, `active_files`, `active_bytes`,
+`quarantined_files`, `quarantined_bytes`, `adopted_files`, `adopted_bytes`,
+`retained`, `legacy_trees`,
+`legacy_bytes`, `legacy_active`, `legacy_unknown_trees`, `legacy_unverified`,
+and `retained_bytes`. Each `retained` entry reports `scope`, `retained_bytes`,
+`active_files`, and `active_bytes`.
+
+Inspection is a read-only snapshot: a transfer that starts after a missing lock
+is observed can make an inactive-looking file active. Reclamation and
+post-install cleanup exclude acquisitions through the shared/exclusive transport
+lease, so snapshot paths remain present for as long as an acquisition holds its
+lease. Successful installation removes only consumed copies that no other
+snapshot references; `gc --downloads` remains the explicit path that removes
+failed partials and other unused transport content. Explicit `.flare-hub-staging-*`
+directories remain permanently unreclaimable by this command because they carry
+no lease that establishes inactivity. On platforms without inode identity,
+`retained_bytes` counts each hardlinked path separately and post-install
+cleanup cannot attribute consumed hardlinks, so those copies remain until an
+explicit `gc --downloads`. An interrupted post-install cleanup can likewise
+leave complete blobs without snapshot links; `gc --downloads` reclaims them.
 
 Human-readable output groups versions by model, marks the selected default and
 entries in use, and formats storage sizes in binary units and capacities with

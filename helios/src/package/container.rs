@@ -175,6 +175,14 @@ impl Slice {
     }
     /// Hashes the exact stored payload bytes, excluding any container framing.
     pub fn digest(&self) -> Result<PayloadId> {
+        self.digest_with(None)
+    }
+    /// Hashes the stored payload bytes, recording each read as verification
+    /// work so a long payload reports progress while it is being checked.
+    pub fn digest_with(
+        &self,
+        progress: Option<&crate::package::progress::AcquisitionProgress>,
+    ) -> Result<PayloadId> {
         let mut context = digest::Context::new(&digest::SHA256);
         let mut buffer = vec![0u8; IO_CHUNK];
         let mut offset = 0;
@@ -182,6 +190,9 @@ impl Slice {
             let count = (self.length - offset).min(buffer.len() as u64) as usize;
             self.read_at(offset, &mut buffer[..count])?;
             context.update(&buffer[..count]);
+            if let Some(progress) = progress {
+                progress.record_verification_bytes(count as u64);
+            }
             offset += count as u64;
         }
         Ok(PayloadId::from_digest(context.finish()))

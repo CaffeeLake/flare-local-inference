@@ -8,20 +8,20 @@ use std::{
 use flare_helios::package::cache::{self, Root};
 
 use crate::cache_support::resolve_model;
+use crate::download_cache::{self, Inspection, Reclaimed};
 use crate::inspect::{Canvas, bytes, text, thousands};
 use serde_json::Value;
 
 use crate::cli::{
-    CacheArgs, CacheCommand, CacheGc, CacheList, CacheRemove, CacheSpec,
+    CacheArgs, CacheCommand, CacheDownloads, CacheGc, CacheList, CacheRemove, CacheSpec,
 };
 
 pub fn run(args: CacheArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let root = || -> Result<Root, Box<dyn std::error::Error>> {
-        Ok(Root::open(
-            crate::cache_support::model_root(args.model_cache.as_deref())
-                .map_err(|error| error.to_string())?,
-        )?)
+    let model_root = || -> Result<PathBuf, Box<dyn std::error::Error>> {
+        crate::cache_support::model_root(args.model_cache.as_deref())
+            .map_err(|error| error.to_string().into())
     };
+    let root = || -> Result<Root, Box<dyn std::error::Error>> { Ok(Root::open(model_root()?)?) };
     match args.command {
         CacheCommand::List(list) => list_entries(&root()?, list, args.plain),
         CacheCommand::Inspect(mut inspect) => {
@@ -29,10 +29,26 @@ pub fn run(args: CacheArgs) -> Result<(), Box<dyn std::error::Error>> {
             crate::inspect::run(inspect)
         }
         CacheCommand::Download(download) => crate::hub::run_download(download),
+        CacheCommand::Downloads(downloads) => show_downloads(&model_root()?, downloads, args.plain),
         CacheCommand::Select(spec) => select(&root()?, spec, args.plain),
         CacheCommand::Remove(remove) => remove_entry(&root()?, remove, args.plain),
         CacheCommand::Gc(gc) => collect(&root()?, gc, args.plain),
     }
+}
+
+fn show_downloads(
+    model_root: &Path,
+    downloads: CacheDownloads,
+    plain: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = downloads.cache_dir.as_deref().unwrap_or(model_root);
+    let inspection = download_cache::inspect(parent, model_root)?;
+    if downloads.json {
+        println!("{}", serde_json::to_string_pretty(&inspection)?);
+    } else {
+        print!("{}", render_downloads(&inspection, plain));
+    }
+    Ok(())
 }
 
 fn split(spec: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -336,27 +352,306 @@ fn remove_entry(root: &Root, remove: CacheRemove, plain: bool) -> Result<(), Box
 
 fn collect(root: &Root, gc: CacheGc, plain: bool) -> Result<(), Box<dyn std::error::Error>> {
     let collected = root.collect()?;
+    let parent = gc.cache_dir.as_deref().unwrap_or(root.path());
+    let reclaimed = if gc.downloads {
+        Some(download_cache::reclaim(parent, root.path())?)
+    } else {
+        None
+    };
     if gc.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "staging_trees": collected.staging,
-                "payload_objects": collected.objects,
-                "legacy_containers": collected.legacy,
-            })
-        );
+        let mut document = serde_json::json!({
+            "staging_trees": collected.staging,
+            "payload_objects": collected.objects,
+            "legacy_containers": collected.legacy,
+            "preserved_transport_trees": collected.preserved_transport,
+        });
+        if let Some(reclaimed) = &reclaimed {
+            document["downloads"] = serde_json::to_value(reclaimed)?;
+        }
+        println!("{document}");
     } else {
         let mut output = Canvas::terminal(plain);
         output.heading("Unused model storage freed");
         output.row("Temporary directories", &thousands(collected.staging as u64));
         output.row("Model files", &thousands(collected.objects as u64));
         output.row("Legacy model files", &thousands(collected.legacy as u64));
-        if collected.staging == 0 && collected.objects == 0 && collected.legacy == 0 {
+        if collected.preserved_transport > 0 && !gc.downloads {
+            output.row(
+                "Preserved downloads",
+                &format!(
+                    "{} legacy staging {}; use flare models gc --downloads",
+                    thousands(collected.preserved_transport as u64),
+                    if collected.preserved_transport == 1 { "tree" } else { "trees" }
+                ),
+            );
+        }
+        if let Some(reclaimed) = &reclaimed {
+            render_reclaimed(reclaimed, &mut output);
+        }
+        if collected.staging == 0
+            && collected.objects == 0
+            && collected.legacy == 0
+            && reclaimed
+                .as_ref()
+                .is_none_or(|reclaimed| {
+                    reclaimed.complete_files == 0
+                        && reclaimed.partial_files == 0
+                        && reclaimed.repository_refs == 0
+                        && reclaimed.snapshot_files == 0
+                        && reclaimed.legacy_trees == 0
+                })
+        {
             output.note("Nothing to reclaim.");
         }
         print!("{}", output.finish());
     }
     Ok(())
+}
+
+fn render_downloads(inspection: &Inspection, plain: bool) -> String {
+    let transport = &inspection.transport;
+    let mut output = Canvas::terminal(plain);
+    output.heading("Download cache");
+    output.row("Storage", &transport.root);
+    if !transport.present {
+        output.row("Transport", "no shared transport root");
+    } else if transport.marker == "valid" {
+        output.row(
+            "Transport",
+            &format!(
+                "shared root · version 1 · {} retained",
+                bytes(transport.retained_bytes)
+            ),
+        );
+    } else {
+        output.row(
+            "Transport",
+            &format!("{} marker · not managed by this command", transport.marker),
+        );
+    }
+    if transport.present {
+        output.row(
+            "Acquisition lease",
+            if transport.acquisition_active {
+                "held · new-root cleanup is excluded"
+            } else {
+                "free"
+            },
+        );
+    }
+    let blobs = &transport.blobs;
+    output.row(
+        "Complete files",
+        &format!(
+            "{} · {}",
+            thousands(blobs.complete_files as u64),
+            bytes(blobs.complete_bytes)
+        ),
+    );
+    output.row(
+        "Partial files",
+        &format!(
+            "{} · {}",
+            thousands(blobs.partial_files as u64),
+            bytes(blobs.partial_bytes)
+        ),
+    );
+    output.row(
+        "Quarantined files",
+        &format!(
+            "{} · {}",
+            thousands(blobs.quarantined_files as u64),
+            bytes(blobs.quarantined_bytes)
+        ),
+    );
+    output.row(
+        "Adopted files",
+        &format!(
+            "{} · {}",
+            thousands(blobs.adopted_files as u64),
+            bytes(blobs.adopted_bytes)
+        ),
+    );
+    output.row(
+        "Active transfers",
+        &format!(
+            "{} · {}",
+            thousands(blobs.active_files as u64),
+            bytes(blobs.active_bytes)
+        ),
+    );
+    let snapshots: usize = transport
+        .repositories
+        .iter()
+        .map(|repository| repository.snapshots.len())
+        .sum();
+    let refs: usize = transport
+        .repositories
+        .iter()
+        .map(|repository| repository.refs.len())
+        .sum();
+    output.row(
+        "Repositories",
+        &format!(
+            "{} · {} ref{} · {} snapshot{}",
+            thousands(transport.repositories.len() as u64),
+            thousands(refs as u64),
+            if refs == 1 { "" } else { "s" },
+            thousands(snapshots as u64),
+            if snapshots == 1 { "" } else { "s" }
+        ),
+    );
+    for repository in &transport.repositories {
+        output.row(
+            &text(&Value::String(repository.folder.clone())),
+            &format!(
+                "scope {} · {} ref{} · {} snapshot{}",
+                repository.scope,
+                repository.refs.len(),
+                if repository.refs.len() == 1 { "" } else { "s" },
+                repository.snapshots.len(),
+                if repository.snapshots.len() == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    output.heading("Legacy download staging");
+    if inspection.legacy.trees.is_empty() {
+        output.note("No legacy Hugging Face staging trees found.");
+    } else {
+        for tree in &inspection.legacy.trees {
+            output.row(
+                &text(&Value::String(tree.path.clone())),
+                &format!(
+                    "{} · {} · complete {} / partial {}",
+                    tree.kind,
+                    if tree.active { "ACTIVE" } else { "idle" },
+                    format_args!(
+                        "{} · {}",
+                        thousands(tree.complete_files as u64),
+                        bytes(tree.complete_bytes)
+                    ),
+                    format_args!(
+                        "{} · {}",
+                        thousands(tree.partial_files as u64),
+                        bytes(tree.partial_bytes)
+                    )
+                ),
+            );
+        }
+    }
+    output.note(
+        "Blob, partial, quarantined, and adopted figures are apparent file sizes; snapshot entries share blob inodes.",
+    );
+    output.finish()
+}
+
+fn render_reclaimed(reclaimed: &Reclaimed, output: &mut Canvas) {
+    output.heading("Download cache");
+    if reclaimed.present {
+        output.row(
+            "Transport",
+            &format!(
+                "{} · {} retained",
+                reclaimed.marker,
+                bytes(reclaimed.retained_bytes)
+            ),
+        );
+    } else {
+        output.row("Transport", "no shared transport root");
+    }
+    output.row(
+        "Removed complete files",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.complete_files as u64),
+            bytes(reclaimed.complete_bytes)
+        ),
+    );
+    output.row(
+        "Removed partial files",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.partial_files as u64),
+            bytes(reclaimed.partial_bytes)
+        ),
+    );
+    output.row(
+        "Removed repository metadata",
+        &format!(
+            "{} ref{} · {} snapshot file{}",
+            thousands(reclaimed.repository_refs as u64),
+            if reclaimed.repository_refs == 1 { "" } else { "s" },
+            thousands(reclaimed.snapshot_files as u64),
+            if reclaimed.snapshot_files == 1 { "" } else { "s" }
+        ),
+    );
+    if reclaimed.acquisition_active {
+        output.row(
+            "Active acquisition",
+            "transport preserved for the whole pass",
+        );
+    }
+    output.row(
+        "Removed adopted files",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.adopted_files as u64),
+            bytes(reclaimed.adopted_bytes)
+        ),
+    );
+    output.row(
+        "Removed quarantined files",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.quarantined_files as u64),
+            bytes(reclaimed.quarantined_bytes)
+        ),
+    );
+    for scope in &reclaimed.retained {
+        output.row(
+            "Retained scope",
+            &format!(
+                "{} · {} · {} active",
+                scope.scope,
+                bytes(scope.retained_bytes),
+                thousands(scope.active_files as u64)
+            ),
+        );
+    }
+    output.row(
+        "Preserved active transfers",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.active_files as u64),
+            bytes(reclaimed.active_bytes)
+        ),
+    );
+    output.row(
+        "Removed legacy trees",
+        &format!(
+            "{} · {}",
+            thousands(reclaimed.legacy_trees as u64),
+            bytes(reclaimed.legacy_bytes)
+        ),
+    );
+    if reclaimed.legacy_active > 0 {
+        output.row(
+            "Active legacy trees",
+            &thousands(reclaimed.legacy_active as u64),
+        );
+    }
+    if reclaimed.legacy_unknown_trees > 0 {
+        output.row(
+            "Unrecognized legacy trees",
+            &thousands(reclaimed.legacy_unknown_trees as u64),
+        );
+    }
+    if reclaimed.legacy_unverified > 0 {
+        output.row(
+            "Unverified legacy trees",
+            &thousands(reclaimed.legacy_unverified as u64),
+        );
+    }
 }
 
 /// Unused on platforms without hard-linked cache entries; keeps the module portable.

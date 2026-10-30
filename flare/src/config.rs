@@ -63,6 +63,7 @@ struct PrefixCache {
 struct Paths {
     package_cache: Option<String>,
     prefix_cache: Option<String>,
+    hub_cache: Option<String>,
 }
 
 impl Configuration {
@@ -99,6 +100,11 @@ impl Configuration {
         nonempty(self.paths.package_cache.as_deref()).map(|path| expand(home, Path::new(path)))
     }
 
+    /// Hugging Face hub cache that prepared-package acquisition may borrow from.
+    pub(crate) fn hub_cache(&self, home: &Path) -> Option<PathBuf> {
+        nonempty(self.paths.hub_cache.as_deref()).map(|path| expand(home, Path::new(path)))
+    }
+
     pub(crate) fn apply(
         &self,
         cli: &mut cli::Cli,
@@ -108,6 +114,12 @@ impl Configuration {
         let cache = self
             .package_cache(home)
             .unwrap_or_else(|| home.join(".cache/flare/packages"));
+        // Resolve the acquisition Hub cache here, from the configuration this
+        // process selected, so acquisition never reloads a configuration file and
+        // `--config` keeps deciding it.
+        let hub_cache = self
+            .hub_cache(home)
+            .unwrap_or_else(|| crate::cache_support::hub_cache_default(home));
         match &mut cli.command {
             cli::Command::Run(run) => {
                 let matches = matches.subcommand_matches("run").expect("run matches");
@@ -152,9 +164,11 @@ impl Configuration {
                     .hub
                     .model_cache
                     .get_or_insert_with(|| run.package_cache.clone().unwrap_or(cache));
+                serving.hub.hub_cache = Some(hub_cache.clone());
             }
             cli::Command::Download(args) => {
                 args.hub.model_cache.get_or_insert(cache);
+                args.hub.hub_cache = Some(hub_cache.clone());
             }
             cli::Command::Inspect(args) => {
                 args.model_cache.get_or_insert(cache);
@@ -167,6 +181,7 @@ impl Configuration {
                     }
                     cli::CacheCommand::Download(download) => {
                         download.hub.model_cache.get_or_insert(cache);
+                        download.hub.hub_cache = Some(hub_cache.clone());
                     }
                     _ => {}
                 }
@@ -174,9 +189,11 @@ impl Configuration {
             cli::Command::Orbit(args) => match &mut args.command {
                 cli::OrbitCommand::Run(run) => {
                     run.serving.hub.model_cache.get_or_insert(cache);
+                    run.serving.hub.hub_cache = Some(hub_cache.clone());
                 }
                 cli::OrbitCommand::Push(push) => {
                     push.serving.hub.model_cache.get_or_insert(cache);
+                    push.serving.hub.hub_cache = Some(hub_cache.clone());
                 }
                 _ => {}
             },
@@ -553,6 +570,7 @@ namespace = "publisher"
             "[prefix_cache]\ndisk_transport='staged'",
             "[prefix_cache]\ndisk_transport='direct'",
             "[paths]\npackage_cache=12",
+            "[paths]\nhub_cache=12",
         ] {
             assert!(Configuration::parse(text).is_err(), "{text}");
         }
@@ -629,6 +647,66 @@ namespace = "publisher"
             &[],
         );
         assert_eq!(run.hub.model_cache.as_deref(), Some(Path::new("/fallback")));
+    }
+
+    #[test]
+    fn hub_cache_is_configured_expanded_or_absent() {
+        let home = Path::new("/home/test");
+        let configured = Configuration::parse("[paths]\nhub_cache = '/checkpoint-cache'").unwrap();
+        assert_eq!(
+            configured.hub_cache(home),
+            Some(PathBuf::from("/checkpoint-cache"))
+        );
+        let expanded = Configuration::parse("[paths]\nhub_cache = '~/hf'").unwrap();
+        assert_eq!(expanded.hub_cache(home), Some(home.join("hf")));
+        let blank = Configuration::parse("[paths]\nhub_cache = '  '").unwrap();
+        assert_eq!(blank.hub_cache(home), None);
+        let absent = Configuration::parse("").unwrap();
+        assert_eq!(absent.hub_cache(home), None);
+    }
+
+    #[test]
+    fn acquisition_hub_cache_comes_from_the_selected_configuration() {
+        let home = Path::new("/home/test");
+        let default = crate::cache_support::hub_cache_default(home);
+        for (text, expected) in [
+            ("[paths]\nhub_cache = '/checkpoint-cache'", PathBuf::from("/checkpoint-cache")),
+            ("[paths]\nhub_cache = '~/hf'", home.join("hf")),
+            ("", default.clone()),
+        ] {
+            let matches = cli::Cli::command()
+                .try_get_matches_from(["flare", "download", "org/model"])
+                .unwrap();
+            let mut cli = cli::Cli::from_arg_matches(&matches).unwrap();
+            Configuration::parse(text)
+                .unwrap()
+                .apply(&mut cli, &matches, home)
+                .unwrap();
+            match cli.command {
+                cli::Command::Download(args) => {
+                    assert_eq!(args.hub.hub_cache.as_deref(), Some(expected.as_path()), "{text}");
+                    // The hub cache is host-local; an Orbit request must not carry it.
+                    let wire = serde_json::to_value(&args.hub).unwrap();
+                    assert!(wire.get("hub_cache").is_none(), "{wire}");
+                }
+                _ => panic!("download command"),
+            }
+
+            let matches = cli::Cli::command()
+                .try_get_matches_from(["flare", "run", "model"])
+                .unwrap();
+            let mut cli = cli::Cli::from_arg_matches(&matches).unwrap();
+            Configuration::parse(text)
+                .unwrap()
+                .apply(&mut cli, &matches, home)
+                .unwrap();
+            match cli.command {
+                cli::Command::Run(run) => {
+                    assert_eq!(run.serving.hub.hub_cache.as_deref(), Some(expected.as_path()), "{text}")
+                }
+                _ => panic!("run command"),
+            }
+        }
     }
 
     #[test]

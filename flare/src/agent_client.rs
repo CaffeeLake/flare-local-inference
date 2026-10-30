@@ -78,6 +78,7 @@ impl Client {
             controllers_revision: self.revision()?,
             free_bytes: 0,
             executable: None,
+            download_progress: true,
         };
         let hello = exchange_hello(&mut session, &mine)?;
         if hello.kind != "node" {

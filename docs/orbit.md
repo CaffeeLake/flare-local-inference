@@ -223,7 +223,18 @@ sequenceDiagram
    and acceptance on the controller, and refreshes candidate status before
    placement. A repository's default group name is its repository name without
    the owner or revision suffix. Repository resolution can download files
-   even with `--dry-run`; no serving process starts in that mode.
+   even with `--dry-run`; no serving process starts in that mode. A controller
+   and agent that both advertise `download_progress` in HELLO stream
+   DOWNLOAD_PROGRESS frames while the node acquires the package; the controller
+   prints one node-labeled row with transferred bytes, rate, and an ETA when
+   companion metadata supplies a total, then a final downloaded and verified
+   byte count. Frames also carry advisory free space for the node's transport
+   parent and model cache; the controller reports it in the final row and never
+   rejects an acquisition from that estimate. Progress is advisory: a controller
+   that disconnects stops receiving rows, while the node continues the download
+   into its resumable transport cache. Repository acquisition uses the node
+   agent's own loaded `[paths].hub_cache`; controller hub-cache paths are never
+   sent in DOWNLOAD options.
    A local path is read directly. `NODE:PATH`
    refers to a package a node holds, from which the controller fetches the
    safetensors header, the signed index, and each companion's header into a
@@ -272,7 +283,9 @@ prints the resulting URL and does not proxy requests.
 
 The agent owns its rank process for the life of the process. A controller
 disconnecting, sleeping, or crashing does not stop a group; the agent retains
-about 64 KiB of output per rank for a later ATTACH. `flare orbit run` stops
+about 64 KiB of output per rank for a later ATTACH. A repository DOWNLOAD
+similarly continues after its controller session ends; the node keeps completed
+package data and its durable resumable transport bytes. `flare orbit run` stops
 the group on Ctrl-C; `flare orbit run --detach` returns after process startup;
 `flare orbit attach GROUP` follows retained and live output; Ctrl-C in `attach`
 detaches without stopping ranks. `flare orbit stop GROUP` stops matching running
@@ -622,7 +635,7 @@ with a message; an ERROR closes the session.
 
 | Frame | Direction | Body | Effect |
 | --- | --- | --- | --- |
-| HELLO | Both, first frame | Protocol version, public key, controller-set revision, node facts, installed executable path | Must name the key that authenticated the session; agrees on the version; a newer controller-set record follows when the sender has one |
+| HELLO | Both, first frame | Protocol version, public key, controller-set revision, node facts, installed executable path, optional `download_progress` | Must name the key that authenticated the session; agrees on the version; a newer controller-set record follows when the sender has one; `download_progress` enables live DOWNLOAD progress |
 | PAIR | Controller to node | Code proof | Authorizes the controller as described above |
 | HAVE | Controller or node to node | Kind, name, size | Whether the cache holds the entry at that size |
 | PUT | Controller to node | Kind, name, size, optional ranges, then bytes | Stores an executable or package bytes at their offsets in a sparse file of the package's length |
@@ -633,7 +646,8 @@ with a message; an ERROR closes the session.
 | FETCH_FABRIC | Node to fabric peer | Grant, source and destination ranks, rail, file name, size, ranges | Pulls directly or through signed ring endpoints; only the destination stores the bytes |
 | GET | Controller to node | Absolute path, offset, length | Streams up to 256 MiB of a node-local file, used to mirror a package's header and index |
 | STAT | Controller to node | Absolute path | The package file's size and its companions' names and sizes |
-| DOWNLOAD | Controller to node | Repository, resolved revision, filename and cache options, optional access token | Downloads a pinned package and its companions into the node's Hugging Face cache and returns its absolute path |
+| DOWNLOAD | Controller to node | Repository, resolved revision, filename and cache options, optional access token | Downloads a pinned package and its companions into the node's Hugging Face cache and returns its absolute path; a controller that negotiated progress receives DOWNLOAD_PROGRESS frames before the reply, with final transferred, total, verified, and free-space fields |
+| DOWNLOAD_PROGRESS | Node to controller | Transferred and verified byte counts, optional cumulative network total, and advisory transport and model-cache free bytes | Live progress for the DOWNLOAD in progress; advisory and absent unless both HELLO frames advertised `download_progress` |
 | RUN | Controller to node | Grant, rank, optional cached executable name, publisher profile | Starts this host's rank on the GPUs the grant's member names, beside other groups on other GPUs, then streams LOG and EXIT; an absent or null executable name selects the agent's installed Flare |
 | ATTACH | Controller to node | Group identifier, required when several groups are on the node | Streams the rank's retained output, then live output |
 | STOP | Controller to node | Group identifier, required when several groups are on the node | Sends SIGTERM to the rank |
@@ -764,11 +778,21 @@ upload executables. Updating the installed agent with `flare agent install`
 also updates the default serving executable; restarting the agent stops its
 running ranks.
 
+HELLO's optional `download_progress` flag negotiates live DOWNLOAD progress
+within protocol 6. A controller sets it only when it can consume progress
+frames; an agent sends DOWNLOAD_PROGRESS only to a controller that set it.
+Peers without the field exchange the original DOWNLOAD request and reply, and
+their protocol bytes are otherwise unchanged.
+
 ## Limitations
 
 The controller does not proxy HTTP; clients reach rank zero's host directly.
 The controller and agents must share the agent protocol version.
-Restarting an agent stops its ranks. Routing between controller and nodes uses
+DOWNLOAD progress is advisory. Its total and ETA appear once companion metadata
+supplies every remaining size; a primary-only or unresolved acquisition keeps
+the total unknown and shows bytes and rate alone. Reported free space is an
+advisory snapshot of the transport parent and model cache filesystems, not a
+rejection criterion. Restarting an agent stops its ranks. Routing between controller and nodes uses
 the addresses recorded at pairing. Orbit does not configure the RoCE fabric,
 interfaces, or firewalls. Ring package transfers select fabric IPs as described
 above; other transfers use the paired addresses. All package transfers use

@@ -112,6 +112,30 @@ pub fn lock(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Try to take the exclusive lock without waiting. Returns false when another
+/// holder owns it.
+pub fn try_lock(file: &File) -> io::Result<bool> {
+    let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut operation,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(true)
+}
+
 pub fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     let source = wide(source)?;
     let destination = wide(destination)?;

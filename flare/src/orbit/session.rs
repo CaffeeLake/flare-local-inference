@@ -488,6 +488,28 @@ impl Session {
         self.expect(frame::OK)
     }
 
+    /// Send a request and pass any `progress_tag` bodies to `progress` before
+    /// the final OK or ERROR. Used only after the peer's HELLO negotiated that
+    /// frame; a peer that did not negotiate never sends one.
+    pub fn request_with_progress(
+        &mut self,
+        tag: u8,
+        request: &serde_json::Value,
+        progress_tag: u8,
+        mut progress: impl FnMut(&[u8]),
+    ) -> Result<Vec<u8>, Failure> {
+        self.write_frame(tag, &serde_json::to_vec(request)?)?;
+        loop {
+            let (found, body) = self.read_frame()?;
+            match found {
+                frame::OK => return Ok(body),
+                frame::ERROR => return Err(String::from_utf8_lossy(&body).into_owned().into()),
+                found if found == progress_tag => progress(&body),
+                found => return Err(format!("unexpected frame {found}").into()),
+            }
+        }
+    }
+
     pub fn ok(&mut self, body: &[u8]) -> Result<(), Failure> {
         self.write_frame(frame::OK, body)
     }
@@ -612,6 +634,34 @@ mod tests {
         client.write_frame(frame::EXIT, &[1, 2, 3]).unwrap();
         assert_eq!(server.read_frame().unwrap(), (frame::EXIT, vec![1, 2, 3]));
         assert!(server.read_body(FRAME_LIMIT + 1, FRAME_LIMIT).is_err());
+    }
+
+    #[test]
+    fn a_request_can_consume_progress_before_its_reply() {
+        let (mut client, mut server) = pair();
+        let writer = thread::spawn(move || {
+            let (tag, _) = server.read_header().unwrap();
+            assert_eq!(tag, frame::DOWNLOAD);
+            server
+                .write_frame(frame::DOWNLOAD_PROGRESS, b"one")
+                .unwrap();
+            server
+                .write_frame(frame::DOWNLOAD_PROGRESS, b"two")
+                .unwrap();
+            server.write_frame(frame::OK, b"done").unwrap();
+        });
+        let mut seen = Vec::new();
+        let reply = client
+            .request_with_progress(
+                frame::DOWNLOAD,
+                &serde_json::json!({}),
+                frame::DOWNLOAD_PROGRESS,
+                |body| seen.push(String::from_utf8(body.to_vec()).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(reply, b"done");
+        assert_eq!(seen, ["one", "two"]);
+        writer.join().unwrap();
     }
 
     #[test]

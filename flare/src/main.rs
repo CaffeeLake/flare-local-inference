@@ -7,6 +7,7 @@ mod cache_support;
 mod cli;
 mod cluster;
 mod config;
+mod download_cache;
 #[cfg(unix)]
 mod distribution;
 mod environment;
@@ -90,6 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &agent_args.listen,
                     orbit::store::AgentDir::new(orbit::store::AgentDir::default_root()),
                     orbit::cache::default_root(),
+                    configuration
+                        .hub_cache(&home)
+                        .unwrap_or_else(|| cache_support::hub_cache_default(&home)),
                 ),
                 Some(cli::AgentCommand::Install {
                     join_code,

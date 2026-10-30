@@ -524,9 +524,8 @@ impl AcquisitionPlan<'_> {
                 if tensor.len() != length {
                     return Err("relocated embedded asset has the wrong payload length".into());
                 }
-                let digest = tensor.digest()?;
+                let digest = tensor.digest_with(self.progress.as_ref())?;
                 if let Some(progress) = &self.progress {
-                    progress.record_verification_bytes(tensor.len());
                     progress.record_local_source_bytes(tensor.len());
                 }
                 if digest
@@ -825,9 +824,8 @@ impl Root {
             };
             if let Ok(Some(object)) = self.payload(identity) {
                 let compared = object.length() == length;
-                let valid = validate_hit(&object, identity, length).is_ok();
+                let valid = validate_hit(&object, identity, length, progress.as_ref()).is_ok();
                 if compared && let Some(progress) = &progress {
-                    progress.record_verification_bytes(length);
                     progress.record_local_source_bytes(length);
                 }
                 if valid {
@@ -1257,11 +1255,14 @@ impl Root {
                 return Err("materialized target has the wrong length".into());
             }
             let file = File::open(&target).map_err(failure)?;
-            let object = self.insert_payload(identity, derivation.length, file)?;
-            if let Some(progress) = &progress {
-                progress.record_local_source_bytes(derivation.length);
-                progress.record_verification_bytes(derivation.length);
-            }
+            let object = self.insert_payload(
+                identity,
+                derivation.length,
+                ProgressReader {
+                    inner: file,
+                    progress: progress.clone(),
+                },
+            )?;
             let companion = format!("weights/tuned/{deployment}/derived-{:03}.safetensors", ordinal - 1);
             fs::remove_file(&target).map_err(failure)?;
             staging.link(&object, &companion)?;
@@ -1356,7 +1357,7 @@ impl Root {
         source: impl Read,
     ) -> Result<PayloadObject> {
         if let Some(object) = self.payload(declared)? {
-            validate_hit(&object, declared, length)?;
+            validate_hit(&object, declared, length, None)?;
             verify_stream(declared, length, source)?;
             return Ok(object);
         }
@@ -1376,7 +1377,7 @@ impl Root {
         let (transaction, staged, id) = self.stage_payload(length, source)?;
         if let Some(object) = self.payload(id)? {
             let _ = fs::remove_file(&staged);
-            validate_hit(&object, id, length)?;
+            validate_hit(&object, id, length, None)?;
             return Ok(object);
         }
         self.publish_payload(&transaction, &staged, id, length)
@@ -1501,7 +1502,7 @@ impl Root {
             if object.length() != slice.len() {
                 return Err(format!("cached object {id} has a different length").into());
             }
-            verify_slice(object.slice(), id)?;
+            verify_slice(object.slice(), id, None)?;
             return Ok(object);
         }
         let transaction = Transaction::begin(self)?;
@@ -1545,11 +1546,7 @@ impl Root {
         }
         match self.payload(declared) {
             Ok(Some(object)) => {
-                let compared = object.length() == length;
-                let valid = validate_hit(&object, declared, length).is_ok();
-                if compared && let Some(progress) = progress {
-                    progress.record_verification_bytes(length);
-                }
+                let valid = validate_hit(&object, declared, length, progress).is_ok();
                 if valid {
                     return Ok(Some((object, false)));
                 }
@@ -1735,6 +1732,17 @@ impl Root {
     /// recorded companion path (or its derived path) with the signed length and
     /// digest; existence alone never satisfies a warm hit.
     pub fn verify_ready(&self, entry: &Entry, source: &PackageSource<'_>) -> Result<()> {
+        self.verify_ready_with(entry, source, None)
+    }
+
+    /// Verify an existing entry, recording each hashed payload as verification
+    /// progress for the acquisition that requested it.
+    pub fn verify_ready_with(
+        &self,
+        entry: &Entry,
+        source: &PackageSource<'_>,
+        progress: Option<&progress::AcquisitionProgress>,
+    ) -> Result<()> {
         // The entry must be the same signed package. Its physical locations may
         // be normalized, but its signed envelope may not change.
         let installed = reader::Metadata::open(entry.directory())?;
@@ -1786,7 +1794,7 @@ impl Root {
                 )
                 .into());
             }
-            verify_slice(&slice, identity)?;
+            verify_slice(&slice, identity, progress)?;
         }
         Ok(())
     }
@@ -2399,6 +2407,14 @@ impl Root {
             }
         }
         for tree in read_dir(&self.root.join("staging/trees"))? {
+            // A staging transaction that carries a Hugging Face transport cache is a
+            // resumable download partial. It is preserved here and reclaimed only by
+            // `flare models gc --downloads`, which also checks the transport locks.
+            if is_legacy_hub_transport(&tree) {
+                collect_inodes(&tree, &mut live)?;
+                collected.preserved_transport += 1;
+                continue;
+            }
             let Some(token) = tree.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -2535,7 +2551,7 @@ impl Root {
                 )
                 .into());
             }
-            verify_slice(&slice, id)?;
+            verify_slice(&slice, id, None)?;
             Ok(PayloadObject {
                 id,
                 path: destination,
@@ -2572,7 +2588,7 @@ impl Root {
                     )
                     .into());
                 }
-                verify_slice(&slice, id)?;
+                verify_slice(&slice, id, None)?;
                 make_immutable(destination)?;
                 fs::remove_file(staged).map_err(failure)
             }
@@ -2933,9 +2949,8 @@ fn write_primary(
                 .try_into()
                 .map_err(|_| "embedded asset identity is not 32 bytes".to_string())?,
         );
-        let digest = tensor.digest()?;
+        let digest = tensor.digest_with(progress)?;
         if let Some(progress) = progress {
-            progress.record_verification_bytes(tensor.len());
             progress.record_local_source_bytes(tensor.len());
         }
         if digest != declared {
@@ -3254,6 +3269,8 @@ pub struct Collected {
     pub staging: usize,
     pub objects: usize,
     pub legacy: usize,
+    /// Unlocked staging trees holding a resumable Hugging Face transport cache.
+    pub preserved_transport: usize,
 }
 
 /// Process-owned file lock; dropping the descriptor releases it.
@@ -3373,7 +3390,15 @@ fn write_stream(path: &Path, mut source: impl Read) -> Result<(PayloadId, u64)> 
 }
 
 /// Validate a cache hit against the caller's declared identity and length.
-fn validate_hit(object: &PayloadObject, declared: PayloadId, length: u64) -> Result<()> {
+///
+/// Hashing reports verification bytes as it reads, so a large cached payload is
+/// visible while it is being checked rather than only after it completes.
+fn validate_hit(
+    object: &PayloadObject,
+    declared: PayloadId,
+    length: u64,
+    progress: Option<&progress::AcquisitionProgress>,
+) -> Result<()> {
     if object.length() != length {
         return Err(format!(
             "object {declared} holds {} bytes, expected {length}",
@@ -3381,7 +3406,7 @@ fn validate_hit(object: &PayloadObject, declared: PayloadId, length: u64) -> Res
         )
         .into());
     }
-    verify_slice(object.slice(), declared)
+    verify_slice(object.slice(), declared, progress)
 }
 
 /// Hash a complete file and compare it with a declared container identity.
@@ -3405,7 +3430,11 @@ fn verify_file(path: &Path, declared: PayloadId) -> Result<()> {
 }
 
 /// Hash the installed payload bytes and compare them with their identity.
-fn verify_slice(slice: &Slice, declared: PayloadId) -> Result<()> {
+fn verify_slice(
+    slice: &Slice,
+    declared: PayloadId,
+    progress: Option<&progress::AcquisitionProgress>,
+) -> Result<()> {
     let mut context = DigestContext::new(&SHA256);
     let mut buffer = vec![0; 1 << 20];
     let mut offset = 0u64;
@@ -3413,6 +3442,9 @@ fn verify_slice(slice: &Slice, declared: PayloadId) -> Result<()> {
         let count = (slice.len() - offset).min(buffer.len() as u64) as usize;
         slice.read_at(offset, &mut buffer[..count])?;
         context.update(&buffer[..count]);
+        if let Some(progress) = progress {
+            progress.record_verification_bytes(count as u64);
+        }
         offset += count as u64;
     }
     if PayloadId::from_digest(context.finish()) != declared {
@@ -3475,6 +3507,31 @@ fn validate_name(name: &str, what: &str) -> Result<()> {
         return Err(format!("{what} {name:?} contains unsupported characters").into());
     }
     Ok(())
+}
+
+/// One legacy Hugging Face transport cache tree, identified by a top-level
+/// repository folder with its own blob directory. Flare previously created these
+/// directly in `--cache-dir` and under `staging/trees`; the shared transport root
+/// has a `version` marker and no repository folders at its top level.
+pub fn is_legacy_hub_transport(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let repository = ["models--", "datasets--", "spaces--"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if file_type.is_dir() && repository && entry.path().join("blobs").is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 fn read_dir(path: &Path) -> Result<Vec<PathBuf>> {
@@ -3952,7 +4009,8 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .slice(),
-                PayloadId::of(&bytes)
+                PayloadId::of(&bytes),
+                None,
             )
             .is_err()
         );
@@ -4433,6 +4491,52 @@ mod tests {
         );
         assert!(
             root.payload(PayloadId::of(b"referenced payload"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn collect_preserves_legacy_hub_transport_staging() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let transport = root.path().join("staging/trees/transfer-writer");
+        let blobs = transport.join("models--org--name/blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("sha256:abc"), b"complete").unwrap();
+        fs::write(blobs.join("sha256:abc.part"), b"partial").unwrap();
+        let export = root.path().join("staging/trees/export-writer");
+        fs::create_dir_all(&export).unwrap();
+        fs::write(export.join("model.safetensors"), b"partial").unwrap();
+
+        let collected = root.collect().unwrap();
+        assert_eq!(collected.preserved_transport, 1);
+        assert_eq!(collected.staging, 1);
+        assert!(transport.is_dir());
+        assert!(!export.exists());
+    }
+
+    #[test]
+    fn collect_keeps_objects_linked_from_preserved_transport() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let object = install(&root, b"linked from preserved transport");
+        let tree = root.path().join("staging/trees/transfer-writer");
+        let blobs = tree.join("models--org--name/blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::hard_link(
+            object.path(),
+            blobs.join("sha256:0123456789abcdef"),
+        )
+        .unwrap();
+        drop(object);
+
+        let collected = root.collect().unwrap();
+        assert_eq!(collected.preserved_transport, 1);
+        assert_eq!(collected.objects, 0);
+        assert!(tree.is_dir());
+        assert!(
+            root.payload(PayloadId::of(b"linked from preserved transport"))
                 .unwrap()
                 .is_some()
         );
@@ -6540,6 +6644,90 @@ mod tests {
         assert!(
             error.contains("payload") || error.contains("digest"),
             "embedded primary corruption was not detected: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_ready_with_reports_hashed_payload_bytes() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let directory = temporary.0.join("verify-progress");
+        let target = b"TTTTtttt";
+        let target_id = PayloadId::of(target);
+        let publisher = publish_fixture(&directory, &[("target", target)], &[(target_id, 0)]);
+        let selection = protection::Selection::Deployment { deployment: 0, rank: None };
+        let entry = root
+            .install_package(
+                PackageSource::open(&directory, std::slice::from_ref(&publisher), selection)
+                    .unwrap(),
+                "verify-progress-model",
+                "entry",
+            )
+            .unwrap();
+        let source = PackageSource::open(&directory, std::slice::from_ref(&publisher), selection)
+            .unwrap();
+        let progress = progress::AcquisitionProgress::new();
+        root.verify_ready_with(&entry, &source, Some(&progress)).unwrap();
+        let once = progress.snapshot().verification_bytes;
+        assert!(once >= target.len() as u64, "{once}");
+        root.verify_ready_with(&entry, &source, Some(&progress)).unwrap();
+        assert_eq!(progress.snapshot().verification_bytes, 2 * once);
+    }
+
+    #[test]
+    fn verified_cache_hit_is_counted_once_and_not_rehashed_on_install() {
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let directory = temporary.0.join("planned-hit-progress");
+        let canonical = b"CCCCcccc";
+        let canonical_id = PayloadId::of(canonical);
+        let publisher = publish_fixture(
+            &directory,
+            &[("canonical", canonical)],
+            &[(canonical_id, 0)],
+        );
+        let package = package_source(&directory, &publisher);
+        let graph = package.verified()[0].ranks()[0].resources[0]
+            .stored
+            .as_ref()
+            .unwrap();
+        let graph_id = PayloadId::from_bytes(graph.payload_id.as_slice().try_into().unwrap());
+        let graph_payload = package
+            .metadata()
+            .payloads(package.verified()[0].catalog(), [graph.payload_id.as_slice()])
+            .unwrap();
+        let graph_slice = graph_payload.get(&graph.payload_id).unwrap().clone();
+        let graph_len = graph_slice.len();
+        root.insert_payload(canonical_id, canonical.len() as u64, canonical.as_slice())
+            .unwrap();
+        root.insert_payload(
+            graph_id,
+            graph_len,
+            SliceReader { slice: graph_slice, offset: 0 },
+        )
+        .unwrap();
+        let progress = progress::AcquisitionProgress::new();
+        let plan = root
+            .plan_acquisition_with(
+                package_source(&directory, &publisher),
+                &derivation::Limits::default(),
+                Some(&progress),
+            )
+            .unwrap();
+        let verified = canonical.len() as u64 + graph_len;
+        assert_eq!(progress.snapshot().verification_bytes, verified);
+        let _entry = root.install_planned(plan, "planned-hit", "entry").unwrap();
+        assert_eq!(
+            progress.snapshot().verification_bytes,
+            verified,
+            "installation must reuse the verified payload bytes"
+        );
+        let slice = root.payload(canonical_id).unwrap().unwrap().slice().clone();
+        let digest_progress = progress::AcquisitionProgress::new();
+        assert_eq!(slice.digest_with(Some(&digest_progress)).unwrap(), canonical_id);
+        assert_eq!(
+            digest_progress.snapshot().verification_bytes,
+            canonical.len() as u64
         );
     }
 
